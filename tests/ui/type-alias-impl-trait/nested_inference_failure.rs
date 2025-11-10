@@ -1,6 +1,7 @@
-// check-pass
-// revisions: new old
-//[new] compile-flags: -Znext-solver
+//@ check-pass
+//@ revisions: current next
+//@ ignore-compare-mode-next-solver (explicit revisions)
+//@[next] compile-flags: -Znext-solver
 
 //! This test checks that we can successfully infer
 //! the hidden type of `FooImpl` to be `Foo<i32, {closure}>`
@@ -21,6 +22,7 @@ struct Foo<T: Debug, F: FnOnce(T)> {
 type ImplT = impl Debug;
 type FooImpl = Foo<ImplT, impl FnOnce(ImplT)>;
 
+#[define_opaque(FooImpl)]
 fn bar() -> FooImpl {
     Foo::<i32, _> { f: |_| (), _phantom: PhantomData }
 }

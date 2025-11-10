@@ -1,6 +1,6 @@
 // When denying at the crate level, be sure to not get random warnings from the
 // injected intrinsics by the compiler.
-// aux-build:missing_docs.rs
+//@ aux-build:missing_docs.rs
 #![deny(missing_docs)]
 #![allow(dead_code)]
 #![feature(associated_type_defaults, extern_types)]
@@ -184,10 +184,10 @@ mod internal_impl {
 }
 /// dox
 pub mod public_interface {
-    pub use internal_impl::documented as foo;
-    pub use internal_impl::undocumented1 as bar;
-    pub use internal_impl::{documented, undocumented2};
-    pub use internal_impl::globbed::*;
+    pub use crate::internal_impl::documented as foo;
+    pub use crate::internal_impl::undocumented1 as bar;
+    pub use crate::internal_impl::{documented, undocumented2};
+    pub use crate::internal_impl::globbed::*;
 }
 
 extern "C" {

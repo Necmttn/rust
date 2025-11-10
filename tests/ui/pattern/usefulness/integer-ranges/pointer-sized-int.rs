@@ -1,5 +1,4 @@
-// revisions: deny
-#![feature(exclusive_range_pattern)]
+//@ revisions: deny
 #![allow(overlapping_range_endpoints)]
 
 macro_rules! m {

@@ -1,15 +1,15 @@
 //! Handle syntactic aspects of merging UseTrees.
 use std::cmp::Ordering;
-use std::iter::empty;
 
 use itertools::{EitherOrBoth, Itertools};
 use parser::T;
-use stdx::is_upper_snake_case;
 use syntax::{
-    algo,
-    ast::{self, make, AstNode, HasAttrs, HasName, HasVisibility, PathSegmentKind},
+    Direction, SyntaxElement, algo,
+    ast::{
+        self, AstNode, HasAttrs, HasName, HasVisibility, PathSegmentKind, edit_in_place::Removable,
+        make,
+    },
     ted::{self, Position},
-    Direction,
 };
 
 use crate::syntax_helpers::node_ext::vis_eq;
@@ -58,6 +58,10 @@ pub fn try_merge_imports(
     let lhs_tree = lhs.use_tree()?;
     let rhs_tree = rhs.use_tree()?;
     try_merge_trees_mut(&lhs_tree, &rhs_tree, merge_behavior)?;
+
+    // Ignore `None` result because normalization should not affect the merge result.
+    try_normalize_use_tree_mut(&lhs_tree, merge_behavior.into());
+
     Some(lhs)
 }
 
@@ -71,6 +75,10 @@ pub fn try_merge_trees(
     let lhs = lhs.clone_subtree().clone_for_update();
     let rhs = rhs.clone_subtree().clone_for_update();
     try_merge_trees_mut(&lhs, &rhs, merge)?;
+
+    // Ignore `None` result because normalization should not affect the merge result.
+    try_normalize_use_tree_mut(&lhs, merge.into());
+
     Some(lhs)
 }
 
@@ -83,17 +91,25 @@ fn try_merge_trees_mut(lhs: &ast::UseTree, rhs: &ast::UseTree, merge: MergeBehav
         let rhs_path = rhs.path()?;
 
         let (lhs_prefix, rhs_prefix) = common_prefix(&lhs_path, &rhs_path)?;
-        if !(lhs.is_simple_path()
+        if lhs.is_simple_path()
             && rhs.is_simple_path()
             && lhs_path == lhs_prefix
-            && rhs_path == rhs_prefix)
+            && rhs_path == rhs_prefix
         {
-            lhs.split_prefix(&lhs_prefix);
-            rhs.split_prefix(&rhs_prefix);
-        } else {
+            // we can't merge if the renames are different (`A as a` and `A as b`),
+            // and we can safely return here
+            let lhs_name = lhs.rename().and_then(|lhs_name| lhs_name.name());
+            let rhs_name = rhs.rename().and_then(|rhs_name| rhs_name.name());
+            if lhs_name != rhs_name {
+                return None;
+            }
+
             ted::replace(lhs.syntax(), rhs.syntax());
             // we can safely return here, in this case `recursive_merge` doesn't do anything
             return Some(());
+        } else {
+            lhs.split_prefix(&lhs_prefix);
+            rhs.split_prefix(&rhs_prefix);
         }
     }
     recursive_merge(lhs, rhs, merge)
@@ -147,10 +163,14 @@ fn recursive_merge(lhs: &ast::UseTree, rhs: &ast::UseTree, merge: MergeBehavior)
                     }
 
                     match (tree_contains_self(lhs_t), tree_contains_self(&rhs_t)) {
-                        (Some(true), None) => continue,
+                        (Some(true), None) => {
+                            remove_subtree_if_only_self(lhs_t);
+                            continue;
+                        }
                         (None, Some(true)) => {
                             ted::replace(lhs_t.syntax(), rhs_t.syntax());
                             *lhs_t = rhs_t;
+                            remove_subtree_if_only_self(lhs_t);
                             continue;
                         }
                         _ => (),
@@ -169,64 +189,312 @@ fn recursive_merge(lhs: &ast::UseTree, rhs: &ast::UseTree, merge: MergeBehavior)
                     && !use_trees.is_empty()
                     && rhs_t.use_tree_list().is_some() =>
             {
-                return None
+                return None;
             }
             Err(insert_idx) => {
                 use_trees.insert(insert_idx, rhs_t.clone());
-                match lhs.use_tree_list() {
-                    // Creates a new use tree list with the item.
-                    None => lhs.get_or_create_use_tree_list().add_use_tree(rhs_t),
-                    // Recreates the use tree list with sorted items (see `use_tree_cmp` doc).
-                    Some(use_tree_list) => {
-                        if use_tree_list.l_curly_token().is_none() {
-                            ted::insert_raw(
-                                Position::first_child_of(use_tree_list.syntax()),
-                                make::token(T!['{']),
-                            );
-                        }
-                        if use_tree_list.r_curly_token().is_none() {
-                            ted::insert_raw(
-                                Position::last_child_of(use_tree_list.syntax()),
-                                make::token(T!['}']),
-                            );
-                        }
+                // We simply add the use tree to the end of tree list. Ordering of use trees
+                // and imports is done by the `try_normalize_*` functions. The sorted `use_trees`
+                // vec is only used for binary search.
+                lhs.get_or_create_use_tree_list().add_use_tree(rhs_t);
+            }
+        }
+    }
+    Some(())
+}
 
-                        let mut elements = Vec::new();
-                        for (idx, tree) in use_trees.iter().enumerate() {
-                            if idx > 0 {
-                                elements.push(make::token(T![,]).into());
-                                elements.push(make::tokens::single_space().into());
-                            }
-                            elements.push(tree.syntax().clone().into());
-                        }
+/// Style to follow when normalizing a use tree.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum NormalizationStyle {
+    /// Merges all descendant use tree lists with only one child use tree into their parent use tree.
+    ///
+    /// Examples:
+    /// - `foo::{bar::{Qux}}` -> `foo::bar::Qux`
+    /// - `foo::{bar::{self}}` -> `foo::bar`
+    /// - `{foo::bar}` -> `foo::bar`
+    Default,
+    /// Same as default but wraps the root use tree in a use tree list.
+    ///
+    /// Examples:
+    /// - `foo::{bar::{Qux}}` -> `{foo::bar::Qux}`
+    /// - `foo::{bar::{self}}` -> `{foo::bar}`
+    /// - `{foo::bar}` -> `{foo::bar}`
+    One,
+}
 
-                        let start = use_tree_list
-                            .l_curly_token()
-                            .and_then(|l_curly| {
-                                algo::non_trivia_sibling(l_curly.into(), Direction::Next)
-                            })
-                            .filter(|it| it.kind() != T!['}']);
-                        let end = use_tree_list
-                            .r_curly_token()
-                            .and_then(|r_curly| {
-                                algo::non_trivia_sibling(r_curly.into(), Direction::Prev)
-                            })
-                            .filter(|it| it.kind() != T!['{']);
-                        if let Some((start, end)) = start.zip(end) {
-                            // Attempt to insert elements while preserving preceding and trailing trivia.
-                            ted::replace_all(start..=end, elements);
-                        } else {
-                            let new_use_tree_list = make::use_tree_list(empty()).clone_for_update();
-                            let trees_pos = match new_use_tree_list.l_curly_token() {
-                                Some(l_curly) => Position::after(l_curly),
-                                None => Position::last_child_of(new_use_tree_list.syntax()),
-                            };
-                            ted::insert_all_raw(trees_pos, elements);
-                            ted::replace(use_tree_list.syntax(), new_use_tree_list.syntax());
-                        }
-                    }
+impl From<MergeBehavior> for NormalizationStyle {
+    fn from(mb: MergeBehavior) -> Self {
+        match mb {
+            MergeBehavior::One => NormalizationStyle::One,
+            _ => NormalizationStyle::Default,
+        }
+    }
+}
+
+/// Normalizes a use item by:
+/// - Ordering all use trees
+/// - Merging use trees with common prefixes
+/// - Removing redundant braces based on the specified normalization style
+///   (see [`NormalizationStyle`] doc)
+///
+/// Examples:
+///
+/// Using the "Default" normalization style
+///
+/// - `foo::{bar::Qux, bar::{self}}` -> `foo::bar::{self, Qux}`
+/// - `foo::bar::{self}` -> `foo::bar`
+/// - `{foo::bar}` -> `foo::bar`
+///
+/// Using the "One" normalization style
+///
+/// - `foo::{bar::Qux, bar::{self}}` -> `{foo::bar::{self, Qux}}`
+/// - `foo::bar::{self}` -> `{foo::bar}`
+/// - `foo::bar` -> `{foo::bar}`
+pub fn try_normalize_import(use_item: &ast::Use, style: NormalizationStyle) -> Option<ast::Use> {
+    let use_item = use_item.clone_subtree().clone_for_update();
+    try_normalize_use_tree_mut(&use_item.use_tree()?, style)?;
+    Some(use_item)
+}
+
+/// Normalizes a use tree (see [`try_normalize_import`] doc).
+pub fn try_normalize_use_tree(
+    use_tree: &ast::UseTree,
+    style: NormalizationStyle,
+) -> Option<ast::UseTree> {
+    let use_tree = use_tree.clone_subtree().clone_for_update();
+    try_normalize_use_tree_mut(&use_tree, style)?;
+    Some(use_tree)
+}
+
+pub fn try_normalize_use_tree_mut(
+    use_tree: &ast::UseTree,
+    style: NormalizationStyle,
+) -> Option<()> {
+    if style == NormalizationStyle::One {
+        let mut modified = false;
+        modified |= use_tree.wrap_in_tree_list().is_some();
+        modified |= recursive_normalize(use_tree, style).is_some();
+        if !modified {
+            // Either the use tree was already normalized or its semantically empty.
+            return None;
+        }
+    } else {
+        recursive_normalize(use_tree, NormalizationStyle::Default)?;
+    }
+    Some(())
+}
+
+/// Recursively normalizes a use tree and its subtrees (if any).
+fn recursive_normalize(use_tree: &ast::UseTree, style: NormalizationStyle) -> Option<()> {
+    let use_tree_list = use_tree.use_tree_list()?;
+    let merge_subtree_into_parent_tree = |single_subtree: &ast::UseTree| {
+        let subtree_is_only_self = single_subtree.path().as_ref().is_some_and(path_is_self);
+
+        let merged_path = match (use_tree.path(), single_subtree.path()) {
+            // If the subtree is `{self}` then we cannot merge: `use
+            // foo::bar::{self}` is not equivalent to `use foo::bar`. See
+            // https://github.com/rust-lang/rust-analyzer/pull/17140#issuecomment-2079189725.
+            _ if subtree_is_only_self => None,
+
+            (None, None) => None,
+            (Some(outer), None) => Some(outer),
+            (None, Some(inner)) => Some(inner),
+            (Some(outer), Some(inner)) => Some(make::path_concat(outer, inner).clone_for_update()),
+        };
+
+        if merged_path.is_some()
+            || single_subtree.use_tree_list().is_some()
+            || single_subtree.star_token().is_some()
+        {
+            ted::remove_all_iter(use_tree.syntax().children_with_tokens());
+            if let Some(path) = merged_path {
+                ted::insert_raw(Position::first_child_of(use_tree.syntax()), path.syntax());
+                if single_subtree.use_tree_list().is_some() || single_subtree.star_token().is_some()
+                {
+                    ted::insert_raw(
+                        Position::last_child_of(use_tree.syntax()),
+                        make::token(T![::]),
+                    );
                 }
             }
+            if let Some(inner_use_tree_list) = single_subtree.use_tree_list() {
+                ted::insert_raw(
+                    Position::last_child_of(use_tree.syntax()),
+                    inner_use_tree_list.syntax(),
+                );
+            } else if single_subtree.star_token().is_some() {
+                ted::insert_raw(Position::last_child_of(use_tree.syntax()), make::token(T![*]));
+            } else if let Some(rename) = single_subtree.rename() {
+                ted::insert_raw(
+                    Position::last_child_of(use_tree.syntax()),
+                    make::tokens::single_space(),
+                );
+                ted::insert_raw(Position::last_child_of(use_tree.syntax()), rename.syntax());
+            }
+            Some(())
+        } else {
+            // Bail on semantically empty use trees.
+            None
+        }
+    };
+    let one_style_tree_list = |subtree: &ast::UseTree| match (
+        subtree.path().is_none() && subtree.star_token().is_none() && subtree.rename().is_none(),
+        subtree.use_tree_list(),
+    ) {
+        (true, tree_list) => tree_list,
+        _ => None,
+    };
+    let add_element_to_list = |elem: SyntaxElement, elements: &mut Vec<SyntaxElement>| {
+        if !elements.is_empty() {
+            elements.push(make::token(T![,]).into());
+            elements.push(make::tokens::single_space().into());
+        }
+        elements.push(elem);
+    };
+    if let Some((single_subtree,)) = use_tree_list.use_trees().collect_tuple() {
+        if style == NormalizationStyle::One {
+            // Only normalize descendant subtrees if the normalization style is "one".
+            recursive_normalize(&single_subtree, NormalizationStyle::Default)?;
+        } else {
+            // Otherwise, merge the single subtree into it's parent (if possible)
+            // and then normalize the result.
+            merge_subtree_into_parent_tree(&single_subtree)?;
+            recursive_normalize(use_tree, style);
+        }
+    } else {
+        // Tracks whether any changes have been made to the use tree.
+        let mut modified = false;
+
+        // Recursively un-nests (if necessary) and then normalizes each subtree in the tree list.
+        for subtree in use_tree_list.use_trees() {
+            if let Some(one_tree_list) = one_style_tree_list(&subtree) {
+                let mut elements = Vec::new();
+                let mut one_tree_list_iter = one_tree_list.use_trees();
+                let mut prev_skipped = Vec::new();
+                loop {
+                    let mut prev_skipped_iter = prev_skipped.into_iter();
+                    let mut curr_skipped = Vec::new();
+
+                    while let Some(sub_sub_tree) =
+                        one_tree_list_iter.next().or(prev_skipped_iter.next())
+                    {
+                        if let Some(sub_one_tree_list) = one_style_tree_list(&sub_sub_tree) {
+                            curr_skipped.extend(sub_one_tree_list.use_trees());
+                        } else {
+                            modified |=
+                                recursive_normalize(&sub_sub_tree, NormalizationStyle::Default)
+                                    .is_some();
+                            add_element_to_list(
+                                sub_sub_tree.syntax().clone().into(),
+                                &mut elements,
+                            );
+                        }
+                    }
+
+                    if curr_skipped.is_empty() {
+                        // Un-nesting is complete.
+                        break;
+                    }
+                    prev_skipped = curr_skipped;
+                }
+
+                // Either removes the subtree (if its semantically empty) or replaces it with
+                // the un-nested elements.
+                if elements.is_empty() {
+                    subtree.remove();
+                } else {
+                    ted::replace_with_many(subtree.syntax(), elements);
+                }
+                // Silence unused assignment warning on `modified`.
+                let _ = modified;
+                modified = true;
+            } else {
+                modified |= recursive_normalize(&subtree, NormalizationStyle::Default).is_some();
+            }
+        }
+
+        // Merge all merge-able subtrees.
+        let mut tree_list_iter = use_tree_list.use_trees();
+        let mut anchor = tree_list_iter.next()?;
+        let mut prev_skipped = Vec::new();
+        loop {
+            let mut has_merged = false;
+            let mut prev_skipped_iter = prev_skipped.into_iter();
+            let mut next_anchor = None;
+            let mut curr_skipped = Vec::new();
+
+            while let Some(candidate) = tree_list_iter.next().or(prev_skipped_iter.next()) {
+                let result = try_merge_trees_mut(&anchor, &candidate, MergeBehavior::Crate);
+                if result.is_some() {
+                    // Remove merged subtree.
+                    candidate.remove();
+                    has_merged = true;
+                } else if next_anchor.is_none() {
+                    next_anchor = Some(candidate);
+                } else {
+                    curr_skipped.push(candidate);
+                }
+            }
+
+            if has_merged {
+                // Normalize the merge result.
+                recursive_normalize(&anchor, NormalizationStyle::Default);
+                modified = true;
+            }
+
+            let (Some(next_anchor), true) = (next_anchor, !curr_skipped.is_empty()) else {
+                // Merging is complete.
+                break;
+            };
+
+            // Try to merge the remaining subtrees in the next iteration.
+            anchor = next_anchor;
+            prev_skipped = curr_skipped;
+        }
+
+        let mut subtrees: Vec<_> = use_tree_list.use_trees().collect();
+        // Merge the remaining subtree into its parent, if its only one and
+        // the normalization style is not "one".
+        if subtrees.len() == 1 && style != NormalizationStyle::One {
+            modified |= merge_subtree_into_parent_tree(&subtrees[0]).is_some();
+        }
+        // Order the remaining subtrees (if necessary).
+        if subtrees.len() > 1 {
+            let mut did_sort = false;
+            subtrees.sort_unstable_by(|a, b| {
+                let order = use_tree_cmp_bin_search(a, b);
+                if !did_sort && order == Ordering::Less {
+                    did_sort = true;
+                }
+                order
+            });
+            if did_sort {
+                let start = use_tree_list
+                    .l_curly_token()
+                    .and_then(|l_curly| algo::non_trivia_sibling(l_curly.into(), Direction::Next))
+                    .filter(|it| it.kind() != T!['}']);
+                let end = use_tree_list
+                    .r_curly_token()
+                    .and_then(|r_curly| algo::non_trivia_sibling(r_curly.into(), Direction::Prev))
+                    .filter(|it| it.kind() != T!['{']);
+                if let Some((start, end)) = start.zip(end) {
+                    // Attempt to insert elements while preserving preceding and trailing trivia.
+                    let mut elements = Vec::new();
+                    for subtree in subtrees {
+                        add_element_to_list(subtree.syntax().clone().into(), &mut elements);
+                    }
+                    ted::replace_all(start..=end, elements);
+                } else {
+                    let new_use_tree_list = make::use_tree_list(subtrees).clone_for_update();
+                    ted::replace(use_tree_list.syntax(), new_use_tree_list.syntax());
+                }
+                modified = true;
+            }
+        }
+
+        if !modified {
+            // Either the use tree was already normalized or its semantically empty.
+            return None;
         }
     }
     Some(())
@@ -276,12 +544,13 @@ fn use_tree_cmp_bin_search(lhs: &ast::UseTree, rhs: &ast::UseTree) -> Ordering {
     }
 }
 
-/// Orders use trees following `rustfmt`'s algorithm for ordering imports, which is `self`, `super`
-/// and `crate` first, then identifier imports with lowercase ones first and upper snake case
-/// (e.g. UPPER_SNAKE_CASE) ones last, then glob imports, and at last list imports.
+/// Orders use trees following `rustfmt`'s version sorting algorithm for ordering imports.
 ///
-/// Example foo::{self, foo, baz, Baz, Qux, FOO_BAZ, *, {Bar}}
-/// Ref: <https://github.com/rust-lang/rustfmt/blob/6356fca675bd756d71f5c123cd053d17b16c573e/src/imports.rs#L83-L86>.
+/// Example: `foo::{self, Baz, FOO_BAZ, Qux, baz, foo, *, {Bar}}`
+///
+/// Ref:
+///   - <https://doc.rust-lang.org/style-guide/index.html#sorting>
+///   - <https://doc.rust-lang.org/edition-guide/rust-2024/rustfmt.html>
 pub(super) fn use_tree_cmp(a: &ast::UseTree, b: &ast::UseTree) -> Ordering {
     let a_is_simple_path = a.is_simple_path() && a.rename().is_none();
     let b_is_simple_path = b.is_simple_path() && b.rename().is_none();
@@ -346,26 +615,9 @@ fn path_segment_cmp(a: &ast::PathSegment, b: &ast::PathSegment) -> Ordering {
                 (Some(_), None) => Ordering::Greater,
                 (None, Some(_)) => Ordering::Less,
                 (Some(a_name), Some(b_name)) => {
-                    // snake_case < CamelCase < UPPER_SNAKE_CASE
                     let a_text = a_name.as_str().trim_start_matches("r#");
                     let b_text = b_name.as_str().trim_start_matches("r#");
-                    if a_text.starts_with(char::is_lowercase)
-                        && b_text.starts_with(char::is_uppercase)
-                    {
-                        return Ordering::Less;
-                    }
-                    if a_text.starts_with(char::is_uppercase)
-                        && b_text.starts_with(char::is_lowercase)
-                    {
-                        return Ordering::Greater;
-                    }
-                    if !is_upper_snake_case(a_text) && is_upper_snake_case(b_text) {
-                        return Ordering::Less;
-                    }
-                    if is_upper_snake_case(a_text) && !is_upper_snake_case(b_text) {
-                        return Ordering::Greater;
-                    }
-                    a_text.cmp(b_text)
+                    version_sort::version_sort(a_text, b_text)
                 }
             }
         }
@@ -455,4 +707,207 @@ fn path_is_self(path: &ast::Path) -> bool {
 
 fn path_len(path: ast::Path) -> usize {
     path.segments().count()
+}
+
+fn get_single_subtree(use_tree: &ast::UseTree) -> Option<ast::UseTree> {
+    use_tree
+        .use_tree_list()
+        .and_then(|tree_list| tree_list.use_trees().collect_tuple())
+        .map(|(single_subtree,)| single_subtree)
+}
+
+fn remove_subtree_if_only_self(use_tree: &ast::UseTree) {
+    let Some(single_subtree) = get_single_subtree(use_tree) else { return };
+    match (use_tree.path(), single_subtree.path()) {
+        (Some(_), Some(inner)) if path_is_self(&inner) => {
+            ted::remove_all_iter(single_subtree.syntax().children_with_tokens());
+        }
+        _ => (),
+    }
+}
+
+// Taken from rustfmt
+// https://github.com/rust-lang/rustfmt/blob/0332da01486508710f2a542111e40513bfb215aa/src/sort.rs
+mod version_sort {
+    // Original rustfmt code contains some clippy lints.
+    // Suppress them to minimize changes from upstream.
+    #![allow(clippy::all)]
+
+    use std::cmp::Ordering;
+
+    use itertools::{EitherOrBoth, Itertools};
+
+    struct VersionChunkIter<'a> {
+        ident: &'a str,
+        start: usize,
+    }
+
+    impl<'a> VersionChunkIter<'a> {
+        pub(crate) fn new(ident: &'a str) -> Self {
+            Self { ident, start: 0 }
+        }
+
+        fn parse_numeric_chunk(
+            &mut self,
+            mut chars: std::str::CharIndices<'a>,
+        ) -> Option<VersionChunk<'a>> {
+            let mut end = self.start;
+            let mut is_end_of_chunk = false;
+
+            while let Some((idx, c)) = chars.next() {
+                end = self.start + idx;
+
+                if c.is_ascii_digit() {
+                    continue;
+                }
+
+                is_end_of_chunk = true;
+                break;
+            }
+
+            let source = if is_end_of_chunk {
+                let value = &self.ident[self.start..end];
+                self.start = end;
+                value
+            } else {
+                let value = &self.ident[self.start..];
+                self.start = self.ident.len();
+                value
+            };
+
+            let zeros = source.chars().take_while(|c| *c == '0').count();
+            let value = source.parse::<usize>().ok()?;
+
+            Some(VersionChunk::Number { value, zeros, source })
+        }
+
+        fn parse_str_chunk(
+            &mut self,
+            mut chars: std::str::CharIndices<'a>,
+        ) -> Option<VersionChunk<'a>> {
+            let mut end = self.start;
+            let mut is_end_of_chunk = false;
+
+            while let Some((idx, c)) = chars.next() {
+                end = self.start + idx;
+
+                if c == '_' {
+                    is_end_of_chunk = true;
+                    break;
+                }
+
+                if !c.is_ascii_digit() {
+                    continue;
+                }
+
+                is_end_of_chunk = true;
+                break;
+            }
+
+            let source = if is_end_of_chunk {
+                let value = &self.ident[self.start..end];
+                self.start = end;
+                value
+            } else {
+                let value = &self.ident[self.start..];
+                self.start = self.ident.len();
+                value
+            };
+
+            Some(VersionChunk::Str(source))
+        }
+    }
+
+    impl<'a> Iterator for VersionChunkIter<'a> {
+        type Item = VersionChunk<'a>;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            let mut chars = self.ident[self.start..].char_indices();
+            let (_, next) = chars.next()?;
+
+            if next == '_' {
+                self.start = self.start + next.len_utf8();
+                return Some(VersionChunk::Underscore);
+            }
+
+            if next.is_ascii_digit() {
+                return self.parse_numeric_chunk(chars);
+            }
+
+            self.parse_str_chunk(chars)
+        }
+    }
+
+    /// Represents a chunk in the version-sort algorithm
+    #[derive(Debug, PartialEq, Eq)]
+    enum VersionChunk<'a> {
+        /// A single `_` in an identifier. Underscores are sorted before all other characters.
+        Underscore,
+        /// A &str chunk in the version sort.
+        Str(&'a str),
+        /// A numeric chunk in the version sort. Keeps track of the numeric value and leading zeros.
+        Number { value: usize, zeros: usize, source: &'a str },
+    }
+
+    /// Determine which side of the version-sort comparison had more leading zeros.
+    #[derive(Debug, PartialEq, Eq)]
+    enum MoreLeadingZeros {
+        Left,
+        Right,
+        Equal,
+    }
+
+    pub(super) fn version_sort(a: &str, b: &str) -> Ordering {
+        let iter_a = VersionChunkIter::new(a);
+        let iter_b = VersionChunkIter::new(b);
+        let mut more_leading_zeros = MoreLeadingZeros::Equal;
+
+        for either_or_both in iter_a.zip_longest(iter_b) {
+            match either_or_both {
+                EitherOrBoth::Left(_) => return std::cmp::Ordering::Greater,
+                EitherOrBoth::Right(_) => return std::cmp::Ordering::Less,
+                EitherOrBoth::Both(a, b) => match (a, b) {
+                    (VersionChunk::Underscore, VersionChunk::Underscore) => {
+                        continue;
+                    }
+                    (VersionChunk::Underscore, _) => return std::cmp::Ordering::Less,
+                    (_, VersionChunk::Underscore) => return std::cmp::Ordering::Greater,
+                    (VersionChunk::Str(ca), VersionChunk::Str(cb))
+                    | (VersionChunk::Str(ca), VersionChunk::Number { source: cb, .. })
+                    | (VersionChunk::Number { source: ca, .. }, VersionChunk::Str(cb)) => {
+                        match ca.cmp(&cb) {
+                            std::cmp::Ordering::Equal => {
+                                continue;
+                            }
+                            order @ _ => return order,
+                        }
+                    }
+                    (
+                        VersionChunk::Number { value: va, zeros: lza, .. },
+                        VersionChunk::Number { value: vb, zeros: lzb, .. },
+                    ) => match va.cmp(&vb) {
+                        std::cmp::Ordering::Equal => {
+                            if lza == lzb {
+                                continue;
+                            }
+
+                            if more_leading_zeros == MoreLeadingZeros::Equal && lza > lzb {
+                                more_leading_zeros = MoreLeadingZeros::Left;
+                            } else if more_leading_zeros == MoreLeadingZeros::Equal && lza < lzb {
+                                more_leading_zeros = MoreLeadingZeros::Right;
+                            }
+                            continue;
+                        }
+                        order @ _ => return order,
+                    },
+                },
+            }
+        }
+
+        match more_leading_zeros {
+            MoreLeadingZeros::Equal => std::cmp::Ordering::Equal,
+            MoreLeadingZeros::Left => std::cmp::Ordering::Less,
+            MoreLeadingZeros::Right => std::cmp::Ordering::Greater,
+        }
+    }
 }

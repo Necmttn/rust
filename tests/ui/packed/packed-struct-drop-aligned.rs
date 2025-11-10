@@ -1,19 +1,20 @@
-// run-pass
-#![feature(coroutines)]
+//@ run-pass
+#![feature(coroutines, stmt_expr_attributes)]
 #![feature(coroutine_trait)]
+#![allow(unused_assignments, unused_variables)]
+
 use std::cell::Cell;
 use std::mem;
 use std::ops::Coroutine;
 use std::pin::Pin;
 
 struct Aligned<'a> {
-    drop_count: &'a Cell<usize>
+    drop_count: &'a Cell<usize>,
 }
 
 #[inline(never)]
 fn check_align(ptr: *const Aligned) {
-    assert_eq!(ptr as usize % mem::align_of::<Aligned>(),
-               0);
+    assert_eq!(ptr as usize % mem::align_of::<Aligned>(), 0);
 }
 
 impl<'a> Drop for Aligned<'a> {
@@ -39,7 +40,8 @@ fn main() {
     assert_eq!(drop_count.get(), 2);
 
     let drop_count = &Cell::new(0);
-    let mut g = || {
+    let mut g = #[coroutine]
+    || {
         let mut p = Packed(NotCopy(0), Aligned { drop_count });
         let _ = &p;
         p.1 = Aligned { drop_count };

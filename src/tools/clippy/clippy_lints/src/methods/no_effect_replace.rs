@@ -1,6 +1,6 @@
-use clippy_utils::diagnostics::span_lint;
-use clippy_utils::ty::is_type_lang_item;
 use clippy_utils::SpanlessEq;
+use clippy_utils::diagnostics::span_lint;
+use clippy_utils::res::MaybeDef;
 use rustc_ast::LitKind;
 use rustc_hir::{ExprKind, LangItem};
 use rustc_lint::LateContext;
@@ -14,7 +14,7 @@ pub(super) fn check<'tcx>(
     arg2: &'tcx rustc_hir::Expr<'_>,
 ) {
     let ty = cx.typeck_results().expr_ty(expr).peel_refs();
-    if !(ty.is_str() || is_type_lang_item(cx, ty, LangItem::String)) {
+    if !(ty.is_str() || ty.is_lang_item(cx, LangItem::String)) {
         return;
     }
 
@@ -25,6 +25,7 @@ pub(super) fn check<'tcx>(
         && param1 == param2.as_str()
     {
         span_lint(cx, NO_EFFECT_REPLACE, expr.span, "replacing text with itself");
+        return;
     }
 
     if SpanlessEq::new(cx).eq_expr(arg1, arg2) {

@@ -1,4 +1,4 @@
-// run-pass
+//@ run-pass
 
 #![allow(non_upper_case_globals)]
 #![feature(rustc_private)]
@@ -20,6 +20,7 @@ pub const s: u8 = 1;
 pub const state: u8 = 1;
 pub const cmp: u8 = 1;
 
+#[allow(dead_code)]
 #[derive(Ord, Eq, PartialOrd, PartialEq, Debug, Decodable, Encodable, Hash)]
 struct Foo {}
 

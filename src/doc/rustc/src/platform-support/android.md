@@ -8,9 +8,10 @@
 
 ## Target maintainers
 
-- Chris Wailes ([@chriswailes](https://github.com/chriswailes))
-- Matthew Maurer ([@maurer](https://github.com/maurer))
-- Martin Geisler ([@mgeisler](https://github.com/mgeisler))
+[@chriswailes](https://github.com/chriswailes)
+[@jfgoog](https://github.com/jfgoog)
+[@maurer](https://github.com/maurer)
+[@pirama-arumuga-nainar](https://github.com/pirama-arumuga-nainar)
 
 ## Requirements
 
@@ -61,3 +62,8 @@ Currently the `riscv64-linux-android` target requires the following architecture
 * `Zba` (address calculation instructions)
 * `Zbb` (base instructions)
 * `Zbs` (single-bit instructions)
+
+### aarch64-linux-android on Nightly compilers
+
+As soon as `-Zfixed-x18` compiler flag is supplied, the [`ShadowCallStack` sanitizer](https://releases.llvm.org/7.0.1/tools/clang/docs/ShadowCallStack.html)
+instrumentation is also made available by supplying the second compiler flag `-Zsanitizer=shadow-call-stack`.

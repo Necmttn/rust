@@ -1,11 +1,4 @@
 #![cfg_attr(test, allow(dead_code))]
 
-pub struct Handler;
-
-impl Handler {
-    pub fn new() -> Handler {
-        Handler
-    }
-}
-
-pub unsafe fn init() {}
+pub fn reserve_stack() {}
+pub fn init() {}

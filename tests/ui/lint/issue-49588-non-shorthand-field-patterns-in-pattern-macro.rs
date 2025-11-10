@@ -1,4 +1,4 @@
-// run-pass
+//@ run-pass
 #![allow(unused_variables)]
 #![deny(non_shorthand_field_patterns)]
 
@@ -13,4 +13,5 @@ macro_rules! pat {
 
 fn main() {
     let pat!(value) = Value { value: () };
+    //~^ WARN value assigned to `value` is never read
 }

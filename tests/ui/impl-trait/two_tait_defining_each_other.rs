@@ -1,6 +1,7 @@
-// revisions: current next
-//[next] compile-flags: -Znext-solver
-//[next] check-pass
+//@ revisions: current next
+//@ ignore-compare-mode-next-solver (explicit revisions)
+//@[next] compile-flags: -Znext-solver
+//@[next] check-pass
 
 #![feature(type_alias_impl_trait)]
 
@@ -9,6 +10,7 @@ type B = impl Foo;
 
 trait Foo {}
 
+#[define_opaque(A, B)]
 fn muh(x: A) -> B {
     if false {
         return Bar; // B's hidden type is Bar

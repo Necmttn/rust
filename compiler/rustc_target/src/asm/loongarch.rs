@@ -1,7 +1,8 @@
-use super::{InlineAsmArch, InlineAsmType};
-use rustc_macros::HashStable_Generic;
-use rustc_span::Symbol;
 use std::fmt;
+
+use rustc_span::Symbol;
+
+use super::{InlineAsmArch, InlineAsmType, ModifierInfo};
 
 def_reg_class! {
     LoongArch LoongArchInlineAsmRegClass {
@@ -23,21 +24,25 @@ impl LoongArchInlineAsmRegClass {
         self,
         _arch: InlineAsmArch,
         _ty: InlineAsmType,
-    ) -> Option<(char, &'static str)> {
+    ) -> Option<ModifierInfo> {
         None
     }
 
-    pub fn default_modifier(self, _arch: InlineAsmArch) -> Option<(char, &'static str)> {
+    pub fn default_modifier(self, _arch: InlineAsmArch) -> Option<ModifierInfo> {
         None
     }
 
     pub fn supported_types(
         self,
-        _arch: InlineAsmArch,
+        arch: InlineAsmArch,
     ) -> &'static [(InlineAsmType, Option<Symbol>)] {
-        match self {
-            Self::reg => types! { _: I8, I16, I32, I64, F32, F64; },
-            Self::freg => types! { _: F32, F64; },
+        match (self, arch) {
+            (Self::reg, InlineAsmArch::LoongArch64) => {
+                types! { _: I8, I16, I32, I64, F16, F32, F64; }
+            }
+            (Self::reg, InlineAsmArch::LoongArch32) => types! { _: I8, I16, I32, F16, F32; },
+            (Self::freg, _) => types! { f: F16, F32; d: F64; },
+            _ => unreachable!("unsupported register class"),
         }
     }
 }

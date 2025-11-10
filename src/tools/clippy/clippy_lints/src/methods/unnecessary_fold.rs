@@ -1,6 +1,7 @@
 use clippy_utils::diagnostics::span_lint_and_sugg;
+use clippy_utils::res::{MaybeDef, MaybeResPath, MaybeTypeckRes};
 use clippy_utils::source::snippet_with_applicability;
-use clippy_utils::{is_trait_method, path_to_local_id, peel_blocks, strip_pat_refs};
+use clippy_utils::{peel_blocks, strip_pat_refs};
 use rustc_ast::ast;
 use rustc_data_structures::packed::Pu128;
 use rustc_errors::Applicability;
@@ -8,7 +9,7 @@ use rustc_hir as hir;
 use rustc_hir::PatKind;
 use rustc_lint::LateContext;
 use rustc_middle::ty;
-use rustc_span::{sym, Span};
+use rustc_span::{Span, sym};
 
 use super::UNNECESSARY_FOLD;
 
@@ -16,11 +17,11 @@ use super::UNNECESSARY_FOLD;
 /// Changing `fold` to `sum` needs it sometimes when the return type can't be
 /// inferred. This checks for some common cases where it can be safely omitted
 fn needs_turbofish(cx: &LateContext<'_>, expr: &hir::Expr<'_>) -> bool {
-    let parent = cx.tcx.hir().get_parent(expr.hir_id);
+    let parent = cx.tcx.parent_hir_node(expr.hir_id);
 
     // some common cases where turbofish isn't needed:
     // - assigned to a local variable with a type annotation
-    if let hir::Node::Local(local) = parent
+    if let hir::Node::LetStmt(local) = parent
         && local.ty.is_some()
     {
         return false;
@@ -62,7 +63,7 @@ fn check_fold_with_op(
 ) {
     if let hir::ExprKind::Closure(&hir::Closure { body, .. }) = acc.kind
         // Extract the body of the closure passed to fold
-        && let closure_body = cx.tcx.hir().body(body)
+        && let closure_body = cx.tcx.hir_body(body)
         && let closure_expr = peel_blocks(closure_body.value)
 
         // Check if the closure body is of the form `acc <op> some_expr(x)`
@@ -74,8 +75,8 @@ fn check_fold_with_op(
         && let PatKind::Binding(_, first_arg_id, ..) = strip_pat_refs(param_a.pat).kind
         && let PatKind::Binding(_, second_arg_id, second_arg_ident, _) = strip_pat_refs(param_b.pat).kind
 
-        && path_to_local_id(left_expr, first_arg_id)
-        && (replacement.has_args || path_to_local_id(right_expr, second_arg_id))
+        && left_expr.res_local_id() == Some(first_arg_id)
+        && (replacement.has_args || right_expr.res_local_id() == Some(second_arg_id))
     {
         let mut applicability = Applicability::MachineApplicable;
 
@@ -99,7 +100,6 @@ fn check_fold_with_op(
             cx,
             UNNECESSARY_FOLD,
             fold_span.with_hi(expr.span.hi()),
-            // TODO #2371 don't suggest e.g., .any(|x| f(x)) if we can suggest .any(f)
             "this `.fold` can be written more succinctly using another method",
             "try",
             sugg,
@@ -116,7 +116,7 @@ pub(super) fn check(
     fold_span: Span,
 ) {
     // Check that this is a call to Iterator::fold rather than just some function called fold
-    if !is_trait_method(cx, expr, sym::Iterator) {
+    if !cx.ty_based_def(expr).opt_parent(cx).is_diag_item(cx, sym::Iterator) {
         return;
     }
 
@@ -131,9 +131,9 @@ pub(super) fn check(
                     fold_span,
                     hir::BinOpKind::Or,
                     Replacement {
+                        method_name: "any",
                         has_args: true,
                         has_generic_return: false,
-                        method_name: "any",
                     },
                 );
             },
@@ -145,24 +145,26 @@ pub(super) fn check(
                     fold_span,
                     hir::BinOpKind::And,
                     Replacement {
+                        method_name: "all",
                         has_args: true,
                         has_generic_return: false,
-                        method_name: "all",
                     },
                 );
             },
-            ast::LitKind::Int(Pu128(0), _) => check_fold_with_op(
-                cx,
-                expr,
-                acc,
-                fold_span,
-                hir::BinOpKind::Add,
-                Replacement {
-                    has_args: false,
-                    has_generic_return: needs_turbofish(cx, expr),
-                    method_name: "sum",
-                },
-            ),
+            ast::LitKind::Int(Pu128(0), _) => {
+                check_fold_with_op(
+                    cx,
+                    expr,
+                    acc,
+                    fold_span,
+                    hir::BinOpKind::Add,
+                    Replacement {
+                        method_name: "sum",
+                        has_args: false,
+                        has_generic_return: needs_turbofish(cx, expr),
+                    },
+                );
+            },
             ast::LitKind::Int(Pu128(1), _) => {
                 check_fold_with_op(
                     cx,
@@ -171,9 +173,9 @@ pub(super) fn check(
                     fold_span,
                     hir::BinOpKind::Mul,
                     Replacement {
+                        method_name: "product",
                         has_args: false,
                         has_generic_return: needs_turbofish(cx, expr),
-                        method_name: "product",
                     },
                 );
             },

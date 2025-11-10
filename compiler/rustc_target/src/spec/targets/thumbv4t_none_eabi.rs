@@ -9,14 +9,22 @@
 //! The default link script is very likely wrong, so you should use
 //! `-Clink-arg=-Tmy_script.ld` to override that with a correct linker script.
 
-use crate::spec::{base, PanicStrategy, RelocModel, Target, TargetOptions};
-use crate::spec::{cvs, FramePointer};
+use crate::spec::{
+    Arch, FloatAbi, FramePointer, PanicStrategy, RelocModel, Target, TargetMetadata, TargetOptions,
+    base, cvs,
+};
 
-pub fn target() -> Target {
+pub(crate) fn target() -> Target {
     Target {
         llvm_target: "thumbv4t-none-eabi".into(),
+        metadata: TargetMetadata {
+            description: Some("Thumb-mode Bare ARMv4T".into()),
+            tier: Some(3),
+            host_tools: Some(false),
+            std: Some(false),
+        },
         pointer_width: 32,
-        arch: "arm".into(),
+        arch: Arch::Arm,
         /* Data layout args are '-' separated:
          * little endian
          * stack is 64-bit aligned (EABI)
@@ -29,6 +37,7 @@ pub fn target() -> Target {
         data_layout: "e-m:e-p:32:32-Fi8-i64:64-v128:64:128-a:0:32-n32-S64".into(),
         options: TargetOptions {
             abi: "eabi".into(),
+            llvm_floatabi: Some(FloatAbi::Soft),
 
             // extra args passed to the external assembler (assuming `arm-none-eabi-as`):
             // * activate t32/a32 interworking

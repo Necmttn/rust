@@ -11,60 +11,28 @@
 //! This is because `sys_common` not only contains platform-independent code,
 //! but also code that is shared between the different platforms in `sys`.
 //! Ideally all that shared code should be moved to `sys::common`,
-//! and the dependencies between `std`, `sys_common` and `sys` all would form a dag.
+//! and the dependencies between `std`, `sys_common` and `sys` all would form a DAG.
 //! Progress on this is tracked in #84187.
 
 #![allow(missing_docs)]
-#![allow(missing_debug_implementations)]
 
 #[cfg(test)]
 mod tests;
 
-pub mod backtrace;
-pub mod fs;
-pub mod io;
-pub mod lazy_box;
-pub mod memchr;
-pub mod once;
-pub mod process;
-pub mod thread;
-pub mod thread_info;
-pub mod thread_local_dtor;
-pub mod thread_parking;
 pub mod wstr;
-pub mod wtf8;
-
-cfg_if::cfg_if! {
-    if #[cfg(target_os = "windows")] {
-        pub use crate::sys::thread_local_key;
-    } else {
-        pub mod thread_local_key;
-    }
-}
-
-cfg_if::cfg_if! {
-    if #[cfg(any(
-        all(unix, not(target_os = "l4re")),
-        windows,
-        target_os = "hermit",
-        target_os = "solid_asp3"
-    ))] {
-        pub mod net;
-    } else {
-        pub use crate::sys::net;
-    }
-}
 
 // common error constructors
 
 /// A trait for viewing representations from std types
 #[doc(hidden)]
+#[allow(dead_code)] // not used on all platforms
 pub trait AsInner<Inner: ?Sized> {
     fn as_inner(&self) -> &Inner;
 }
 
 /// A trait for viewing representations from std types
 #[doc(hidden)]
+#[allow(dead_code)] // not used on all platforms
 pub trait AsInnerMut<Inner: ?Sized> {
     fn as_inner_mut(&mut self) -> &mut Inner;
 }
@@ -81,15 +49,22 @@ pub trait FromInner<Inner> {
     fn from_inner(inner: Inner) -> Self;
 }
 
-// Computes (value*numer)/denom without overflow, as long as both
-// (numer*denom) and the overall result fit into i64 (which is the case
-// for our time conversions).
+// Computes (value*numerator)/denom without overflow, as long as both (numerator*denom) and the
+// overall result fit into i64 (which is the case for our time conversions).
 #[allow(dead_code)] // not used on all platforms
-pub fn mul_div_u64(value: u64, numer: u64, denom: u64) -> u64 {
+pub fn mul_div_u64(value: u64, numerator: u64, denom: u64) -> u64 {
     let q = value / denom;
     let r = value % denom;
     // Decompose value as (value/denom*denom + value%denom),
-    // substitute into (value*numer)/denom and simplify.
-    // r < denom, so (denom*numer) is the upper bound of (r*numer)
-    q * numer + r * numer / denom
+    // substitute into (value*numerator)/denom and simplify.
+    // r < denom, so (denom*numerator) is the upper bound of (r*numerator)
+    q * numerator + r * numerator / denom
+}
+
+pub fn ignore_notfound<T>(result: crate::io::Result<T>) -> crate::io::Result<()> {
+    match result {
+        Err(err) if err.kind() == crate::io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => Ok(()),
+        Err(err) => Err(err),
+    }
 }

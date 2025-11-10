@@ -1,4 +1,4 @@
-// compile-flags: -Znext-solver
+//@ compile-flags: -Znext-solver
 
 #![feature(fn_traits)]
 #![feature(unboxed_closures)]
@@ -13,5 +13,5 @@ fn foo<F: Fn<T>, T: Tuple>(f: Option<F>, t: T) {
 
 fn main() {
     foo::<fn() -> str, _>(None, ());
-    //~^ expected a `Fn<_>` closure, found `fn() -> str`
+    //~^ ERROR the size for values of type `str` cannot be known at compilation time
 }

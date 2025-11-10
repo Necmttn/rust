@@ -1,7 +1,7 @@
 use hir::InFile;
 use syntax::ast;
 
-use crate::{adjusted_display_range, Diagnostic, DiagnosticCode, DiagnosticsContext, Severity};
+use crate::{Diagnostic, DiagnosticCode, DiagnosticsContext, Severity, adjusted_display_range};
 
 // Diagnostic: trait-impl-incorrect-safety
 //
@@ -19,7 +19,7 @@ pub(crate) fn trait_impl_incorrect_safety(
         },
         adjusted_display_range::<ast::Impl>(
             ctx,
-            InFile { file_id: d.file_id, value: d.impl_.syntax_node_ptr() },
+            InFile { file_id: d.file_id, value: d.impl_ },
             &|impl_| {
                 if d.should_be_safe {
                     Some(match (impl_.unsafe_token(), impl_.impl_token()) {
@@ -33,6 +33,7 @@ pub(crate) fn trait_impl_incorrect_safety(
             },
         ),
     )
+    .stable()
 }
 
 #[cfg(test)]
@@ -124,6 +125,15 @@ struct S;
   unsafe impl S {}
 //^^^^^^^^^^^ error: unsafe impl for safe trait
 "#,
+        );
+    }
+
+    #[test]
+    fn unsafe_unresolved_trait() {
+        check_diagnostics(
+            r#"
+unsafe impl TestTrait for u32 {}
+        "#,
         );
     }
 }

@@ -1,8 +1,14 @@
-use crate::spec::{PanicStrategy, Target, TargetOptions};
+use crate::spec::{Arch, PanicStrategy, Target, TargetMetadata, TargetOptions};
 
-pub fn target() -> Target {
+pub(crate) fn target() -> Target {
     Target {
         llvm_target: "hexagon-unknown-none-elf".into(),
+        metadata: TargetMetadata {
+            description: Some("Bare Hexagon (v60+, HVX)".into()),
+            tier: Some(3),
+            host_tools: Some(false),
+            std: Some(false),
+        },
         pointer_width: 32,
         data_layout: concat!(
             "e-m:e-p:32:32:32-a:0-n16:32-i64:64:64-i32:32",
@@ -11,7 +17,7 @@ pub fn target() -> Target {
             ":2048:2048"
         )
         .into(),
-        arch: "hexagon".into(),
+        arch: Arch::Hexagon,
 
         options: TargetOptions {
             cpu: "hexagonv60".into(),
@@ -21,6 +27,7 @@ pub fn target() -> Target {
             max_atomic_width: Some(32),
             emit_debug_gdb_scripts: false,
             c_enum_min_bits: Some(8),
+            linker: Some("rust-lld".into()),
             ..Default::default()
         },
     }

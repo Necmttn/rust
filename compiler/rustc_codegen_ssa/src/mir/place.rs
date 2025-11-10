@@ -1,36 +1,97 @@
+use rustc_abi::{
+    Align, BackendRepr, FieldIdx, FieldsShape, Size, TagEncoding, VariantIdx, Variants,
+};
+use rustc_middle::mir::PlaceTy;
+use rustc_middle::mir::interpret::Scalar;
+use rustc_middle::ty::layout::{HasTyCtxt, HasTypingEnv, LayoutOf, TyAndLayout};
+use rustc_middle::ty::{self, Ty};
+use rustc_middle::{bug, mir};
+use tracing::{debug, instrument};
+
 use super::operand::OperandValue;
 use super::{FunctionCx, LocalRef};
-
 use crate::common::IntPredicate;
 use crate::size_of_val;
 use crate::traits::*;
 
-use rustc_middle::mir;
-use rustc_middle::mir::tcx::PlaceTy;
-use rustc_middle::ty::layout::{HasTyCtxt, LayoutOf, TyAndLayout};
-use rustc_middle::ty::{self, Ty};
-use rustc_target::abi::{Abi, Align, FieldsShape, Int, Pointer, TagEncoding};
-use rustc_target::abi::{VariantIdx, Variants};
-
+/// The location and extra runtime properties of the place.
+///
+/// Typically found in a [`PlaceRef`] or an [`OperandValue::Ref`].
+///
+/// As a location in memory, this has no specific type. If you want to
+/// load or store it using a typed operation, use [`Self::with_type`].
 #[derive(Copy, Clone, Debug)]
-pub struct PlaceRef<'tcx, V> {
+pub struct PlaceValue<V> {
     /// A pointer to the contents of the place.
     pub llval: V,
 
     /// This place's extra data if it is unsized, or `None` if null.
     pub llextra: Option<V>,
 
-    /// The monomorphized type of this place, including variant information.
-    pub layout: TyAndLayout<'tcx>,
-
     /// The alignment we know for this place.
     pub align: Align,
 }
 
+impl<V: CodegenObject> PlaceValue<V> {
+    /// Constructor for the ordinary case of `Sized` types.
+    ///
+    /// Sets `llextra` to `None`.
+    pub fn new_sized(llval: V, align: Align) -> PlaceValue<V> {
+        PlaceValue { llval, llextra: None, align }
+    }
+
+    /// Allocates a stack slot in the function for a value
+    /// of the specified size and alignment.
+    ///
+    /// The allocation itself is untyped.
+    pub fn alloca<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx, Value = V>>(
+        bx: &mut Bx,
+        size: Size,
+        align: Align,
+    ) -> PlaceValue<V> {
+        let llval = bx.alloca(size, align);
+        PlaceValue::new_sized(llval, align)
+    }
+
+    /// Creates a `PlaceRef` to this location with the given type.
+    pub fn with_type<'tcx>(self, layout: TyAndLayout<'tcx>) -> PlaceRef<'tcx, V> {
+        assert!(
+            layout.is_unsized() || layout.is_uninhabited() || self.llextra.is_none(),
+            "Had pointer metadata {:?} for sized type {layout:?}",
+            self.llextra,
+        );
+        PlaceRef { val: self, layout }
+    }
+
+    /// Gets the pointer to this place as an [`OperandValue::Immediate`]
+    /// or, for those needing metadata, an [`OperandValue::Pair`].
+    ///
+    /// This is the inverse of [`OperandValue::deref`].
+    pub fn address(self) -> OperandValue<V> {
+        if let Some(llextra) = self.llextra {
+            OperandValue::Pair(self.llval, llextra)
+        } else {
+            OperandValue::Immediate(self.llval)
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct PlaceRef<'tcx, V> {
+    /// The location and extra runtime properties of the place.
+    pub val: PlaceValue<V>,
+
+    /// The monomorphized type of this place, including variant information.
+    ///
+    /// You probably shouldn't use the alignment from this layout;
+    /// rather you should use the `.val.align` of the actual place,
+    /// which might be different from the type's normal alignment.
+    pub layout: TyAndLayout<'tcx>,
+}
+
 impl<'a, 'tcx, V: CodegenObject> PlaceRef<'tcx, V> {
     pub fn new_sized(llval: V, layout: TyAndLayout<'tcx>) -> PlaceRef<'tcx, V> {
-        assert!(layout.is_sized());
-        PlaceRef { llval, llextra: None, layout, align: layout.align.abi }
+        PlaceRef::new_sized_aligned(llval, layout, layout.align.abi)
     }
 
     pub fn new_sized_aligned(
@@ -39,7 +100,7 @@ impl<'a, 'tcx, V: CodegenObject> PlaceRef<'tcx, V> {
         align: Align,
     ) -> PlaceRef<'tcx, V> {
         assert!(layout.is_sized());
-        PlaceRef { llval, llextra: None, layout, align }
+        PlaceValue::new_sized(llval, align).with_type(layout)
     }
 
     // FIXME(eddyb) pass something else for the name so no work is done
@@ -48,17 +109,16 @@ impl<'a, 'tcx, V: CodegenObject> PlaceRef<'tcx, V> {
         bx: &mut Bx,
         layout: TyAndLayout<'tcx>,
     ) -> Self {
-        Self::alloca_aligned(bx, layout, layout.align.abi)
+        Self::alloca_size(bx, layout.size, layout)
     }
 
-    pub fn alloca_aligned<Bx: BuilderMethods<'a, 'tcx, Value = V>>(
+    pub fn alloca_size<Bx: BuilderMethods<'a, 'tcx, Value = V>>(
         bx: &mut Bx,
+        size: Size,
         layout: TyAndLayout<'tcx>,
-        align: Align,
     ) -> Self {
         assert!(layout.is_sized(), "tried to statically allocate unsized place");
-        let tmp = bx.alloca(bx.cx().backend_type(layout), align);
-        Self::new_sized_aligned(tmp, layout, align)
+        PlaceValue::alloca(bx, size, layout.align.abi).with_type(layout)
     }
 
     /// Returns a place for an indirect reference to an unsized place.
@@ -74,11 +134,11 @@ impl<'a, 'tcx, V: CodegenObject> PlaceRef<'tcx, V> {
         Self::alloca(bx, ptr_layout)
     }
 
-    pub fn len<Cx: ConstMethods<'tcx, Value = V>>(&self, cx: &Cx) -> V {
+    pub fn len<Cx: ConstCodegenMethods<Value = V>>(&self, cx: &Cx) -> V {
         if let FieldsShape::Array { count, .. } = self.layout.fields {
             if self.layout.is_unsized() {
                 assert_eq!(count, 0);
-                self.llextra.unwrap()
+                self.val.llextra.unwrap()
             } else {
                 cx.const_usize(count)
             }
@@ -97,46 +157,26 @@ impl<'a, 'tcx, V: CodegenObject> PlaceRef<'tcx, V> {
     ) -> Self {
         let field = self.layout.field(bx.cx(), ix);
         let offset = self.layout.fields.offset(ix);
-        let effective_field_align = self.align.restrict_for_offset(offset);
+        let effective_field_align = self.val.align.restrict_for_offset(offset);
 
         // `simple` is called when we don't need to adjust the offset to
         // the dynamic alignment of the field.
         let mut simple = || {
-            let llval = match self.layout.abi {
-                _ if offset.bytes() == 0 => {
-                    // Unions and newtypes only use an offset of 0.
-                    // Also handles the first field of Scalar, ScalarPair, and Vector layouts.
-                    self.llval
-                }
-                Abi::ScalarPair(..) => {
-                    // FIXME(nikic): Generate this for all ABIs.
-                    bx.inbounds_gep(bx.type_i8(), self.llval, &[bx.const_usize(offset.bytes())])
-                }
-                Abi::Scalar(_) | Abi::Vector { .. } if field.is_zst() => {
-                    // ZST fields (even some that require alignment) are not included in Scalar,
-                    // ScalarPair, and Vector layouts, so manually offset the pointer.
-                    bx.gep(bx.cx().type_i8(), self.llval, &[bx.const_usize(offset.bytes())])
-                }
-                Abi::Scalar(_) => {
-                    // All fields of Scalar layouts must have been handled by this point.
-                    // Vector layouts have additional fields for each element of the vector, so don't panic in that case.
-                    bug!(
-                        "offset of non-ZST field `{:?}` does not match layout `{:#?}`",
-                        field,
-                        self.layout
-                    );
-                }
-                _ => {
-                    let ty = bx.backend_type(self.layout);
-                    bx.struct_gep(ty, self.llval, bx.cx().backend_field_index(self.layout, ix))
-                }
+            let llval = if offset.bytes() == 0 {
+                self.val.llval
+            } else {
+                bx.inbounds_ptradd(self.val.llval, bx.const_usize(offset.bytes()))
             };
-            PlaceRef {
+            let val = PlaceValue {
                 llval,
-                llextra: if bx.cx().type_has_metadata(field.ty) { self.llextra } else { None },
-                layout: field,
+                llextra: if bx.cx().tcx().type_has_metadata(field.ty, bx.cx().typing_env()) {
+                    self.val.llextra
+                } else {
+                    None
+                },
                 align: effective_field_align,
-            }
+            };
+            val.with_type(field)
         };
 
         // Simple cases, which don't need DST adjustment:
@@ -166,7 +206,7 @@ impl<'a, 'tcx, V: CodegenObject> PlaceRef<'tcx, V> {
         // The type `Foo<Foo<Trait>>` is represented in LLVM as `{ u16, { u16, u8 }}`, meaning that
         // the `y` field has 16-bit alignment.
 
-        let meta = self.llextra;
+        let meta = self.val.llextra;
 
         let unaligned_offset = bx.cx().const_usize(offset.bytes());
 
@@ -188,131 +228,10 @@ impl<'a, 'tcx, V: CodegenObject> PlaceRef<'tcx, V> {
         debug!("struct_field_ptr: DST field offset: {:?}", offset);
 
         // Adjust pointer.
-        let ptr = bx.gep(bx.cx().type_i8(), self.llval, &[offset]);
-
-        PlaceRef { llval: ptr, llextra: self.llextra, layout: field, align: effective_field_align }
-    }
-
-    /// Obtain the actual discriminant of a value.
-    #[instrument(level = "trace", skip(bx))]
-    pub fn codegen_get_discr<Bx: BuilderMethods<'a, 'tcx, Value = V>>(
-        self,
-        bx: &mut Bx,
-        cast_to: Ty<'tcx>,
-    ) -> V {
-        let dl = &bx.tcx().data_layout;
-        let cast_to_layout = bx.cx().layout_of(cast_to);
-        let cast_to = bx.cx().immediate_backend_type(cast_to_layout);
-        if self.layout.abi.is_uninhabited() {
-            return bx.cx().const_poison(cast_to);
-        }
-        let (tag_scalar, tag_encoding, tag_field) = match self.layout.variants {
-            Variants::Single { index } => {
-                let discr_val = self
-                    .layout
-                    .ty
-                    .discriminant_for_variant(bx.cx().tcx(), index)
-                    .map_or(index.as_u32() as u128, |discr| discr.val);
-                return bx.cx().const_uint_big(cast_to, discr_val);
-            }
-            Variants::Multiple { tag, ref tag_encoding, tag_field, .. } => {
-                (tag, tag_encoding, tag_field)
-            }
-        };
-
-        // Read the tag/niche-encoded discriminant from memory.
-        let tag = self.project_field(bx, tag_field);
-        let tag_op = bx.load_operand(tag);
-        let tag_imm = tag_op.immediate();
-
-        // Decode the discriminant (specifically if it's niche-encoded).
-        match *tag_encoding {
-            TagEncoding::Direct => {
-                let signed = match tag_scalar.primitive() {
-                    // We use `i1` for bytes that are always `0` or `1`,
-                    // e.g., `#[repr(i8)] enum E { A, B }`, but we can't
-                    // let LLVM interpret the `i1` as signed, because
-                    // then `i1 1` (i.e., `E::B`) is effectively `i8 -1`.
-                    Int(_, signed) => !tag_scalar.is_bool() && signed,
-                    _ => false,
-                };
-                bx.intcast(tag_imm, cast_to, signed)
-            }
-            TagEncoding::Niche { untagged_variant, ref niche_variants, niche_start } => {
-                // Cast to an integer so we don't have to treat a pointer as a
-                // special case.
-                let (tag, tag_llty) = match tag_scalar.primitive() {
-                    // FIXME(erikdesjardins): handle non-default addrspace ptr sizes
-                    Pointer(_) => {
-                        let t = bx.type_from_integer(dl.ptr_sized_integer());
-                        let tag = bx.ptrtoint(tag_imm, t);
-                        (tag, t)
-                    }
-                    _ => (tag_imm, bx.cx().immediate_backend_type(tag_op.layout)),
-                };
-
-                let relative_max = niche_variants.end().as_u32() - niche_variants.start().as_u32();
-
-                // We have a subrange `niche_start..=niche_end` inside `range`.
-                // If the value of the tag is inside this subrange, it's a
-                // "niche value", an increment of the discriminant. Otherwise it
-                // indicates the untagged variant.
-                // A general algorithm to extract the discriminant from the tag
-                // is:
-                // relative_tag = tag - niche_start
-                // is_niche = relative_tag <= (ule) relative_max
-                // discr = if is_niche {
-                //     cast(relative_tag) + niche_variants.start()
-                // } else {
-                //     untagged_variant
-                // }
-                // However, we will likely be able to emit simpler code.
-                let (is_niche, tagged_discr, delta) = if relative_max == 0 {
-                    // Best case scenario: only one tagged variant. This will
-                    // likely become just a comparison and a jump.
-                    // The algorithm is:
-                    // is_niche = tag == niche_start
-                    // discr = if is_niche {
-                    //     niche_start
-                    // } else {
-                    //     untagged_variant
-                    // }
-                    let niche_start = bx.cx().const_uint_big(tag_llty, niche_start);
-                    let is_niche = bx.icmp(IntPredicate::IntEQ, tag, niche_start);
-                    let tagged_discr =
-                        bx.cx().const_uint(cast_to, niche_variants.start().as_u32() as u64);
-                    (is_niche, tagged_discr, 0)
-                } else {
-                    // The special cases don't apply, so we'll have to go with
-                    // the general algorithm.
-                    let relative_discr = bx.sub(tag, bx.cx().const_uint_big(tag_llty, niche_start));
-                    let cast_tag = bx.intcast(relative_discr, cast_to, false);
-                    let is_niche = bx.icmp(
-                        IntPredicate::IntULE,
-                        relative_discr,
-                        bx.cx().const_uint(tag_llty, relative_max as u64),
-                    );
-                    (is_niche, cast_tag, niche_variants.start().as_u32() as u128)
-                };
-
-                let tagged_discr = if delta == 0 {
-                    tagged_discr
-                } else {
-                    bx.add(tagged_discr, bx.cx().const_uint_big(cast_to, delta))
-                };
-
-                let discr = bx.select(
-                    is_niche,
-                    tagged_discr,
-                    bx.cx().const_uint(cast_to, untagged_variant.as_u32() as u64),
-                );
-
-                // In principle we could insert assumes on the possible range of `discr`, but
-                // currently in LLVM this seems to be a pessimization.
-
-                discr
-            }
-        }
+        let ptr = bx.inbounds_ptradd(self.val.llval, offset);
+        let val =
+            PlaceValue { llval: ptr, llextra: self.val.llextra, align: effective_field_align };
+        val.with_type(field)
     }
 
     /// Sets the discriminant for a new value of the given case of the given
@@ -322,47 +241,17 @@ impl<'a, 'tcx, V: CodegenObject> PlaceRef<'tcx, V> {
         bx: &mut Bx,
         variant_index: VariantIdx,
     ) {
-        if self.layout.for_variant(bx.cx(), variant_index).abi.is_uninhabited() {
-            // We play it safe by using a well-defined `abort`, but we could go for immediate UB
-            // if that turns out to be helpful.
-            bx.abort();
-            return;
-        }
-        match self.layout.variants {
-            Variants::Single { index } => {
-                assert_eq!(index, variant_index);
+        match codegen_tag_value(bx.cx(), variant_index, self.layout) {
+            Err(UninhabitedVariantError) => {
+                // We play it safe by using a well-defined `abort`, but we could go for immediate UB
+                // if that turns out to be helpful.
+                bx.abort();
             }
-            Variants::Multiple { tag_encoding: TagEncoding::Direct, tag_field, .. } => {
-                let ptr = self.project_field(bx, tag_field);
-                let to =
-                    self.layout.ty.discriminant_for_variant(bx.tcx(), variant_index).unwrap().val;
-                bx.store(
-                    bx.cx().const_uint_big(bx.cx().backend_type(ptr.layout), to),
-                    ptr.llval,
-                    ptr.align,
-                );
+            Ok(Some((tag_field, imm))) => {
+                let tag_place = self.project_field(bx, tag_field.as_usize());
+                OperandValue::Immediate(imm).store(bx, tag_place);
             }
-            Variants::Multiple {
-                tag_encoding:
-                    TagEncoding::Niche { untagged_variant, ref niche_variants, niche_start },
-                tag_field,
-                ..
-            } => {
-                if variant_index != untagged_variant {
-                    let niche = self.project_field(bx, tag_field);
-                    let niche_llty = bx.cx().immediate_backend_type(niche.layout);
-                    let niche_value = variant_index.as_u32() - niche_variants.start().as_u32();
-                    let niche_value = (niche_value as u128).wrapping_add(niche_start);
-                    // FIXME(eddyb): check the actual primitive type here.
-                    let niche_llval = if niche_value == 0 {
-                        // HACK(eddyb): using `c_null` as it works on all types.
-                        bx.cx().const_null(niche_llty)
-                    } else {
-                        bx.cx().const_uint_big(niche_llty, niche_value)
-                    };
-                    OperandValue::Immediate(niche_llval).store(bx, niche);
-                }
-            }
+            Ok(None) => {}
         }
     }
 
@@ -380,16 +269,9 @@ impl<'a, 'tcx, V: CodegenObject> PlaceRef<'tcx, V> {
             layout.size
         };
 
-        PlaceRef {
-            llval: bx.inbounds_gep(
-                bx.cx().backend_type(self.layout),
-                self.llval,
-                &[bx.cx().const_usize(0), llindex],
-            ),
-            llextra: None,
-            layout,
-            align: self.align.restrict_for_offset(offset),
-        }
+        let llval = bx.inbounds_nuw_gep(bx.cx().backend_type(layout), self.val.llval, &[llindex]);
+        let align = self.val.align.restrict_for_offset(offset);
+        PlaceValue::new_sized(llval, align).with_type(layout)
     }
 
     pub fn project_downcast<Bx: BuilderMethods<'a, 'tcx, Value = V>>(
@@ -413,11 +295,11 @@ impl<'a, 'tcx, V: CodegenObject> PlaceRef<'tcx, V> {
     }
 
     pub fn storage_live<Bx: BuilderMethods<'a, 'tcx, Value = V>>(&self, bx: &mut Bx) {
-        bx.lifetime_start(self.llval, self.layout.size);
+        bx.lifetime_start(self.val.llval, self.layout.size);
     }
 
     pub fn storage_dead<Bx: BuilderMethods<'a, 'tcx, Value = V>>(&self, bx: &mut Bx) {
-        bx.lifetime_end(self.llval, self.layout.size);
+        bx.lifetime_end(self.val.llval, self.layout.size);
     }
 }
 
@@ -455,12 +337,19 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
             cg_base = match *elem {
                 mir::ProjectionElem::Deref => bx.load_operand(cg_base).deref(bx.cx()),
                 mir::ProjectionElem::Field(ref field, _) => {
+                    assert!(
+                        !cg_base.layout.ty.is_any_ptr(),
+                        "Bad PlaceRef: destructing pointers should use cast/PtrMetadata, \
+                         but tried to access field {field:?} of pointer {cg_base:?}",
+                    );
                     cg_base.project_field(bx, field.index())
                 }
                 mir::ProjectionElem::OpaqueCast(ty) => {
                     bug!("encountered OpaqueCast({ty}) in codegen")
                 }
-                mir::ProjectionElem::Subtype(ty) => cg_base.project_type(bx, self.monomorphize(ty)),
+                mir::ProjectionElem::UnwrapUnsafeBinder(ty) => {
+                    cg_base.project_type(bx, self.monomorphize(ty))
+                }
                 mir::ProjectionElem::Index(index) => {
                     let index = &mir::Operand::Copy(mir::Place::from(index));
                     let index = self.codegen_operand(bx, index);
@@ -485,8 +374,9 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
 
                     if subslice.layout.is_unsized() {
                         assert!(from_end, "slice subslices should be `from_end`");
-                        subslice.llextra =
-                            Some(bx.sub(cg_base.llextra.unwrap(), bx.cx().const_usize(from + to)));
+                        subslice.val.llextra = Some(
+                            bx.sub(cg_base.val.llextra.unwrap(), bx.cx().const_usize(from + to)),
+                        );
                     }
 
                     subslice
@@ -546,3 +436,73 @@ fn round_up_const_value_to_alignment<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
     let offset = bx.and(neg_value, align_minus_1);
     bx.add(value, offset)
 }
+
+/// Calculates the value that needs to be stored to mark the discriminant.
+///
+/// This might be `None` for a `struct` or a niched variant (like `Some(&3)`).
+///
+/// If it's `Some`, it returns the value to store and the field in which to
+/// store it. Note that this value is *not* the same as the discriminant, in
+/// general, as it might be a niche value or have a different size.
+///
+/// It might also be an `Err` because the variant is uninhabited.
+pub(super) fn codegen_tag_value<'tcx, V>(
+    cx: &impl CodegenMethods<'tcx, Value = V>,
+    variant_index: VariantIdx,
+    layout: TyAndLayout<'tcx>,
+) -> Result<Option<(FieldIdx, V)>, UninhabitedVariantError> {
+    // By checking uninhabited-ness first we don't need to worry about types
+    // like `(u32, !)` which are single-variant but weird.
+    if layout.for_variant(cx, variant_index).is_uninhabited() {
+        return Err(UninhabitedVariantError);
+    }
+
+    Ok(match layout.variants {
+        Variants::Empty => unreachable!("we already handled uninhabited types"),
+        Variants::Single { index } => {
+            assert_eq!(index, variant_index);
+            None
+        }
+
+        Variants::Multiple { tag_encoding: TagEncoding::Direct, tag_field, .. } => {
+            let discr = layout.ty.discriminant_for_variant(cx.tcx(), variant_index);
+            let to = discr.unwrap().val;
+            let tag_layout = layout.field(cx, tag_field.as_usize());
+            let tag_llty = cx.immediate_backend_type(tag_layout);
+            let imm = cx.const_uint_big(tag_llty, to);
+            Some((tag_field, imm))
+        }
+        Variants::Multiple {
+            tag_encoding: TagEncoding::Niche { untagged_variant, ref niche_variants, niche_start },
+            tag_field,
+            ..
+        } => {
+            if variant_index != untagged_variant {
+                let niche_layout = layout.field(cx, tag_field.as_usize());
+                let niche_llty = cx.immediate_backend_type(niche_layout);
+                let BackendRepr::Scalar(scalar) = niche_layout.backend_repr else {
+                    bug!("expected a scalar placeref for the niche");
+                };
+                // We are supposed to compute `niche_value.wrapping_add(niche_start)` wrapping
+                // around the `niche`'s type.
+                // The easiest way to do that is to do wrapping arithmetic on `u128` and then
+                // masking off any extra bits that occur because we did the arithmetic with too many bits.
+                let niche_value = variant_index.as_u32() - niche_variants.start().as_u32();
+                let niche_value = (niche_value as u128).wrapping_add(niche_start);
+                let niche_value = niche_value & niche_layout.size.unsigned_int_max();
+
+                let niche_llval = cx.scalar_to_backend(
+                    Scalar::from_uint(niche_value, niche_layout.size),
+                    scalar,
+                    niche_llty,
+                );
+                Some((tag_field, niche_llval))
+            } else {
+                None
+            }
+        }
+    })
+}
+
+#[derive(Debug)]
+pub(super) struct UninhabitedVariantError;

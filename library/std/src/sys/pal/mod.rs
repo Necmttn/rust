@@ -24,106 +24,78 @@
 
 pub mod common;
 
-cfg_if::cfg_if! {
-    if #[cfg(unix)] {
+cfg_select! {
+    unix => {
         mod unix;
         pub use self::unix::*;
-    } else if #[cfg(windows)] {
+    }
+    windows => {
         mod windows;
         pub use self::windows::*;
-    } else if #[cfg(target_os = "solid_asp3")] {
+    }
+    target_os = "solid_asp3" => {
         mod solid;
         pub use self::solid::*;
-    } else if #[cfg(target_os = "hermit")] {
+    }
+    target_os = "hermit" => {
         mod hermit;
         pub use self::hermit::*;
-    } else if #[cfg(target_os = "wasi")] {
-        mod wasi;
-        pub use self::wasi::*;
-    } else if #[cfg(all(target_os = "wasi", target_env = "preview2"))] {
-        mod wasi_preview2;
-        pub use self::wasi_preview2::*;
-    } else if #[cfg(target_family = "wasm")] {
+    }
+    target_os = "motor" => {
+        mod motor;
+        pub use self::motor::*;
+    }
+    target_os = "trusty" => {
+        mod trusty;
+        pub use self::trusty::*;
+    }
+    target_os = "vexos" => {
+        mod vexos;
+        pub use self::vexos::*;
+    }
+    all(target_os = "wasi", any(target_env = "p2", target_env = "p3")) => {
+        mod wasip2;
+        pub use self::wasip2::*;
+    }
+    all(target_os = "wasi", target_env = "p1") => {
+        mod wasip1;
+        pub use self::wasip1::*;
+    }
+    target_family = "wasm" => {
         mod wasm;
         pub use self::wasm::*;
-    } else if #[cfg(target_os = "xous")] {
+    }
+    target_os = "xous" => {
         mod xous;
         pub use self::xous::*;
-    } else if #[cfg(target_os = "uefi")] {
+    }
+    target_os = "uefi" => {
         mod uefi;
         pub use self::uefi::*;
-    } else if #[cfg(all(target_vendor = "fortanix", target_env = "sgx"))] {
+    }
+    all(target_vendor = "fortanix", target_env = "sgx") => {
         mod sgx;
         pub use self::sgx::*;
-    } else if #[cfg(target_os = "teeos")] {
+    }
+    target_os = "teeos" => {
         mod teeos;
         pub use self::teeos::*;
-    } else if #[cfg(target_os = "zkvm")] {
+    }
+    target_os = "zkvm" => {
         mod zkvm;
         pub use self::zkvm::*;
-    } else {
+    }
+    _ => {
         mod unsupported;
         pub use self::unsupported::*;
     }
 }
 
-cfg_if::cfg_if! {
+pub const FULL_BACKTRACE_DEFAULT: bool = cfg_select! {
     // Fuchsia components default to full backtrace.
-    if #[cfg(target_os = "fuchsia")] {
-        pub const FULL_BACKTRACE_DEFAULT: bool = true;
-    } else {
-        pub const FULL_BACKTRACE_DEFAULT: bool = false;
-    }
-}
-
-#[cfg(not(test))]
-cfg_if::cfg_if! {
-    if #[cfg(target_os = "android")] {
-        pub use self::android::log2f32;
-        pub use self::android::log2f64;
-    } else {
-        #[inline]
-        pub fn log2f32(n: f32) -> f32 {
-            unsafe { crate::intrinsics::log2f32(n) }
-        }
-
-        #[inline]
-        pub fn log2f64(n: f64) -> f64 {
-            unsafe { crate::intrinsics::log2f64(n) }
-        }
-    }
-}
-
-// Solaris/Illumos requires a wrapper around log, log2, and log10 functions
-// because of their non-standard behavior (e.g., log(-n) returns -Inf instead
-// of expected NaN).
-#[cfg(not(test))]
-#[cfg(any(target_os = "solaris", target_os = "illumos"))]
-#[inline]
-pub fn log_wrapper<F: Fn(f64) -> f64>(n: f64, log_fn: F) -> f64 {
-    if n.is_finite() {
-        if n > 0.0 {
-            log_fn(n)
-        } else if n == 0.0 {
-            f64::NEG_INFINITY // log(0) = -Inf
-        } else {
-            f64::NAN // log(-n) = NaN
-        }
-    } else if n.is_nan() {
-        n // log(NaN) = NaN
-    } else if n > 0.0 {
-        n // log(Inf) = Inf
-    } else {
-        f64::NAN // log(-Inf) = NaN
-    }
-}
-
-#[cfg(not(test))]
-#[cfg(not(any(target_os = "solaris", target_os = "illumos")))]
-#[inline]
-pub fn log_wrapper<F: Fn(f64) -> f64>(n: f64, log_fn: F) -> f64 {
-    log_fn(n)
-}
+    target_os = "fuchsia" => true,
+    _ => false,
+};
 
 #[cfg(not(target_os = "uefi"))]
 pub type RawOsError = i32;

@@ -2,9 +2,9 @@
 // we incorrectly get `X: placeholder('x)`.
 // Make sure we ignore these bogus bounds and not use them for anything useful.
 //
-// revisions: fail pass
-// [fail] check-fail
-// [pass] check-pass
+//@ revisions: fail pass
+//@ [fail] check-fail
+//@ [pass] check-pass
 
 trait Trait {
     type Ty<'a> where Self: 'a;
@@ -30,11 +30,15 @@ mod fail {
     // don't use the bound to prove `'lt: 'static`.
     fn test_lifetime<'lt, T: Trait>(_: Foo<&'lt u8>) {}
     //[fail]~^ ERROR `&'lt u8` does not fulfill the required lifetime
+    //[fail]~| ERROR `&'lt u8` does not fulfill the required lifetime
+    //[fail]~| ERROR may not live long enough
 
     // implied bound: `T::Ty2<'lt>: placeholder('x)`.
     // don't use the bound to prove `T::Ty2<'lt>: 'static`.
     fn test_alias<'lt, T: AnotherTrait>(_: Foo<T::Ty2::<'lt>>) {}
     //[fail]~^ ERROR `<T as AnotherTrait>::Ty2<'lt>` does not fulfill the required lifetime
+    //[fail]~| ERROR `<T as AnotherTrait>::Ty2<'lt>` does not fulfill the required lifetime
+    //[fail]~| ERROR may not live long enough
 }
 
 

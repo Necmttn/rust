@@ -269,21 +269,15 @@
 //!
 //! * [DOT language](https://www.graphviz.org/doc/info/lang.html)
 
-#![doc(
-    html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/",
-    test(attr(allow(unused_variables), deny(warnings)))
-)]
-#![feature(rustdoc_internals)]
-#![doc(rust_logo)]
-#![allow(internal_features)]
-#![deny(rustc::untranslatable_diagnostic)]
-#![deny(rustc::diagnostic_outside_of_impl)]
-
-use LabelText::*;
+// tidy-alphabetical-start
+#![doc(test(attr(allow(unused_variables), deny(warnings), allow(internal_features))))]
+// tidy-alphabetical-end
 
 use std::borrow::Cow;
 use std::io;
 use std::io::prelude::*;
+
+use LabelText::*;
 
 /// The text for a graphviz label on a node or edge.
 pub enum LabelText<'a> {

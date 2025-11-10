@@ -1,4 +1,5 @@
-//@compile-flags: -Zmiri-disable-weak-memory-emulation -Zmiri-preemption-rate=0 -Zmiri-disable-stacked-borrows
+// We want to control preemption here. Stacked borrows interferes by having its own accesses.
+//@compile-flags: -Zmiri-deterministic-concurrency -Zmiri-disable-stacked-borrows
 
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicPtr, Ordering};
@@ -11,7 +12,7 @@ struct EvilSend<T>(pub T);
 unsafe impl<T> Send for EvilSend<T> {}
 unsafe impl<T> Sync for EvilSend<T> {}
 
-pub fn main() {
+fn main() {
     // Shared atomic pointer
     let pointer = AtomicPtr::new(null_mut::<usize>());
     let ptr = EvilSend(&pointer as *const AtomicPtr<usize>);
@@ -40,7 +41,7 @@ pub fn main() {
 
             sleep(Duration::from_millis(200));
 
-            stack_var = 1usize; //~ ERROR: Data race detected between (1) non-atomic write on thread `<unnamed>` and (2) non-atomic write on thread `<unnamed>`
+            stack_var = 1usize; //~ ERROR: Data race detected between (1) non-atomic write on thread `unnamed-2` and (2) non-atomic write on thread `unnamed-1`
 
             // read to silence errors
             stack_var

@@ -1,5 +1,5 @@
 // Derived from an ICE found in tokio-xmpp during a crater run.
-// edition:2021
+//@ edition:2021
 
 #![allow(dead_code)]
 
@@ -40,5 +40,5 @@ fn main() {
     let agent = Agent { info_result: InfoResult { node: None } };
     // FIXME: It would be nice for this to work. See #94067.
     assert_send(agent.handle());
-    //~^ cannot be sent between threads safely
+    //~^ ERROR cannot be sent between threads safely
 }

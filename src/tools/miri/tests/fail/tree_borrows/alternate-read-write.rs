@@ -2,7 +2,7 @@
 
 // Check that TB properly rejects alternating Reads and Writes, but tolerates
 // alternating only Reads to Reserved mutable references.
-pub fn main() {
+fn main() {
     let x = &mut 0u8;
     let y = unsafe { &mut *(x as *mut u8) };
     // Foreign Read, but this is a no-op from the point of view of y (still Reserved)
@@ -13,7 +13,8 @@ pub fn main() {
     // This time y gets Frozen...
     let _val = *x;
     // ... and the next Write attempt fails.
-    *y += 1; // Failure //~ ERROR: /write access through .* is forbidden/
+    //~v ERROR: /write access through .* is forbidden/
+    *y += 1; // Failure
     let _val = *x;
     *y += 1; // Unreachable
 }

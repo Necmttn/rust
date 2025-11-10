@@ -1,36 +1,33 @@
-use std::{ffi::OsStr, iter};
+use std::iter;
 
-use expect_test::{expect, Expect};
+use expect_test::{Expect, expect};
 use hir::Semantics;
 use ide_db::{
-    base_db::{FilePosition, FileRange},
+    FilePosition, FileRange, RootDatabase,
     defs::Definition,
-    documentation::{Documentation, HasDocs},
-    RootDatabase,
+    documentation::{DocsRangeMap, Documentation, HasDocs},
 };
 use itertools::Itertools;
-use syntax::{ast, match_ast, AstNode, SyntaxNode};
+use syntax::{AstNode, SyntaxNode, ast, match_ast};
 
 use crate::{
+    TryToNav,
     doc_links::{extract_definitions_from_docs, resolve_doc_path_for_def, rewrite_links},
-    fixture, TryToNav,
+    fixture,
 };
 
 fn check_external_docs(
-    ra_fixture: &str,
-    target_dir: Option<&OsStr>,
+    #[rust_analyzer::rust_fixture] ra_fixture: &str,
+    target_dir: Option<&str>,
     expect_web_url: Option<Expect>,
     expect_local_url: Option<Expect>,
-    sysroot: Option<&OsStr>,
+    sysroot: Option<&str>,
 ) {
     let (analysis, position) = fixture::position(ra_fixture);
     let links = analysis.external_docs(position, target_dir, sysroot).unwrap();
 
     let web_url = links.web_url;
     let local_url = links.local_url;
-
-    println!("web_url: {:?}", web_url);
-    println!("local_url: {:?}", local_url);
 
     match (expect_web_url, web_url) {
         (Some(expect), Some(url)) => expect.assert_eq(&url),
@@ -45,28 +42,33 @@ fn check_external_docs(
     }
 }
 
-fn check_rewrite(ra_fixture: &str, expect: Expect) {
+fn check_rewrite(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect) {
     let (analysis, position) = fixture::position(ra_fixture);
-    let sema = &Semantics::new(&*analysis.db);
-    let (cursor_def, docs) = def_under_cursor(sema, &position);
-    let res = rewrite_links(sema.db, docs.as_str(), cursor_def);
+    let sema = &Semantics::new(&analysis.db);
+    let (cursor_def, docs, range) = def_under_cursor(sema, &position);
+    let res =
+        hir::attach_db(sema.db, || rewrite_links(sema.db, docs.as_str(), cursor_def, Some(range)));
     expect.assert_eq(&res)
 }
 
-fn check_doc_links(ra_fixture: &str) {
+fn check_doc_links(#[rust_analyzer::rust_fixture] ra_fixture: &str) {
     let key_fn = |&(FileRange { file_id, range }, _): &_| (file_id, range.start());
 
     let (analysis, position, mut expected) = fixture::annotations(ra_fixture);
     expected.sort_by_key(key_fn);
-    let sema = &Semantics::new(&*analysis.db);
-    let (cursor_def, docs) = def_under_cursor(sema, &position);
+    let sema = &Semantics::new(&analysis.db);
+    let (cursor_def, docs, range) = def_under_cursor(sema, &position);
     let defs = extract_definitions_from_docs(&docs);
     let actual: Vec<_> = defs
         .into_iter()
-        .flat_map(|(_, link, ns)| {
-            let def = resolve_doc_path_for_def(sema.db, cursor_def, &link, ns)
-                .unwrap_or_else(|| panic!("Failed to resolve {link}"));
-            def.try_to_nav(sema.db).unwrap().into_iter().zip(iter::repeat(link))
+        .flat_map(|(text_range, link, ns)| {
+            let attr = range.map(text_range);
+            let is_inner_attr = attr.map(|(_file, attr)| attr.is_inner_attr()).unwrap_or(false);
+            let def = hir::attach_db(sema.db, || {
+                resolve_doc_path_for_def(sema.db, cursor_def, &link, ns, is_inner_attr)
+                    .unwrap_or_else(|| panic!("Failed to resolve {link}"))
+            });
+            def.try_to_nav(sema).unwrap().into_iter().zip(iter::repeat(link))
         })
         .map(|(nav_target, link)| {
             let range =
@@ -81,9 +83,9 @@ fn check_doc_links(ra_fixture: &str) {
 fn def_under_cursor(
     sema: &Semantics<'_, RootDatabase>,
     position: &FilePosition,
-) -> (Definition, Documentation) {
+) -> (Definition, Documentation, DocsRangeMap) {
     let (docs, def) = sema
-        .parse(position.file_id)
+        .parse_guess_edition(position.file_id)
         .syntax()
         .token_at_offset(position.offset)
         .left_biased()
@@ -92,31 +94,31 @@ fn def_under_cursor(
         .find_map(|it| node_to_def(sema, &it))
         .expect("no def found")
         .unwrap();
-    let docs = docs.expect("no docs found for cursor def");
-    (def, docs)
+    let (docs, range) = docs.expect("no docs found for cursor def");
+    (def, docs, range)
 }
 
 fn node_to_def(
     sema: &Semantics<'_, RootDatabase>,
     node: &SyntaxNode,
-) -> Option<Option<(Option<Documentation>, Definition)>> {
+) -> Option<Option<(Option<(Documentation, DocsRangeMap)>, Definition)>> {
     Some(match_ast! {
         match node {
-            ast::SourceFile(it)  => sema.to_def(&it).map(|def| (def.docs(sema.db), Definition::Module(def))),
-            ast::Module(it)      => sema.to_def(&it).map(|def| (def.docs(sema.db), Definition::Module(def))),
-            ast::Fn(it)          => sema.to_def(&it).map(|def| (def.docs(sema.db), Definition::Function(def))),
-            ast::Struct(it)      => sema.to_def(&it).map(|def| (def.docs(sema.db), Definition::Adt(hir::Adt::Struct(def)))),
-            ast::Union(it)       => sema.to_def(&it).map(|def| (def.docs(sema.db), Definition::Adt(hir::Adt::Union(def)))),
-            ast::Enum(it)        => sema.to_def(&it).map(|def| (def.docs(sema.db), Definition::Adt(hir::Adt::Enum(def)))),
-            ast::Variant(it)     => sema.to_def(&it).map(|def| (def.docs(sema.db), Definition::Variant(def))),
-            ast::Trait(it)       => sema.to_def(&it).map(|def| (def.docs(sema.db), Definition::Trait(def))),
-            ast::Static(it)      => sema.to_def(&it).map(|def| (def.docs(sema.db), Definition::Static(def))),
-            ast::Const(it)       => sema.to_def(&it).map(|def| (def.docs(sema.db), Definition::Const(def))),
-            ast::TypeAlias(it)   => sema.to_def(&it).map(|def| (def.docs(sema.db), Definition::TypeAlias(def))),
-            ast::Impl(it)        => sema.to_def(&it).map(|def| (def.docs(sema.db), Definition::SelfType(def))),
-            ast::RecordField(it) => sema.to_def(&it).map(|def| (def.docs(sema.db), Definition::Field(def))),
-            ast::TupleField(it)  => sema.to_def(&it).map(|def| (def.docs(sema.db), Definition::Field(def))),
-            ast::Macro(it)       => sema.to_def(&it).map(|def| (def.docs(sema.db), Definition::Macro(def))),
+            ast::SourceFile(it)  => sema.to_def(&it).map(|def| (def.docs_with_rangemap(sema.db), Definition::Module(def))),
+            ast::Module(it)      => sema.to_def(&it).map(|def| (def.docs_with_rangemap(sema.db), Definition::Module(def))),
+            ast::Fn(it)          => sema.to_def(&it).map(|def| (def.docs_with_rangemap(sema.db), Definition::Function(def))),
+            ast::Struct(it)      => sema.to_def(&it).map(|def| (def.docs_with_rangemap(sema.db), Definition::Adt(hir::Adt::Struct(def)))),
+            ast::Union(it)       => sema.to_def(&it).map(|def| (def.docs_with_rangemap(sema.db), Definition::Adt(hir::Adt::Union(def)))),
+            ast::Enum(it)        => sema.to_def(&it).map(|def| (def.docs_with_rangemap(sema.db), Definition::Adt(hir::Adt::Enum(def)))),
+            ast::Variant(it)     => sema.to_def(&it).map(|def| (def.docs_with_rangemap(sema.db), Definition::Variant(def))),
+            ast::Trait(it)       => sema.to_def(&it).map(|def| (def.docs_with_rangemap(sema.db), Definition::Trait(def))),
+            ast::Static(it)      => sema.to_def(&it).map(|def| (def.docs_with_rangemap(sema.db), Definition::Static(def))),
+            ast::Const(it)       => sema.to_def(&it).map(|def| (def.docs_with_rangemap(sema.db), Definition::Const(def))),
+            ast::TypeAlias(it)   => sema.to_def(&it).map(|def| (def.docs_with_rangemap(sema.db), Definition::TypeAlias(def))),
+            ast::Impl(it)        => sema.to_def(&it).map(|def| (def.docs_with_rangemap(sema.db), Definition::SelfType(def))),
+            ast::RecordField(it) => sema.to_def(&it).map(|def| (def.docs_with_rangemap(sema.db), Definition::Field(def))),
+            ast::TupleField(it)  => sema.to_def(&it).map(|def| (def.docs_with_rangemap(sema.db), Definition::Field(def))),
+            ast::Macro(it)       => sema.to_def(&it).map(|def| (def.docs_with_rangemap(sema.db), Definition::Macro(def))),
             // ast::Use(it) => sema.to_def(&it).map(|def| (Box::new(it) as _, def.attrs(sema.db))),
             _ => return None,
         }
@@ -130,10 +132,10 @@ fn external_docs_doc_builtin_type() {
 //- /main.rs crate:foo
 let x: u3$02 = 0;
 "#,
-        Some(OsStr::new("/home/user/project")),
+        Some("/home/user/project"),
         Some(expect![[r#"https://doc.rust-lang.org/nightly/core/primitive.u32.html"#]]),
         Some(expect![[r#"file:///sysroot/share/doc/rust/html/core/primitive.u32.html"#]]),
-        Some(OsStr::new("/sysroot")),
+        Some("/sysroot"),
     );
 }
 
@@ -146,10 +148,10 @@ use foo$0::Foo;
 //- /lib.rs crate:foo
 pub struct Foo;
 "#,
-        Some(OsStr::new("/home/user/project")),
+        Some("/home/user/project"),
         Some(expect![[r#"https://docs.rs/foo/*/foo/index.html"#]]),
         Some(expect![[r#"file:///home/user/project/doc/foo/index.html"#]]),
-        Some(OsStr::new("/sysroot")),
+        Some("/sysroot"),
     );
 }
 
@@ -160,10 +162,10 @@ fn external_docs_doc_url_std_crate() {
 //- /main.rs crate:std
 use self$0;
 "#,
-        Some(OsStr::new("/home/user/project")),
+        Some("/home/user/project"),
         Some(expect!["https://doc.rust-lang.org/stable/std/index.html"]),
         Some(expect!["file:///sysroot/share/doc/rust/html/std/index.html"]),
-        Some(OsStr::new("/sysroot")),
+        Some("/sysroot"),
     );
 }
 
@@ -174,10 +176,10 @@ fn external_docs_doc_url_struct() {
 //- /main.rs crate:foo
 pub struct Fo$0o;
 "#,
-        Some(OsStr::new("/home/user/project")),
+        Some("/home/user/project"),
         Some(expect![[r#"https://docs.rs/foo/*/foo/struct.Foo.html"#]]),
         Some(expect![[r#"file:///home/user/project/doc/foo/struct.Foo.html"#]]),
-        Some(OsStr::new("/sysroot")),
+        Some("/sysroot"),
     );
 }
 
@@ -188,10 +190,10 @@ fn external_docs_doc_url_windows_backslash_path() {
 //- /main.rs crate:foo
 pub struct Fo$0o;
 "#,
-        Some(OsStr::new(r"C:\Users\user\project")),
+        Some(r"C:\Users\user\project"),
         Some(expect![[r#"https://docs.rs/foo/*/foo/struct.Foo.html"#]]),
         Some(expect![[r#"file:///C:/Users/user/project/doc/foo/struct.Foo.html"#]]),
-        Some(OsStr::new("/sysroot")),
+        Some("/sysroot"),
     );
 }
 
@@ -202,10 +204,10 @@ fn external_docs_doc_url_windows_slash_path() {
 //- /main.rs crate:foo
 pub struct Fo$0o;
 "#,
-        Some(OsStr::new(r"C:/Users/user/project")),
+        Some("C:/Users/user/project"),
         Some(expect![[r#"https://docs.rs/foo/*/foo/struct.Foo.html"#]]),
         Some(expect![[r#"file:///C:/Users/user/project/doc/foo/struct.Foo.html"#]]),
-        Some(OsStr::new("/sysroot")),
+        Some("/sysroot"),
     );
 }
 
@@ -416,6 +418,30 @@ fn foo() {
 }
 
 #[test]
+fn external_docs_macro_export() {
+    check_external_docs(
+        r#"
+//- /lib.rs crate:foo
+pub mod inner {
+    #[macro_export]
+    macro_rules! my_macro {
+        () => {};
+    }
+}
+
+//- /main.rs crate:bar deps:foo
+fn main() {
+    foo::my_m$0acro!();
+}
+        "#,
+        Some("/home/user/project"),
+        Some(expect![[r#"https://docs.rs/foo/*/foo/macro.my_macro.html"#]]),
+        Some(expect![[r#"file:///home/user/project/doc/foo/macro.my_macro.html"#]]),
+        Some("/sysroot"),
+    );
+}
+
+#[test]
 fn doc_links_items_simple() {
     check_doc_links(
         r#"
@@ -579,6 +605,40 @@ struct S$0(i32);
 }
 
 #[test]
+fn doc_links_module() {
+    check_doc_links(
+        r#"
+/// [`M`]
+/// [`M::f`]
+mod M$0 {
+  //^ M
+  #![doc = "inner_item[`S`]"]
+
+    pub fn f() {}
+         //^ M::f
+    pub struct S;
+             //^ S
+}
+"#,
+    );
+
+    check_doc_links(
+        r#"
+mod M$0 {
+  //^ super::M
+    //! [`super::M`]
+    //! [`super::M::f`]
+    //! [`super::M::S`]
+    pub fn f() {}
+         //^ super::M::f
+    pub struct S;
+             //^ super::M::S
+}
+"#,
+    );
+}
+
+#[test]
 fn rewrite_html_root_url() {
     check_rewrite(
         r#"
@@ -687,6 +747,123 @@ fn rewrite_intra_doc_link_with_anchor() {
         //! $0[PartialEq#derivable]
         fn main() {}
         "#,
-        expect!["[PartialEq#derivable](https://doc.rust-lang.org/stable/core/cmp/trait.PartialEq.html#derivable)"],
+        expect![
+            "[PartialEq#derivable](https://doc.rust-lang.org/stable/core/cmp/trait.PartialEq.html#derivable)"
+        ],
+    );
+}
+
+#[test]
+fn rewrite_module() {
+    check_rewrite(
+        r#"
+//- /main.rs crate:foo
+/// [Foo]
+pub mod $0Foo{
+};
+"#,
+        expect![[r#"[Foo](https://docs.rs/foo/*/foo/Foo/index.html)"#]],
+    );
+
+    check_rewrite(
+        r#"
+//- /main.rs crate:foo
+pub mod $0Foo{
+    //! [super::Foo]
+};
+"#,
+        expect![[r#"[super::Foo](https://docs.rs/foo/*/foo/Foo/index.html)"#]],
+    );
+}
+
+#[test]
+fn rewrite_intra_doc_link_to_associated_item() {
+    check_rewrite(
+        r#"
+//- /main.rs crate:foo
+/// [Foo::bar]
+pub struct $0Foo;
+
+impl Foo {
+    fn bar() {}
+}
+"#,
+        expect![[r#"[Foo::bar](https://docs.rs/foo/*/foo/struct.Foo.html#method.bar)"#]],
+    );
+    check_rewrite(
+        r#"
+//- /main.rs crate:foo
+/// [Foo::bar]
+pub struct $0Foo {
+    bar: ()
+}
+"#,
+        expect![[r#"[Foo::bar](https://docs.rs/foo/*/foo/struct.Foo.html#structfield.bar)"#]],
+    );
+    check_rewrite(
+        r#"
+//- /main.rs crate:foo
+/// [Foo::Bar]
+pub enum $0Foo {
+    Bar
+}
+"#,
+        expect![[r#"[Foo::Bar](https://docs.rs/foo/*/foo/enum.Foo.html#variant.Bar)"#]],
+    );
+    check_rewrite(
+        r#"
+//- /main.rs crate:foo
+/// [Foo::BAR]
+pub struct $0Foo;
+
+impl Foo {
+    const BAR: () = ();
+}
+"#,
+        expect![[
+            r#"[Foo::BAR](https://docs.rs/foo/*/foo/struct.Foo.html#associatedconstant.BAR)"#
+        ]],
+    );
+    check_rewrite(
+        r#"
+//- /main.rs crate:foo
+/// [Foo::bar]
+pub trait $0Foo {
+    fn bar();
+}
+"#,
+        expect![[r#"[Foo::bar](https://docs.rs/foo/*/foo/trait.Foo.html#tymethod.bar)"#]],
+    );
+    check_rewrite(
+        r#"
+//- /main.rs crate:foo
+/// [Foo::Bar]
+pub trait $0Foo {
+    type Bar;
+}
+"#,
+        expect![[r#"[Foo::Bar](https://docs.rs/foo/*/foo/trait.Foo.html#associatedtype.Bar)"#]],
+    );
+    check_rewrite(
+        r#"
+//- /main.rs crate:foo
+/// [Foo::bar#anchor]
+pub struct $0Foo {
+    bar: (),
+}
+"#,
+        expect![[r#"[Foo::bar#anchor](https://docs.rs/foo/*/foo/struct.Foo.html#anchor)"#]],
+    );
+    check_rewrite(
+        r#"
+//- /main.rs crate:foo
+/// [method](Foo::bar)
+pub struct $0Foo;
+
+impl Foo {
+    fn bar() {}
+}
+"#,
+        expect![[r#"[method](https://docs.rs/foo/*/foo/struct.Foo.html#method.bar)"#]],
     );
 }

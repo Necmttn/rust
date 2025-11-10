@@ -3,7 +3,7 @@
 
 // Ensure that we check if trivial bounds on const items hold or not.
 
-const UNUSABLE: () = ()
+const UNUSABLE: () = () //~ ERROR entering unreachable code
 where
     String: Copy;
 

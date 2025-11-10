@@ -1,20 +1,19 @@
 //! Implementation of "implicit drop" inlay hints:
-//! ```no_run
-//! fn main() {
-//!     let x = vec![2];
-//!     if some_condition() {
-//!         /* drop(x) */return;
-//!     }
+//! ```ignore
+//! let x = vec![2];
+//! if some_condition() {
+//!     /* drop(x) */return;
 //! }
 //! ```
 use hir::{
+    DefWithBody,
     db::{DefDatabase as _, HirDatabase as _},
     mir::{MirSpan, TerminatorKind},
-    ChalkTyInterner, DefWithBody, Semantics,
 };
-use ide_db::{base_db::FileRange, RootDatabase};
+use ide_db::{FileRange, famous_defs::FamousDefs};
 
 use syntax::{
+    ToSmolStr,
     ast::{self, AstNode},
     match_ast,
 };
@@ -23,20 +22,20 @@ use crate::{InlayHint, InlayHintLabel, InlayHintPosition, InlayHintsConfig, Inla
 
 pub(super) fn hints(
     acc: &mut Vec<InlayHint>,
-    sema: &Semantics<'_, RootDatabase>,
-    config: &InlayHintsConfig,
-    def: &ast::Fn,
+    FamousDefs(sema, _): &FamousDefs<'_, '_>,
+    config: &InlayHintsConfig<'_>,
+    display_target: hir::DisplayTarget,
+    node: &ast::Fn,
 ) -> Option<()> {
     if !config.implicit_drop_hints {
         return None;
     }
 
-    let def = sema.to_def(def)?;
+    let def = sema.to_def(node)?;
     let def: DefWithBody = def.into();
 
-    let source_map = sema.db.body_with_source_map(def.into()).1;
+    let (hir, source_map) = sema.db.body_with_source_map(def.into());
 
-    let hir = sema.db.body(def.into());
     let mir = sema.db.mir_body(def.into()).ok()?;
 
     let local_to_binding = mir.local_to_binding_map();
@@ -47,15 +46,16 @@ pub(super) fn hints(
             if !place.projection.is_empty() {
                 continue; // Ignore complex cases for now
             }
-            if mir.locals[place.local].ty.adt_id(ChalkTyInterner).is_none() {
+            if mir.locals[place.local].ty.as_adt().is_none() {
                 continue; // Arguably only ADTs have significant drop impls
             }
-            let Some(binding) = local_to_binding.get(place.local) else {
+            let Some(&binding_idx) = local_to_binding.get(place.local) else {
                 continue; // Ignore temporary values
             };
             let range = match terminator.span {
                 MirSpan::ExprId(e) => match source_map.expr_syntax(e) {
-                    Ok(s) => {
+                    // don't show inlay hint for macro
+                    Ok(s) if !s.file_id.is_macro() => {
                         let root = &s.file_syntax(sema.db);
                         let expr = s.value.to_node(root);
                         let expr = expr.syntax();
@@ -70,30 +70,48 @@ pub(super) fn hints(
                             }
                         }
                     }
-                    Err(_) => continue,
+                    _ => continue,
                 },
                 MirSpan::PatId(p) => match source_map.pat_syntax(p) {
-                    Ok(s) => s.value.text_range(),
-                    Err(_) => continue,
+                    Ok(s) if !s.file_id.is_macro() => s.value.text_range(),
+                    _ => continue,
+                },
+                MirSpan::BindingId(b) => {
+                    match source_map
+                        .patterns_for_binding(b)
+                        .iter()
+                        .find_map(|p| source_map.pat_syntax(*p).ok())
+                    {
+                        Some(s) if !s.file_id.is_macro() => s.value.text_range(),
+                        _ => continue,
+                    }
+                }
+                MirSpan::SelfParam => match source_map.self_param_syntax() {
+                    Some(s) if !s.file_id.is_macro() => s.value.text_range(),
+                    _ => continue,
                 },
                 MirSpan::Unknown => continue,
             };
-            let binding = &hir.bindings[*binding];
-            let binding_source = binding
-                .definitions
-                .first()
-                .and_then(|d| source_map.pat_syntax(*d).ok())
-                .and_then(|d| {
-                    Some(FileRange { file_id: d.file_id.file_id()?, range: d.value.text_range() })
-                });
-            let name = binding.name.to_smol_str();
+            let binding = &hir[binding_idx];
+            let name = binding.name.display_no_db(display_target.edition).to_smolstr();
             if name.starts_with("<ra@") {
                 continue; // Ignore desugared variables
             }
             let mut label = InlayHintLabel::simple(
                 name,
-                Some(crate::InlayTooltip::String("moz".into())),
-                binding_source,
+                None,
+                config.lazy_location_opt(|| {
+                    source_map
+                        .patterns_for_binding(binding_idx)
+                        .first()
+                        .and_then(|d| source_map.pat_syntax(*d).ok())
+                        .and_then(|d| {
+                            Some(FileRange {
+                                file_id: d.file_id.file_id()?.file_id(sema.db),
+                                range: d.value.text_range(),
+                            })
+                        })
+                }),
             );
             label.prepend_str("drop(");
             label.append_str(")");
@@ -103,9 +121,9 @@ pub(super) fn hints(
                 pad_left: true,
                 pad_right: true,
                 kind: InlayKind::Drop,
-                needs_resolve: label.needs_resolve(),
                 label,
                 text_edit: None,
+                resolve_parent: Some(node.syntax().text_range()),
             })
         }
     }
@@ -125,11 +143,11 @@ fn nearest_token_after_node(
 #[cfg(test)]
 mod tests {
     use crate::{
-        inlay_hints::tests::{check_with_config, DISABLED_CONFIG},
         InlayHintsConfig,
+        inlay_hints::tests::{DISABLED_CONFIG, check_with_config},
     };
 
-    const ONLY_DROP_CONFIG: InlayHintsConfig =
+    const ONLY_DROP_CONFIG: InlayHintsConfig<'_> =
         InlayHintsConfig { implicit_drop_hints: true, ..DISABLED_CONFIG };
 
     #[test]
@@ -177,7 +195,7 @@ mod tests {
 
     #[test]
     fn try_operator() {
-        // We currently show drop inlay hint for every `?` operator that may potentialy drop something. We probably need to
+        // We currently show drop inlay hint for every `?` operator that may potentially drop something. We probably need to
         // make it configurable as it doesn't seem very useful.
         check_with_config(
             ONLY_DROP_CONFIG,
@@ -211,6 +229,27 @@ mod tests {
       //^ drop(y)
     }
   //^ drop(x)
+"#,
+        );
+    }
+
+    #[test]
+    fn ignore_inlay_hint_for_macro_call() {
+        check_with_config(
+            ONLY_DROP_CONFIG,
+            r#"
+    struct X;
+
+    macro_rules! my_macro {
+        () => {{
+            let bbb = X;
+            bbb
+        }};
+    }
+
+    fn test() -> X {
+        my_macro!()
+    }
 "#,
         );
     }

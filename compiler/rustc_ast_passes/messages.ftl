@@ -1,6 +1,28 @@
-ast_passes_anon_struct_or_union_not_allowed =
-    anonymous {$struct_or_union}s are not allowed outside of unnamed struct or union fields
-    .label = anonymous {$struct_or_union} declared here
+ast_passes_abi_cannot_be_coroutine =
+    functions with the {$abi} ABI cannot be `{$coroutine_kind_str}`
+    .suggestion = remove the `{$coroutine_kind_str}` keyword from this definition
+
+ast_passes_abi_custom_safe_foreign_function =
+    foreign functions with the "custom" ABI cannot be safe
+    .suggestion = remove the `safe` keyword from this definition
+
+ast_passes_abi_custom_safe_function =
+    functions with the "custom" ABI must be unsafe
+    .suggestion = add the `unsafe` keyword to this definition
+
+ast_passes_abi_must_not_have_parameters_or_return_type=
+    invalid signature for `extern {$abi}` function
+    .note = functions with the {$abi} ABI cannot have any parameters or return type
+    .suggestion = remove the parameters and return type
+
+ast_passes_abi_must_not_have_return_type=
+    invalid signature for `extern {$abi}` function
+    .note = functions with the {$abi} ABI cannot have a return type
+    .help = remove the return type
+
+ast_passes_abi_x86_interrupt =
+    invalid signature for `extern "x86-interrupt"` function
+    .note = functions with the "x86-interrupt" ABI must be have either 1 or 2 parameters (but found {$param_count})
 
 ast_passes_assoc_const_without_body =
     associated constant in `impl` without body
@@ -14,6 +36,13 @@ ast_passes_assoc_type_without_body =
     associated type in `impl` without body
     .suggestion = provide a definition for the type
 
+ast_passes_async_fn_in_const_trait_or_trait_impl =
+    async functions are not allowed in `const` {$in_impl ->
+        [true] trait impls
+        *[false] traits
+    }
+    .label = associated functions of `const` cannot be declared `async`
+
 ast_passes_at_least_one_trait = at least one trait must be specified
 
 ast_passes_auto_generic = auto traits cannot have generic parameters
@@ -22,13 +51,11 @@ ast_passes_auto_generic = auto traits cannot have generic parameters
 
 ast_passes_auto_items = auto traits cannot have associated items
     .label = {ast_passes_auto_items}
-    .suggestion = remove these associated items
+    .suggestion = remove the associated items
 
 ast_passes_auto_super_lifetime = auto traits cannot have super traits or lifetime bounds
     .label = {ast_passes_auto_super_lifetime}
     .suggestion = remove the super traits or lifetime bounds
-
-ast_passes_bad_c_variadic = only foreign or `unsafe extern "C"` functions may be C-variadic
 
 ast_passes_body_in_extern = incorrect `{$kind}` inside `extern` block
     .cannot_have = cannot have a body
@@ -37,14 +64,25 @@ ast_passes_body_in_extern = incorrect `{$kind}` inside `extern` block
 
 ast_passes_bound_in_context = bounds on `type`s in {$ctx} have no effect
 
-ast_passes_const_and_async = functions cannot be both `const` and `async`
-    .const = `const` because of this
-    .async = `async` because of this
-    .label = {""}
+ast_passes_c_variadic_bad_extern = `...` is not supported for `extern "{$abi}"` functions
+    .label = `extern "{$abi}"` because of this
+    .help = only `extern "C"` and `extern "C-unwind"` functions may have a C variable argument list
+
+ast_passes_c_variadic_must_be_unsafe =
+    functions with a C variable argument list must be unsafe
+    .suggestion = add the `unsafe` keyword to this definition
+
+ast_passes_c_variadic_no_extern = `...` is not supported for non-extern functions
+    .help = only `extern "C"` and `extern "C-unwind"` functions may have a C variable argument list
 
 ast_passes_const_and_c_variadic = functions cannot be both `const` and C-variadic
     .const = `const` because of this
     .variadic = C-variadic because of this
+
+ast_passes_const_and_coroutine = functions cannot be both `const` and `{$coroutine_kind}`
+    .const = `const` because of this
+    .coroutine = `{$coroutine_kind}` because of this
+    .label = {""}
 
 ast_passes_const_bound_trait_object = const trait bounds are not allowed in trait object types
 
@@ -55,8 +93,9 @@ ast_passes_const_without_body =
 ast_passes_constraint_on_negative_bound =
     associated type constraints not allowed on negative bounds
 
-ast_passes_deprecated_where_clause_location =
-    where clause not allowed here
+ast_passes_coroutine_and_c_variadic = functions cannot be both `{$coroutine_kind}` and C-variadic
+    .const = `{$coroutine_kind}` because of this
+    .variadic = C-variadic because of this
 
 ast_passes_equality_in_where = equality constraints are not yet supported in `where` clauses
     .label = not supported
@@ -66,9 +105,12 @@ ast_passes_equality_in_where = equality constraints are not yet supported in `wh
 
 ast_passes_extern_block_suggestion = if you meant to declare an externally defined function, use an `extern` block
 
-ast_passes_extern_fn_qualifiers = functions in `extern` blocks cannot have qualifiers
+ast_passes_extern_fn_qualifiers = functions in `extern` blocks cannot have `{$kw}` qualifier
     .label = in this `extern` block
-    .suggestion = remove the qualifiers
+    .suggestion = remove the `{$kw}` qualifier
+
+ast_passes_extern_invalid_safety = items in `extern` blocks without an `unsafe` qualifier cannot have safety qualifiers
+    .suggestion = add `unsafe` to this `extern` block
 
 ast_passes_extern_item_ascii = items in `extern` blocks cannot use non-ascii identifiers
     .label = in this `extern` block
@@ -80,7 +122,13 @@ ast_passes_extern_types_cannot = `type`s inside `extern` blocks cannot have {$de
     .suggestion = remove the {$remove_descr}
     .label = `extern` block begins here
 
-ast_passes_extern_without_abi = extern declarations without an explicit ABI are deprecated
+ast_passes_extern_without_abi = `extern` declarations without an explicit ABI are disallowed
+    .suggestion = specify an ABI
+    .help = prior to Rust 2024, a default ABI was inferred
+
+ast_passes_extern_without_abi_sugg = `extern` declarations without an explicit ABI are deprecated
+    .label = ABI should be specified here
+    .suggestion = explicitly specify the {$default_abi} ABI
 
 ast_passes_feature_on_non_nightly = `#![feature]` may not be used on the {$channel} release channel
     .suggestion = remove the attribute
@@ -97,9 +145,6 @@ ast_passes_fn_body_extern = incorrect function inside `extern` block
 ast_passes_fn_param_c_var_args_not_last =
     `...` must be the last argument of a C-variadic function
 
-ast_passes_fn_param_c_var_args_only =
-    C-variadic function must be declared with at least one named argument
-
 ast_passes_fn_param_doc_comment =
     documentation comments cannot be applied to function parameters
     .label = doc comments are not allowed here
@@ -115,12 +160,18 @@ ast_passes_fn_param_forbidden_self =
 ast_passes_fn_param_too_many =
     function can not have more than {$max_num_args} arguments
 
+ast_passes_fn_ptr_invalid_safety = function pointers cannot be declared with `safe` safety qualifier
+    .suggestion = remove safe from this item
+
 ast_passes_fn_without_body =
     free function without a body
     .suggestion = provide a definition for the function
 
 ast_passes_forbidden_bound =
     bounds cannot be used in this context
+
+ast_passes_forbidden_const_param =
+    late-bound const parameters cannot be used currently
 
 ast_passes_forbidden_default =
     `default` is only allowed on items in trait impls
@@ -149,38 +200,24 @@ ast_passes_generic_before_constraints = generic arguments must come before the f
 
 ast_passes_generic_default_trailing = generic parameters with a default must be trailing
 
-ast_passes_impl_trait_path = `impl Trait` is not allowed in path parameters
-
 ast_passes_incompatible_features = `{$f1}` and `{$f2}` are incompatible, using them at the same time is not allowed
     .help = remove one of these features
 
-ast_passes_incompatible_trait_bound_modifiers = `{$left}` and `{$right}` are mutually exclusive
-
-ast_passes_inherent_cannot_be = inherent impls cannot be {$annotation}
-    .because = {$annotation} because of this
-    .type = inherent impl for this type
-    .only_trait = only trait implementations may be annotated with {$annotation}
-
-ast_passes_invalid_label =
-    invalid label name `{$name}`
-
-ast_passes_invalid_unnamed_field =
-    unnamed fields are not allowed outside of structs or unions
-    .label = unnamed field declared here
-
-ast_passes_invalid_unnamed_field_ty =
-    unnamed fields can only have struct or union types
-    .label = not a struct or union
+ast_passes_item_invalid_safety = items outside of `unsafe extern {"{ }"}` cannot be declared with `safe` safety qualifier
+    .suggestion = remove safe from this item
 
 ast_passes_item_underscore = `{$kind}` items in this context need a name
     .label = `_` is not a valid name for this `{$kind}` item
 
-ast_passes_keyword_lifetime =
-    lifetimes cannot use keyword names
-
 ast_passes_match_arm_with_no_body =
     `match` arm with no body
     .suggestion = add a body after the pattern
+
+ast_passes_missing_unsafe_on_extern = extern blocks must be unsafe
+    .suggestion = needs `unsafe` before the extern keyword
+
+ast_passes_missing_unsafe_on_extern_lint = extern blocks should be unsafe
+    .suggestion = needs `unsafe` before the extern keyword
 
 ast_passes_module_nonascii = trying to load file for module `{$name}` with non-ascii identifier name
     .help = consider using the `#[path]` attribute to specify filesystem path
@@ -202,11 +239,6 @@ ast_passes_nomangle_ascii = `#[no_mangle]` requires ASCII identifier
 ast_passes_obsolete_auto = `impl Trait for .. {"{}"}` is an obsolete syntax
     .help = use `auto trait Trait {"{}"}` instead
 
-ast_passes_optional_trait_object = `?Trait` is not permitted in trait object types
-
-ast_passes_optional_trait_supertrait = `?Trait` is not permitted in supertraits
-    .note = traits are `?{$path_str}` by default
-
 ast_passes_out_of_order_params = {$param_ord} parameters must be declared prior to {$max_param} parameters
     .suggestion = reorder the parameters: lifetimes, then consts and types
 
@@ -218,25 +250,30 @@ ast_passes_pattern_in_fn_pointer = patterns aren't allowed in function pointer t
 ast_passes_pattern_in_foreign = patterns aren't allowed in foreign function declarations
     .label = pattern not allowed in foreign function
 
-ast_passes_show_span = {$msg}
+ast_passes_precise_capturing_duplicated = duplicate `use<...>` precise capturing syntax
+    .label = second `use<...>` here
 
-ast_passes_stability_outside_std = stability attributes may not be used outside of the standard library
+ast_passes_precise_capturing_not_allowed_here = `use<...>` precise capturing syntax not allowed in {$loc}
 
 ast_passes_static_without_body =
     free static item without body
     .suggestion = provide a definition for the static
 
-ast_passes_tilde_const_disallowed = `~const` is not allowed here
-    .closure = closures cannot have `~const` trait bounds
-    .function = this function is not `const`, so it cannot have `~const` trait bounds
-    .trait = this trait is not a `#[const_trait]`, so it cannot have `~const` trait bounds
-    .trait_impl = this impl is not `const`, so it cannot have `~const` trait bounds
-    .impl = inherent impls cannot have `~const` trait bounds
-    .trait_assoc_ty = associated types in non-`#[const_trait]` traits cannot have `~const` trait bounds
-    .trait_impl_assoc_ty = associated types in non-const impls cannot have `~const` trait bounds
-    .inherent_assoc_ty = inherent associated types cannot have `~const` trait bounds
-    .object = trait objects cannot have `~const` trait bounds
-    .item = this item cannot have `~const` trait bounds
+ast_passes_tilde_const_disallowed = `[const]` is not allowed here
+    .closure = closures cannot have `[const]` trait bounds
+    .function = this function is not `const`, so it cannot have `[const]` trait bounds
+    .trait = this trait is not `const`, so it cannot have `[const]` trait bounds
+    .trait_impl = this impl is not `const`, so it cannot have `[const]` trait bounds
+    .impl = inherent impls cannot have `[const]` trait bounds
+    .trait_assoc_ty = associated types in non-`const` traits cannot have `[const]` trait bounds
+    .trait_impl_assoc_ty = associated types in non-const impls cannot have `[const]` trait bounds
+    .inherent_assoc_ty = inherent associated types cannot have `[const]` trait bounds
+    .struct = structs cannot have `[const]` trait bounds
+    .enum = enums cannot have `[const]` trait bounds
+    .union = unions cannot have `[const]` trait bounds
+    .anon_const = anonymous constants cannot have `[const]` trait bounds
+    .object = trait objects cannot have `[const]` trait bounds
+    .item = this item cannot have `[const]` trait bounds
 
 ast_passes_trait_fn_const =
     functions in {$in_impl ->
@@ -253,7 +290,7 @@ ast_passes_trait_fn_const =
         *[false] {""}
     }
     .make_impl_const_sugg = ... and declare the impl to be const instead
-    .make_trait_const_sugg = ... and declare the trait to be a `#[const_trait]` instead
+    .make_trait_const_sugg = ... and declare the trait to be const instead
 
 ast_passes_trait_object_single_bound = only a single explicit lifetime bound is permitted
 
@@ -267,12 +304,16 @@ ast_passes_unsafe_negative_impl = negative impls cannot be unsafe
     .negative = negative because of this
     .unsafe = unsafe because of this
 
+ast_passes_unsafe_static =
+    static items cannot be declared with `unsafe` safety qualifier outside of `extern` block
+
 ast_passes_visibility_not_permitted =
     visibility qualifiers are not permitted here
     .enum_variant = enum variants and their fields always share the visibility of the enum they are in
     .trait_impl = trait items always share the visibility of their trait
     .individual_impl_items = place qualifiers on individual impl items instead
     .individual_foreign_items = place qualifiers on individual foreign items instead
+    .remove_qualifier_sugg = remove the qualifier
 
 ast_passes_where_clause_after_type_alias = where clauses are not allowed after the type for type aliases
     .note = see issue #112792 <https://github.com/rust-lang/rust/issues/112792> for more information
@@ -280,4 +321,5 @@ ast_passes_where_clause_after_type_alias = where clauses are not allowed after t
 
 ast_passes_where_clause_before_type_alias = where clauses are not allowed before the type for type aliases
     .note = see issue #89122 <https://github.com/rust-lang/rust/issues/89122> for more information
-    .suggestion = move it to the end of the type declaration
+    .remove_suggestion = remove this `where`
+    .move_suggestion = move it to the end of the type declaration

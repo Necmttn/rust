@@ -1,4 +1,4 @@
-// aux-build:cfged_out.rs
+//@ aux-build:cfged_out.rs
 
 extern crate cfged_out;
 
@@ -22,7 +22,6 @@ fn main() {
     cfged_out::inner::right::meow(); //~ ERROR cannot find function
     //~^ NOTE found an item that was configured out
     //~| NOTE not found in `cfged_out::inner::right
-    //~| NOTE the item is gated behind the `what-a-cool-feature` feature
 
     // Exists in the crate root - diagnostic.
     cfged_out::vanished(); //~ ERROR cannot find function

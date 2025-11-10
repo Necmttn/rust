@@ -1,31 +1,12 @@
-use crate::environment::{executable_extension, Environment};
-use crate::exec::{cmd, CmdBuilder};
-use crate::utils::io::{count_files, delete_directory};
-use crate::utils::with_log_group;
 use anyhow::Context;
+use build_helper::{LLVM_PGO_CRATES, RUSTC_PGO_CRATES};
 use camino::{Utf8Path, Utf8PathBuf};
 use humansize::BINARY;
 
-const LLVM_PGO_CRATES: &[&str] = &[
-    "syn-1.0.89",
-    "cargo-0.60.0",
-    "serde-1.0.136",
-    "ripgrep-13.0.0",
-    "regex-1.5.5",
-    "clap-3.1.6",
-    "hyper-0.14.18",
-];
-
-const RUSTC_PGO_CRATES: &[&str] = &[
-    "externs",
-    "ctfe-stress-5",
-    "cargo-0.60.0",
-    "token-stream-stress",
-    "match-stress",
-    "tuple-stress",
-    "diesel-1.4.8",
-    "bitmaps-3.1.0",
-];
+use crate::environment::{Environment, executable_extension};
+use crate::exec::{CmdBuilder, cmd};
+use crate::utils::io::{count_files, delete_directory};
+use crate::utils::with_log_group;
 
 fn init_compiler_benchmarks(
     env: &Environment,
@@ -36,7 +17,7 @@ fn init_compiler_benchmarks(
     // Run rustc-perf benchmarks
     // Benchmark using profile_local with eprintln, which essentially just means
     // don't actually benchmark -- just make sure we run rustc a bunch of times.
-    cmd(&[
+    let mut cmd = cmd(&[
         env.cargo_stage_0().as_str(),
         "run",
         "-p",
@@ -55,13 +36,22 @@ fn init_compiler_benchmarks(
         profiles.join(",").as_str(),
         "--scenarios",
         scenarios.join(",").as_str(),
-        "--include",
+        "--exact-match",
         crates.join(",").as_str(),
     ])
-    .env("RUST_LOG", "collector=debug")
     .env("RUSTC", env.rustc_stage_0().as_str())
     .env("RUSTC_BOOTSTRAP", "1")
-    .workdir(&env.rustc_perf_dir())
+    .workdir(&env.rustc_perf_dir());
+
+    // This propagates cargo configs to `rustc-perf --cargo-config`,
+    // which is particularly useful when the environment is air-gapped,
+    // and you want to use the default set of training crates vendored
+    // in the rustc-src tarball.
+    for config in env.benchmark_cargo_config() {
+        cmd = cmd.arg("--cargo-config").arg(config);
+    }
+
+    cmd
 }
 
 /// Describes which `llvm-profdata` binary should be used for merging PGO profiles.
@@ -79,7 +69,9 @@ fn merge_llvm_profiles(
     profdata: LlvmProfdata,
 ) -> anyhow::Result<()> {
     let llvm_profdata = match profdata {
-        LlvmProfdata::Host => env.host_llvm_dir().join("bin/llvm-profdata"),
+        LlvmProfdata::Host => {
+            env.host_llvm_dir().join(format!("bin/llvm-profdata{}", executable_extension()))
+        }
         LlvmProfdata::Target => env
             .build_artifacts()
             .join("llvm")
@@ -170,7 +162,9 @@ pub fn gather_rustc_profiles(
     let merged_profile = env.artifact_dir().join("rustc-pgo.profdata");
     log::info!("Merging Rustc PGO profiles to {merged_profile}");
 
-    merge_llvm_profiles(env, &merged_profile, profile_root, LlvmProfdata::Target)?;
+    let llvm_profdata = if env.build_llvm() { LlvmProfdata::Target } else { LlvmProfdata::Host };
+
+    merge_llvm_profiles(env, &merged_profile, profile_root, llvm_profdata)?;
     log_profile_stats("Rustc", &merged_profile, profile_root)?;
 
     // We don't need the individual .profraw files now that they have been merged
@@ -200,7 +194,8 @@ pub fn gather_bolt_profiles(
     let profiles: Vec<_> =
         glob::glob(&format!("{profile_prefix}*"))?.collect::<Result<Vec<_>, _>>()?;
 
-    let mut merge_args = vec!["merge-fdata"];
+    let fdata = env.merge_fdata();
+    let mut merge_args = vec![fdata.as_str()];
     merge_args.extend(profiles.iter().map(|p| p.to_str().unwrap()));
 
     with_log_group("Merging BOLT profiles", || {
@@ -226,11 +221,9 @@ pub fn gather_bolt_profiles(
     log::info!("Profile file count: {}", profiles.len());
 
     // Delete the gathered profiles
-    for profile in glob::glob(&format!("{profile_prefix}*"))?.into_iter() {
-        if let Ok(profile) = profile {
-            if let Err(error) = std::fs::remove_file(&profile) {
-                log::error!("Cannot delete BOLT profile {}: {error:?}", profile.display());
-            }
+    for profile in glob::glob(&format!("{profile_prefix}*"))?.flatten() {
+        if let Err(error) = std::fs::remove_file(&profile) {
+            log::error!("Cannot delete BOLT profile {}: {error:?}", profile.display());
         }
     }
 

@@ -1,15 +1,15 @@
-use crate::deriving::generic::ty::*;
-use crate::deriving::generic::*;
-use crate::deriving::path_std;
 use rustc_ast::{self as ast, Generics, ItemKind, MetaItem, VariantData};
 use rustc_data_structures::fx::FxHashSet;
 use rustc_expand::base::{Annotatable, ExtCtxt};
-use rustc_span::symbol::{kw, sym, Ident};
-use rustc_span::Span;
-use thin_vec::{thin_vec, ThinVec};
+use rustc_span::{Ident, Span, kw, sym};
+use thin_vec::{ThinVec, thin_vec};
 
-pub fn expand_deriving_clone(
-    cx: &mut ExtCtxt<'_>,
+use crate::deriving::generic::ty::*;
+use crate::deriving::generic::*;
+use crate::deriving::path_std;
+
+pub(crate) fn expand_deriving_clone(
+    cx: &ExtCtxt<'_>,
     span: Span,
     mitem: &MetaItem,
     item: &Annotatable,
@@ -34,8 +34,8 @@ pub fn expand_deriving_clone(
     let is_simple;
     match item {
         Annotatable::Item(annitem) => match &annitem.kind {
-            ItemKind::Struct(_, Generics { params, .. })
-            | ItemKind::Enum(_, Generics { params, .. }) => {
+            ItemKind::Struct(_, Generics { params, .. }, _)
+            | ItemKind::Enum(_, Generics { params, .. }, _) => {
                 let container_id = cx.current_expansion.id.expn_data().parent.expect_local();
                 let has_derive_copy = cx.resolver.has_derive_copy(container_id);
                 if has_derive_copy
@@ -87,6 +87,7 @@ pub fn expand_deriving_clone(
         }],
         associated_types: Vec::new(),
         is_const,
+        is_staged_api_crate: cx.ecfg.features.staged_api(),
     };
 
     trait_def.expand_ext(cx, mitem, item, push, is_simple)
@@ -94,7 +95,7 @@ pub fn expand_deriving_clone(
 
 fn cs_clone_simple(
     name: &str,
-    cx: &mut ExtCtxt<'_>,
+    cx: &ExtCtxt<'_>,
     trait_span: Span,
     substr: &Substructure<'_>,
     is_union: bool,
@@ -110,6 +111,8 @@ fn cs_clone_simple(
                 && !seen_type_names.insert(name)
             {
                 // Already produced an assertion for this type.
+                // Anonymous structs or unions must be eliminated as they cannot be
+                // type parameters.
             } else {
                 // let _: AssertParamIsClone<FieldTy>;
                 super::assert_ty_bounds(
@@ -155,14 +158,14 @@ fn cs_clone_simple(
 
 fn cs_clone(
     name: &str,
-    cx: &mut ExtCtxt<'_>,
+    cx: &ExtCtxt<'_>,
     trait_span: Span,
     substr: &Substructure<'_>,
 ) -> BlockOrExpr {
     let ctor_path;
     let all_fields;
     let fn_path = cx.std_path(&[sym::clone, sym::Clone, sym::clone]);
-    let subcall = |cx: &mut ExtCtxt<'_>, field: &FieldInfo| {
+    let subcall = |cx: &ExtCtxt<'_>, field: &FieldInfo| {
         let args = thin_vec![field.self_expr.clone()];
         cx.expr_call_global(field.span, fn_path.clone(), args)
     };
@@ -179,8 +182,8 @@ fn cs_clone(
             all_fields = af;
             vdata = &variant.data;
         }
-        EnumTag(..) | AllFieldlessEnum(..) => {
-            cx.dcx().span_bug(trait_span, format!("enum tags in `derive({name})`",))
+        EnumDiscr(..) | AllFieldlessEnum(..) => {
+            cx.dcx().span_bug(trait_span, format!("enum discriminants in `derive({name})`",))
         }
         StaticEnum(..) | StaticStruct(..) => {
             cx.dcx().span_bug(trait_span, format!("associated function in `derive({name})`"))

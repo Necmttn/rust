@@ -1,8 +1,9 @@
 use crate::assist_context::{AssistContext, Assists};
 use ide_db::assists::AssistId;
 use syntax::{
-    ast::{self, edit::IndentLevel, make, HasGenericParams, HasVisibility},
-    ted, AstNode, SyntaxKind,
+    AstNode, SyntaxKind, T,
+    ast::{self, HasGenericParams, HasName, HasVisibility, edit_in_place::Indent, make},
+    syntax_editor::{Position, SyntaxEditor},
 };
 
 // NOTES :
@@ -44,7 +45,7 @@ use syntax::{
 //     };
 // }
 //
-// trait ${0:TraitName}<const N: usize> {
+// trait ${0:NewTrait}<const N: usize> {
 //     // Used as an associated constant.
 //     const CONST_ASSOC: usize = N * 4;
 //
@@ -53,7 +54,7 @@ use syntax::{
 //     const_maker! {i32, 7}
 // }
 //
-// impl<const N: usize> ${0:TraitName}<N> for Foo<N> {
+// impl<const N: usize> ${0:NewTrait}<N> for Foo<N> {
 //     // Used as an associated constant.
 //     const CONST_ASSOC: usize = N * 4;
 //
@@ -83,75 +84,76 @@ pub(crate) fn generate_trait_from_impl(acc: &mut Assists, ctx: &AssistContext<'_
         return None;
     }
 
-    let assoc_items = impl_ast.assoc_item_list()?;
-    let first_element = assoc_items.assoc_items().next();
+    let impl_assoc_items = impl_ast.assoc_item_list()?;
+    let first_element = impl_assoc_items.assoc_items().next();
     first_element.as_ref()?;
 
     let impl_name = impl_ast.self_ty()?;
 
     acc.add(
-        AssistId("generate_trait_from_impl", ide_db::assists::AssistKind::Generate),
+        AssistId::generate("generate_trait_from_impl"),
         "Generate trait from impl",
         impl_ast.syntax().text_range(),
         |builder| {
-            let trait_items = assoc_items.clone_for_update();
-            let impl_items = assoc_items.clone_for_update();
+            let trait_items: ast::AssocItemList = {
+                let trait_items = impl_assoc_items.clone_subtree();
+                let mut trait_items_editor = SyntaxEditor::new(trait_items.syntax().clone());
 
-            trait_items.assoc_items().for_each(|item| {
-                strip_body(&item);
-                remove_items_visibility(&item);
-            });
-
-            impl_items.assoc_items().for_each(|item| {
-                remove_items_visibility(&item);
-            });
-
+                trait_items.assoc_items().for_each(|item| {
+                    strip_body(&mut trait_items_editor, &item);
+                    remove_items_visibility(&mut trait_items_editor, &item);
+                });
+                ast::AssocItemList::cast(trait_items_editor.finish().new_root().clone()).unwrap()
+            };
             let trait_ast = make::trait_(
                 false,
                 "NewTrait",
                 impl_ast.generic_param_list(),
                 impl_ast.where_clause(),
                 trait_items,
-            );
+            )
+            .clone_for_update();
+
+            let trait_name = trait_ast.name().expect("new trait should have a name");
+            let trait_name_ref = make::name_ref(&trait_name.to_string()).clone_for_update();
 
             // Change `impl Foo` to `impl NewTrait for Foo`
-            let arg_list = if let Some(genpars) = impl_ast.generic_param_list() {
-                genpars.to_generic_args().to_string()
-            } else {
-                "".to_string()
-            };
+            let mut elements = vec![
+                trait_name_ref.syntax().clone().into(),
+                make::tokens::single_space().into(),
+                make::token(T![for]).into(),
+                make::tokens::single_space().into(),
+            ];
 
-            if let Some(snippet_cap) = ctx.config.snippet_cap {
-                builder.replace_snippet(
-                    snippet_cap,
-                    impl_name.syntax().text_range(),
-                    format!("${{0:TraitName}}{} for {}", arg_list, impl_name),
-                );
-
-                // Insert trait before TraitImpl
-                builder.insert_snippet(
-                    snippet_cap,
-                    impl_ast.syntax().text_range().start(),
-                    format!(
-                        "{}\n\n{}",
-                        trait_ast.to_string().replace("NewTrait", "${0:TraitName}"),
-                        IndentLevel::from_node(impl_ast.syntax())
-                    ),
-                );
-            } else {
-                builder.replace(
-                    impl_name.syntax().text_range(),
-                    format!("NewTrait{} for {}", arg_list, impl_name),
-                );
-
-                // Insert trait before TraitImpl
-                builder.insert(
-                    impl_ast.syntax().text_range().start(),
-                    format!("{}\n\n{}", trait_ast, IndentLevel::from_node(impl_ast.syntax())),
-                );
+            if let Some(params) = impl_ast.generic_param_list() {
+                let gen_args = &params.to_generic_args().clone_for_update();
+                elements.insert(1, gen_args.syntax().clone().into());
             }
 
-            builder.replace(assoc_items.syntax().text_range(), impl_items.to_string());
+            let mut editor = builder.make_editor(impl_ast.syntax());
+            impl_assoc_items.assoc_items().for_each(|item| {
+                remove_items_visibility(&mut editor, &item);
+            });
+
+            editor.insert_all(Position::before(impl_name.syntax()), elements);
+
+            // Insert trait before TraitImpl
+            editor.insert_all(
+                Position::before(impl_ast.syntax()),
+                vec![
+                    trait_ast.syntax().clone().into(),
+                    make::tokens::whitespace(&format!("\n\n{}", impl_ast.indent_level())).into(),
+                ],
+            );
+
+            // Link the trait name & trait ref names together as a placeholder snippet group
+            if let Some(cap) = ctx.config.snippet_cap {
+                let placeholder = builder.make_placeholder_snippet(cap);
+                editor.add_annotation(trait_name.syntax(), placeholder);
+                editor.add_annotation(trait_name_ref.syntax(), placeholder);
+            }
+
+            builder.add_file_edits(ctx.vfs_file_id(), editor);
         },
     );
 
@@ -159,40 +161,33 @@ pub(crate) fn generate_trait_from_impl(acc: &mut Assists, ctx: &AssistContext<'_
 }
 
 /// `E0449` Trait items always share the visibility of their trait
-fn remove_items_visibility(item: &ast::AssocItem) {
-    match item {
-        ast::AssocItem::Const(c) => {
-            if let Some(vis) = c.visibility() {
-                ted::remove(vis.syntax());
-            }
+fn remove_items_visibility(editor: &mut SyntaxEditor, item: &ast::AssocItem) {
+    if let Some(has_vis) = ast::AnyHasVisibility::cast(item.syntax().clone()) {
+        if let Some(vis) = has_vis.visibility()
+            && let Some(token) = vis.syntax().next_sibling_or_token()
+            && token.kind() == SyntaxKind::WHITESPACE
+        {
+            editor.delete(token);
         }
-        ast::AssocItem::Fn(f) => {
-            if let Some(vis) = f.visibility() {
-                ted::remove(vis.syntax());
-            }
+        if let Some(vis) = has_vis.visibility() {
+            editor.delete(vis.syntax());
         }
-        ast::AssocItem::TypeAlias(t) => {
-            if let Some(vis) = t.visibility() {
-                ted::remove(vis.syntax());
-            }
-        }
-        _ => (),
     }
 }
 
-fn strip_body(item: &ast::AssocItem) {
-    if let ast::AssocItem::Fn(f) = item {
-        if let Some(body) = f.body() {
-            // In constrast to function bodies, we want to see no ws before a semicolon.
-            // So let's remove them if we see any.
-            if let Some(prev) = body.syntax().prev_sibling_or_token() {
-                if prev.kind() == SyntaxKind::WHITESPACE {
-                    ted::remove(prev);
-                }
-            }
-
-            ted::replace(body.syntax(), make::tokens::semicolon());
+fn strip_body(editor: &mut SyntaxEditor, item: &ast::AssocItem) {
+    if let ast::AssocItem::Fn(f) = item
+        && let Some(body) = f.body()
+    {
+        // In contrast to function bodies, we want to see no ws before a semicolon.
+        // So let's remove them if we see any.
+        if let Some(prev) = body.syntax().prev_sibling_or_token()
+            && prev.kind() == SyntaxKind::WHITESPACE
+        {
+            editor.delete(prev);
         }
+
+        editor.replace(body.syntax(), make::tokens::semicolon());
     };
 }
 
@@ -345,11 +340,11 @@ impl F$0oo {
 struct Foo;
 
 trait NewTrait {
-     fn a_func() -> Option<()>;
+    fn a_func() -> Option<()>;
 }
 
 impl NewTrait for Foo {
-     fn a_func() -> Option<()> {
+    fn a_func() -> Option<()> {
         Some(())
     }
 }"#,
@@ -404,12 +399,12 @@ impl<const N: usize> F$0oo<N> {
             r#"
 struct Foo<const N: usize>([i32; N]);
 
-trait ${0:TraitName}<const N: usize> {
+trait ${0:NewTrait}<const N: usize> {
     // Used as an associated constant.
     const CONST: usize = N * 4;
 }
 
-impl<const N: usize> ${0:TraitName}<N> for Foo<N> {
+impl<const N: usize> ${0:NewTrait}<N> for Foo<N> {
     // Used as an associated constant.
     const CONST: usize = N * 4;
 }

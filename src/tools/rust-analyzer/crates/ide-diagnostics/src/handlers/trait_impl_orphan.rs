@@ -13,11 +13,9 @@ pub(crate) fn trait_impl_orphan(
         ctx,
         DiagnosticCode::RustcHardError("E0117"),
         "only traits defined in the current crate can be implemented for arbitrary types"
-            .to_string(),
+            .to_owned(),
         InFile::new(d.file_id, d.impl_.into()),
     )
-    // Not yet checked for false positives
-    .experimental()
 }
 
 #[cfg(test)]
@@ -102,6 +100,19 @@ trait LocalTrait {}
 impl<T> foo::Foo<T> for dyn LocalTrait {}
 impl<T> foo::Foo<dyn LocalTrait> for Bar {}
 "#,
+        );
+    }
+
+    #[test]
+    fn twice_fundamental() {
+        check_diagnostics(
+            r#"
+//- /foo.rs crate:foo
+pub trait Trait {}
+//- /bar.rs crate:bar deps:foo
+struct Foo;
+impl foo::Trait for &&Foo {}
+        "#,
         );
     }
 }

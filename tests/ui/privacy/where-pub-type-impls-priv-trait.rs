@@ -1,9 +1,8 @@
-// check-pass
+//@ check-pass
 
 // priv-in-pub lint tests where the private trait bounds a public type
 
 #![crate_type = "lib"]
-#![feature(generic_const_exprs)]
 #![allow(incomplete_features)]
 
 struct PrivTy;

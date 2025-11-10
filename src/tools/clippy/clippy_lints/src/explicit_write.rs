@@ -1,13 +1,14 @@
 use clippy_utils::diagnostics::span_lint_and_sugg;
-use clippy_utils::macros::{find_format_args, format_args_inputs_span};
+use clippy_utils::macros::{FormatArgsStorage, format_args_inputs_span};
+use clippy_utils::res::MaybeResPath;
 use clippy_utils::source::snippet_with_applicability;
-use clippy_utils::{is_expn_of, path_def_id};
+use clippy_utils::{is_expn_of, is_in_test, sym};
 use rustc_errors::Applicability;
 use rustc_hir::def::Res;
-use rustc_hir::{BindingAnnotation, Block, BlockCheckMode, Expr, ExprKind, Node, PatKind, QPath, Stmt, StmtKind};
+use rustc_hir::{BindingMode, Block, BlockCheckMode, Expr, ExprKind, Node, PatKind, QPath, Stmt, StmtKind};
 use rustc_lint::{LateContext, LateLintPass};
-use rustc_session::declare_lint_pass;
-use rustc_span::{sym, ExpnId};
+use rustc_session::impl_lint_pass;
+use rustc_span::ExpnId;
 
 declare_clippy_lint! {
     /// ### What it does
@@ -38,7 +39,17 @@ declare_clippy_lint! {
     "using the `write!()` family of functions instead of the `print!()` family of functions, when using the latter would work"
 }
 
-declare_lint_pass!(ExplicitWrite => [EXPLICIT_WRITE]);
+pub struct ExplicitWrite {
+    format_args: FormatArgsStorage,
+}
+
+impl ExplicitWrite {
+    pub fn new(format_args: FormatArgsStorage) -> Self {
+        Self { format_args }
+    }
+}
+
+impl_lint_pass!(ExplicitWrite => [EXPLICIT_WRITE]);
 
 impl<'tcx> LateLintPass<'tcx> for ExplicitWrite {
     fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>) {
@@ -47,9 +58,9 @@ impl<'tcx> LateLintPass<'tcx> for ExplicitWrite {
             && unwrap_fun.ident.name == sym::unwrap
             // match call to write_fmt
             && let ExprKind::MethodCall(write_fun, write_recv, [write_arg], _) = *look_in_block(cx, &write_call.kind)
-            && let ExprKind::Call(write_recv_path, _) = write_recv.kind
-            && write_fun.ident.name == sym!(write_fmt)
-            && let Some(def_id) = path_def_id(cx, write_recv_path)
+            && let ExprKind::Call(write_recv_path, []) = write_recv.kind
+            && write_fun.ident.name == sym::write_fmt
+            && let Some(def_id) = write_recv_path.basic_res().opt_def_id()
         {
             // match calls to std::io::stdout() / std::io::stderr ()
             let (dest_name, prefix) = match cx.tcx.get_diagnostic_name(def_id) {
@@ -57,14 +68,19 @@ impl<'tcx> LateLintPass<'tcx> for ExplicitWrite {
                 Some(sym::io_stderr) => ("stderr", "e"),
                 _ => return,
             };
-            let Some(format_args) = find_format_args(cx, write_arg, ExpnId::root()) else {
+            let Some(format_args) = self.format_args.get(cx, write_arg, ExpnId::root()) else {
                 return;
             };
 
+            // Performing an explicit write in a test circumvent's libtest's capture of stdio and stdout.
+            if is_in_test(cx.tcx, expr.hir_id) {
+                return;
+            }
+
             // ordering is important here, since `writeln!` uses `write!` internally
-            let calling_macro = if is_expn_of(write_call.span, "writeln").is_some() {
+            let calling_macro = if is_expn_of(write_call.span, sym::writeln).is_some() {
                 Some("writeln")
-            } else if is_expn_of(write_call.span, "write").is_some() {
+            } else if is_expn_of(write_call.span, sym::write).is_some() {
                 Some("write")
             } else {
                 None
@@ -83,12 +99,12 @@ impl<'tcx> LateLintPass<'tcx> for ExplicitWrite {
             };
             let mut applicability = Applicability::MachineApplicable;
             let inputs_snippet =
-                snippet_with_applicability(cx, format_args_inputs_span(&format_args), "..", &mut applicability);
+                snippet_with_applicability(cx, format_args_inputs_span(format_args), "..", &mut applicability);
             span_lint_and_sugg(
                 cx,
                 EXPLICIT_WRITE,
                 expr.span,
-                &format!("use of `{used}.unwrap()`"),
+                format!("use of `{used}.unwrap()`"),
                 "try",
                 format!("{prefix}{sugg_mac}!({inputs_snippet})"),
                 applicability,
@@ -102,7 +118,7 @@ impl<'tcx> LateLintPass<'tcx> for ExplicitWrite {
 fn look_in_block<'tcx, 'hir>(cx: &LateContext<'tcx>, kind: &'tcx ExprKind<'hir>) -> &'tcx ExprKind<'hir> {
     if let ExprKind::Block(block, _label @ None) = kind
         && let Block {
-            stmts: [Stmt { kind: StmtKind::Local(local), .. }],
+            stmts: [Stmt { kind: StmtKind::Let(local), .. }],
             expr: Some(expr_end_of_block),
             rules: BlockCheckMode::DefaultBlock,
             ..
@@ -111,10 +127,10 @@ fn look_in_block<'tcx, 'hir>(cx: &LateContext<'tcx>, kind: &'tcx ExprKind<'hir>)
         // Find id of the local that expr_end_of_block resolves to
         && let ExprKind::Path(QPath::Resolved(None, expr_path)) = expr_end_of_block.kind
         && let Res::Local(expr_res) = expr_path.res
-        && let Some(Node::Pat(res_pat)) = cx.tcx.opt_hir_node(expr_res)
+        && let Node::Pat(res_pat) = cx.tcx.hir_node(expr_res)
 
         // Find id of the local we found in the block
-        && let PatKind::Binding(BindingAnnotation::NONE, local_hir_id, _ident, None) = local.pat.kind
+        && let PatKind::Binding(BindingMode::NONE, local_hir_id, _ident, None) = local.pat.kind
 
         // If those two are the same hir id
         && res_pat.hir_id == local_hir_id

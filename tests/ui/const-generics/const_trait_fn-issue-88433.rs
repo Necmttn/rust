@@ -1,14 +1,13 @@
-// build-pass
+//@ build-pass
+//@ compile-flags: -Znext-solver
 
-#![feature(const_trait_impl, effects)]
+#![feature(const_trait_impl)]
 
-#[const_trait]
-trait Func<T> {
+const trait Func<T> {
     type Output;
 
     fn call_once(self, arg: T) -> Self::Output;
 }
-
 
 struct Closure;
 
@@ -20,7 +19,7 @@ impl const Func<&usize> for Closure {
     }
 }
 
-enum Bug<T = [(); Closure.call_once(&0) ]> {
+enum Bug<T = [(); Closure.call_once(&0)]> {
     V(T),
 }
 

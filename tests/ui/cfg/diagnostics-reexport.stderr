@@ -7,6 +7,8 @@ LL | pub use a::x;
 note: found an item that was configured out
   --> $DIR/diagnostics-reexport.rs:18:12
    |
+LL |     #[cfg(false)]
+   |           ----- the item is gated here
 LL |     pub fn x() {}
    |            ^
 
@@ -21,11 +23,15 @@ LL | pub use b::{x, y};
 note: found an item that was configured out
   --> $DIR/diagnostics-reexport.rs:29:12
    |
+LL |     #[cfg(false)]
+   |           ----- the item is gated here
 LL |     pub fn x() {}
    |            ^
 note: found an item that was configured out
   --> $DIR/diagnostics-reexport.rs:32:12
    |
+LL |     #[cfg(false)]
+   |           ----- the item is gated here
 LL |     pub fn y() {}
    |            ^
 
@@ -38,6 +44,8 @@ LL |     inner::uwu();
 note: found an item that was configured out
   --> $DIR/diagnostics-reexport.rs:8:20
    |
+LL |     #[cfg(false)]
+   |           ----- the item is gated here
 LL |     pub use super::uwu;
    |                    ^^^
 

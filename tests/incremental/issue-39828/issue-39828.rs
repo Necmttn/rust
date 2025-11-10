@@ -5,8 +5,9 @@
 // reload, we would consider that node dirty since it is not recreated
 // (it is not the target of any edges).
 
-// revisions:rpass1 rpass2
-// aux-build:generic.rs
+//@ revisions:rpass1 rpass2
+//@ aux-build:generic.rs
+//@ ignore-backends: gcc
 
 extern crate generic;
 fn main() { }

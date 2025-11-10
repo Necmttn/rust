@@ -1,7 +1,8 @@
-use crate::spec::{cvs, RelroLevel, SplitDebuginfo, TargetOptions};
 use std::borrow::Cow;
 
-pub fn opts() -> TargetOptions {
+use crate::spec::{RelroLevel, SplitDebuginfo, TargetOptions, cvs};
+
+pub(crate) fn opts() -> TargetOptions {
     TargetOptions {
         os: "linux".into(),
         dynamic_linking: true,
@@ -11,6 +12,9 @@ pub fn opts() -> TargetOptions {
         relro_level: RelroLevel::Full,
         has_thread_local: true,
         crt_static_respected: true,
+        // We want backtraces to work by default and they rely on unwind tables
+        // (regardless of `-C panic` strategy).
+        default_uwtable: true,
         supported_split_debuginfo: Cow::Borrowed(&[
             SplitDebuginfo::Packed,
             SplitDebuginfo::Unpacked,

@@ -1,15 +1,12 @@
-use crate::bolt::{bolt_optimize, with_bolt_instrumented};
 use anyhow::Context;
 use camino::{Utf8Path, Utf8PathBuf};
 use clap::Parser;
 use log::LevelFilter;
-use std::io::Cursor;
-use std::time::Duration;
 use utils::io;
-use zip::ZipArchive;
 
+use crate::bolt::{bolt_optimize, with_bolt_instrumented};
 use crate::environment::{Environment, EnvironmentBuilder};
-use crate::exec::{cmd, Bootstrap};
+use crate::exec::{Bootstrap, cmd};
 use crate::tests::run_tests;
 use crate::timer::Timer;
 use crate::training::{
@@ -17,9 +14,9 @@ use crate::training::{
     rustc_benchmarks,
 };
 use crate::utils::artifact_size::print_binary_sizes;
-use crate::utils::io::{copy_directory, move_directory, reset_directory};
+use crate::utils::io::{copy_directory, reset_directory};
 use crate::utils::{
-    clear_llvm_files, format_env_variables, print_free_disk_space, retry_action, with_log_group,
+    clear_llvm_files, format_env_variables, print_free_disk_space, with_log_group,
     write_timer_to_summary,
 };
 
@@ -65,12 +62,21 @@ enum EnvironmentCmd {
         python: String,
 
         /// Directory where artifacts (like PGO profiles or rustc-perf) of this workflow
-        /// will be stored.
+        /// will be stored. Relative to `checkout_dir`
         #[arg(long, default_value = "opt-artifacts")]
         artifact_dir: Utf8PathBuf,
 
+        /// Checkout directory of `rustc-perf`.
+        ///
+        /// If unspecified, defaults to the rustc-perf submodule in the rustc checkout dir
+        /// (`src/tools/rustc-perf`), which should have been initialized when building this tool.
+        // FIXME: Move update_submodule into build_helper, that way we can also ensure the submodule
+        // is updated when _running_ opt-dist, rather than building.
+        #[arg(long)]
+        rustc_perf_checkout_dir: Option<Utf8PathBuf>,
+
         /// Is LLVM for `rustc` built in shared library mode?
-        #[arg(long, default_value_t = true)]
+        #[arg(long, default_value_t = true, action(clap::ArgAction::Set))]
         llvm_shared: bool,
 
         /// Should BOLT optimization be used? If yes, host LLVM must have BOLT binaries
@@ -84,6 +90,27 @@ enum EnvironmentCmd {
 
         #[clap(flatten)]
         shared: SharedArgs,
+
+        /// Arguments passed to `rustc-perf --cargo-config <value>` when running benchmarks.
+        #[arg(long)]
+        benchmark_cargo_config: Vec<String>,
+
+        /// Perform tests after final build if it's not a fast try build
+        #[arg(long)]
+        run_tests: bool,
+
+        /// Will be LLVM built during the run?
+        #[arg(long, default_value_t = true, action(clap::ArgAction::Set))]
+        build_llvm: bool,
+
+        /// Set build artifacts dir. Relative to `checkout_dir`, should point to the directory set
+        /// in bootstrap.toml via `build.build-dir` option
+        #[arg(long, default_value = "build")]
+        build_dir: Utf8PathBuf,
+
+        /// Path to custom stage0 root
+        #[arg(long)]
+        stage0_root: Option<Utf8PathBuf>,
     },
     /// Perform an optimized build on Linux CI, from inside Docker.
     LinuxCi {
@@ -97,11 +124,14 @@ enum EnvironmentCmd {
     },
 }
 
-fn is_try_build() -> bool {
+/// For a fast try build, we want to only build the bare minimum of components to get a
+/// working toolchain, and not run any tests.
+fn is_fast_try_build() -> bool {
     std::env::var("DIST_TRY_BUILD").unwrap_or_else(|_| "0".to_string()) != "0"
 }
 
 fn create_environment(args: Args) -> anyhow::Result<(Environment, Vec<String>)> {
+    let is_fast_try_build = is_fast_try_build();
     let (env, args) = match args.env {
         EnvironmentCmd::Local {
             target_triple,
@@ -109,21 +139,33 @@ fn create_environment(args: Args) -> anyhow::Result<(Environment, Vec<String>)> 
             llvm_dir,
             python,
             artifact_dir,
+            rustc_perf_checkout_dir,
             llvm_shared,
             use_bolt,
             skipped_tests,
+            benchmark_cargo_config,
             shared,
+            run_tests,
+            build_llvm,
+            build_dir,
+            stage0_root,
         } => {
             let env = EnvironmentBuilder::default()
-                .host_triple(target_triple)
+                .host_tuple(target_triple)
                 .python_binary(python)
                 .checkout_dir(checkout_dir.clone())
                 .host_llvm_dir(llvm_dir)
-                .artifact_dir(artifact_dir)
-                .build_dir(checkout_dir)
+                .artifact_dir(checkout_dir.join(artifact_dir))
+                .build_dir(checkout_dir.join(build_dir))
+                .prebuilt_rustc_perf(rustc_perf_checkout_dir)
                 .shared_llvm(llvm_shared)
                 .use_bolt(use_bolt)
                 .skipped_tests(skipped_tests)
+                .benchmark_cargo_config(benchmark_cargo_config)
+                .run_tests(run_tests)
+                .fast_try_build(is_fast_try_build)
+                .build_llvm(build_llvm)
+                .stage0_root(stage0_root)
                 .build()?;
 
             (env, shared.build_args)
@@ -132,22 +174,23 @@ fn create_environment(args: Args) -> anyhow::Result<(Environment, Vec<String>)> 
             let target_triple =
                 std::env::var("PGO_HOST").expect("PGO_HOST environment variable missing");
 
+            let is_aarch64 = target_triple.starts_with("aarch64");
+
             let checkout_dir = Utf8PathBuf::from("/checkout");
             let env = EnvironmentBuilder::default()
-                .host_triple(target_triple)
+                .host_tuple(target_triple)
                 .python_binary("python3".to_string())
                 .checkout_dir(checkout_dir.clone())
                 .host_llvm_dir(Utf8PathBuf::from("/rustroot"))
                 .artifact_dir(Utf8PathBuf::from("/tmp/tmp-multistage/opt-artifacts"))
-                .build_dir(checkout_dir.join("obj"))
-                // /tmp/rustc-perf comes from the x64 dist Dockerfile
-                .prebuilt_rustc_perf(Some(Utf8PathBuf::from("/tmp/rustc-perf")))
+                .build_dir(checkout_dir.join("obj").join("build"))
                 .shared_llvm(true)
-                .use_bolt(true)
-                .skipped_tests(vec![
-                    // Fails because of linker errors, as of June 2023.
-                    "tests/ui/process/nofile-limit.rs".to_string(),
-                ])
+                // FIXME: Enable bolt for aarch64 once it's fixed upstream. Broken as of December 2024.
+                .use_bolt(!is_aarch64)
+                .skipped_tests(vec![])
+                .run_tests(true)
+                .fast_try_build(is_fast_try_build)
+                .build_llvm(true)
                 .build()?;
 
             (env, shared.build_args)
@@ -158,18 +201,18 @@ fn create_environment(args: Args) -> anyhow::Result<(Environment, Vec<String>)> 
 
             let checkout_dir: Utf8PathBuf = std::env::current_dir()?.try_into()?;
             let env = EnvironmentBuilder::default()
-                .host_triple(target_triple)
+                .host_tuple(target_triple)
                 .python_binary("python".to_string())
                 .checkout_dir(checkout_dir.clone())
                 .host_llvm_dir(checkout_dir.join("citools").join("clang-rust"))
                 .artifact_dir(checkout_dir.join("opt-artifacts"))
-                .build_dir(checkout_dir)
+                .build_dir(checkout_dir.join("build"))
                 .shared_llvm(false)
                 .use_bolt(false)
-                .skipped_tests(vec![
-                    // Fails as of June 2023.
-                    "tests\\codegen\\vec-shrink-panik.rs".to_string(),
-                ])
+                .skipped_tests(vec![])
+                .run_tests(true)
+                .fast_try_build(is_fast_try_build)
+                .build_llvm(true)
                 .build()?;
 
             (env, shared.build_args)
@@ -185,9 +228,12 @@ fn execute_pipeline(
 ) -> anyhow::Result<()> {
     reset_directory(&env.artifact_dir())?;
 
-    with_log_group("Building rustc-perf", || match env.prebuilt_rustc_perf() {
-        Some(dir) => copy_rustc_perf(env, &dir),
-        None => download_rustc_perf(env),
+    with_log_group("Building rustc-perf", || {
+        let rustc_perf_checkout_dir = match env.prebuilt_rustc_perf() {
+            Some(dir) => dir,
+            None => env.checkout_path().join("src").join("tools").join("rustc-perf"),
+        };
+        copy_rustc_perf(env, &rustc_perf_checkout_dir)
     })?;
 
     // Stage 1: Build PGO instrumented rustc
@@ -229,30 +275,35 @@ fn execute_pipeline(
     // Stage 2: Gather LLVM PGO profiles
     // Here we build a PGO instrumented LLVM, reusing the previously PGO optimized rustc.
     // Then we use the instrumented LLVM to gather LLVM PGO profiles.
-    let llvm_pgo_profile = timer.section("Stage 2 (LLVM PGO)", |stage| {
-        // Remove the previous, uninstrumented build of LLVM.
-        clear_llvm_files(env)?;
+    let llvm_pgo_profile = if env.build_llvm() {
+        timer.section("Stage 2 (LLVM PGO)", |stage| {
+            // Remove the previous, uninstrumented build of LLVM.
+            clear_llvm_files(env)?;
 
-        let llvm_profile_dir_root = env.artifact_dir().join("llvm-pgo");
+            let llvm_profile_dir_root = env.artifact_dir().join("llvm-pgo");
 
-        stage.section("Build PGO instrumented LLVM", |section| {
-            Bootstrap::build(env)
-                .llvm_pgo_instrument(&llvm_profile_dir_root)
-                .avoid_rustc_rebuild()
-                .run(section)
-        })?;
+            stage.section("Build PGO instrumented LLVM", |section| {
+                Bootstrap::build(env)
+                    .llvm_pgo_instrument(&llvm_profile_dir_root)
+                    .avoid_rustc_rebuild()
+                    .run(section)
+            })?;
 
-        let profile = stage
-            .section("Gather profiles", |_| gather_llvm_profiles(env, &llvm_profile_dir_root))?;
+            let profile = stage.section("Gather profiles", |_| {
+                gather_llvm_profiles(env, &llvm_profile_dir_root)
+            })?;
 
-        print_free_disk_space()?;
+            print_free_disk_space()?;
 
-        // Proactively delete the instrumented artifacts, to avoid using them by accident in
-        // follow-up stages.
-        clear_llvm_files(env)?;
+            // Proactively delete the instrumented artifacts, to avoid using them by accident in
+            // follow-up stages.
+            clear_llvm_files(env)?;
 
-        Ok(profile)
-    })?;
+            Ok(Some(profile))
+        })?
+    } else {
+        None
+    };
 
     let bolt_profiles = if env.use_bolt() {
         // Stage 3: Build BOLT instrumented LLVM
@@ -260,42 +311,50 @@ fn execute_pipeline(
         // Note that we don't remove LLVM artifacts after this step, so that they are reused in the final dist build.
         // BOLT instrumentation is performed "on-the-fly" when the LLVM library is copied to the sysroot of rustc,
         // therefore the LLVM artifacts on disk are not "tainted" with BOLT instrumentation and they can be reused.
+        let libdir = env.build_artifacts().join("stage2").join("lib");
         timer.section("Stage 3 (BOLT)", |stage| {
-            stage.section("Build PGO optimized LLVM", |stage| {
-                Bootstrap::build(env)
-                    .with_llvm_bolt_ldflags()
-                    .llvm_pgo_optimize(&llvm_pgo_profile)
-                    .avoid_rustc_rebuild()
-                    .run(stage)
-            })?;
+            let llvm_profile = if env.build_llvm() {
+                stage.section("Build PGO optimized LLVM", |stage| {
+                    Bootstrap::build(env)
+                        .with_llvm_bolt_ldflags()
+                        .llvm_pgo_optimize(llvm_pgo_profile.as_ref())
+                        .avoid_rustc_rebuild()
+                        .run(stage)
+                })?;
 
-            let libdir = env.build_artifacts().join("stage2").join("lib");
-            let llvm_lib = io::find_file_in_dir(&libdir, "libLLVM", ".so")?;
+                // The actual name will be something like libLLVM.so.18.1-rust-dev.
+                let llvm_lib = io::find_file_in_dir(&libdir, "libLLVM.so", "")?;
 
-            log::info!("Optimizing {llvm_lib} with BOLT");
+                log::info!("Optimizing {llvm_lib} with BOLT");
 
-            // FIXME(kobzol): try gather profiles together, at once for LLVM and rustc
-            // Instrument the libraries and gather profiles
-            let llvm_profile = with_bolt_instrumented(&llvm_lib, |llvm_profile_dir| {
-                stage.section("Gather profiles", |_| {
-                    gather_bolt_profiles(env, "LLVM", llvm_benchmarks(env), llvm_profile_dir)
-                })
-            })?;
-            print_free_disk_space()?;
+                // FIXME(kobzol): try gather profiles together, at once for LLVM and rustc
+                // Instrument the libraries and gather profiles
+                let llvm_profile = with_bolt_instrumented(env, &llvm_lib, |llvm_profile_dir| {
+                    stage.section("Gather profiles", |_| {
+                        gather_bolt_profiles(env, "LLVM", llvm_benchmarks(env), llvm_profile_dir)
+                    })
+                })?;
+                print_free_disk_space()?;
 
-            // Now optimize the library with BOLT. The `libLLVM-XXX.so` library is actually hard-linked
-            // from several places, and this specific path (`llvm_lib`) will *not* be packaged into
-            // the final dist build. However, when BOLT optimizes an artifact, it does so *in-place*,
-            // therefore it will actually optimize all the hard links, which means that the final
-            // packaged `libLLVM.so` file *will* be BOLT optimized.
-            bolt_optimize(&llvm_lib, &llvm_profile).context("Could not optimize LLVM with BOLT")?;
+                // Now optimize the library with BOLT. The `libLLVM-XXX.so` library is actually hard-linked
+                // from several places, and this specific path (`llvm_lib`) will *not* be packaged into
+                // the final dist build. However, when BOLT optimizes an artifact, it does so *in-place*,
+                // therefore it will actually optimize all the hard links, which means that the final
+                // packaged `libLLVM.so` file *will* be BOLT optimized.
+                bolt_optimize(&llvm_lib, &llvm_profile, env)
+                    .context("Could not optimize LLVM with BOLT")?;
+
+                Some(llvm_profile)
+            } else {
+                None
+            };
 
             let rustc_lib = io::find_file_in_dir(&libdir, "librustc_driver", ".so")?;
 
             log::info!("Optimizing {rustc_lib} with BOLT");
 
             // Instrument it and gather profiles
-            let rustc_profile = with_bolt_instrumented(&rustc_lib, |rustc_profile_dir| {
+            let rustc_profile = with_bolt_instrumented(env, &rustc_lib, |rustc_profile_dir| {
                 stage.section("Gather profiles", |_| {
                     gather_bolt_profiles(env, "rustc", rustc_benchmarks(env), rustc_profile_dir)
                 })
@@ -303,20 +362,27 @@ fn execute_pipeline(
             print_free_disk_space()?;
 
             // Now optimize the library with BOLT.
-            bolt_optimize(&rustc_lib, &rustc_profile)
+            bolt_optimize(&rustc_lib, &rustc_profile, env)
                 .context("Could not optimize rustc with BOLT")?;
 
-            // LLVM is not being cleared here, we want to use the BOLT-optimized LLVM
-            Ok(vec![llvm_profile, rustc_profile])
+            // LLVM is not being cleared here. Either we built it and we want to use the BOLT-optimized LLVM, or we
+            // didn't build it, so we don't want to remove it.
+            Ok(vec![llvm_profile, Some(rustc_profile)])
         })?
     } else {
         vec![]
     };
 
     let mut dist = Bootstrap::dist(env, &dist_args)
-        .llvm_pgo_optimize(&llvm_pgo_profile)
-        .rustc_pgo_optimize(&rustc_pgo_profile)
-        .avoid_rustc_rebuild();
+        .llvm_pgo_optimize(llvm_pgo_profile.as_ref())
+        .rustc_pgo_optimize(&rustc_pgo_profile);
+
+    // if LLVM is not built we'll have PGO optimized rustc
+    dist = if env.supports_shared_llvm() || !env.build_llvm() {
+        dist.avoid_rustc_rebuild()
+    } else {
+        dist.rustc_rebuild()
+    };
 
     for bolt_profile in bolt_profiles {
         dist = dist.with_bolt_profile(bolt_profile);
@@ -328,9 +394,8 @@ fn execute_pipeline(
 
     // After dist has finished, run a subset of the test suite on the optimized artifacts to discover
     // possible regressions.
-    // The tests are not executed for try builds, which can be in various broken states, so we don't
-    // want to gatekeep them with tests.
-    if !is_try_build() {
+    // The tests are not executed for fast try builds, which can be broken and might not pass them.
+    if !is_fast_try_build() && env.run_tests() {
         timer.section("Run tests", |_| run_tests(env))?;
     }
 
@@ -339,7 +404,10 @@ fn execute_pipeline(
 
 fn main() -> anyhow::Result<()> {
     // Make sure that we get backtraces for easier debugging in CI
-    std::env::set_var("RUST_BACKTRACE", "1");
+    unsafe {
+        // SAFETY: we are the only thread running at this point
+        std::env::set_var("RUST_BACKTRACE", "1");
+    }
 
     env_logger::builder()
         .filter_level(LevelFilter::Info)
@@ -355,26 +423,40 @@ fn main() -> anyhow::Result<()> {
         println!("Environment values\n{}", format_env_variables());
     });
 
-    with_log_group("Printing config.toml", || {
-        if let Ok(config) = std::fs::read_to_string("config.toml") {
-            println!("Contents of `config.toml`:\n{config}");
+    with_log_group("Printing bootstrap.toml", || {
+        let config_file = if std::path::Path::new("bootstrap.toml").exists() {
+            "bootstrap.toml"
+        } else {
+            "config.toml" // Fall back for backward compatibility
+        };
+
+        if let Ok(config) = std::fs::read_to_string(config_file) {
+            println!("Contents of `bootstrap.toml`:\n{config}");
+        } else {
+            eprintln!("Failed to read `{}`", config_file);
         }
     });
 
     let (env, mut build_args) = create_environment(args).context("Cannot create environment")?;
 
-    // Skip components that are not needed for try builds to speed them up
-    if is_try_build() {
-        log::info!("Skipping building of unimportant components for a try build");
+    // Skip components that are not needed for fast try builds to speed them up
+    if is_fast_try_build() {
+        log::info!("Skipping building of unimportant components for a fast try build");
         for target in [
             "rust-docs",
             "rustc-docs",
+            "rustc-dev",
+            "rust-dev",
             "rust-docs-json",
             "rust-analyzer",
             "rustc-src",
+            "extended",
             "clippy",
             "miri",
             "rustfmt",
+            "gcc",
+            "generate-copyright",
+            "bootstrap",
         ] {
             build_args.extend(["--skip".to_string(), target.to_string()]);
         }
@@ -399,36 +481,6 @@ fn main() -> anyhow::Result<()> {
 // Copy rustc-perf from the given path into the environment and build it.
 fn copy_rustc_perf(env: &Environment, dir: &Utf8Path) -> anyhow::Result<()> {
     copy_directory(dir, &env.rustc_perf_dir())?;
-    build_rustc_perf(env)
-}
-
-// Download and build rustc-perf into the given environment.
-fn download_rustc_perf(env: &Environment) -> anyhow::Result<()> {
-    reset_directory(&env.rustc_perf_dir())?;
-
-    // FIXME: add some mechanism for synchronization of this commit SHA with
-    // Linux (which builds rustc-perf in a Dockerfile)
-    // rustc-perf version from 2023-10-22
-    const PERF_COMMIT: &str = "4f313add609f43e928e98132358e8426ed3969ae";
-
-    let url = format!("https://ci-mirrors.rust-lang.org/rustc/rustc-perf-{PERF_COMMIT}.zip");
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(60 * 2))
-        .connect_timeout(Duration::from_secs(60 * 2))
-        .build()?;
-    let response = retry_action(
-        || Ok(client.get(&url).send()?.error_for_status()?.bytes()?.to_vec()),
-        "Download rustc-perf archive",
-        5,
-    )?;
-
-    let mut archive = ZipArchive::new(Cursor::new(response))?;
-    archive.extract(env.rustc_perf_dir())?;
-    move_directory(
-        &env.rustc_perf_dir().join(format!("rustc-perf-{PERF_COMMIT}")),
-        &env.rustc_perf_dir(),
-    )?;
-
     build_rustc_perf(env)
 }
 

@@ -42,8 +42,9 @@ fn in_dyn_Fn_return_in_parameters(_: &dyn Fn() -> impl Debug) { panic!() }
 fn in_dyn_Fn_parameter_in_return() -> &'static dyn Fn(impl Debug) { panic!() }
 //~^ ERROR `impl Trait` is not allowed in the parameters of `Fn` trait bounds
 
-// Allowed
+// Allowed (but it's still ambiguous; nothing constrains the RPIT in this body).
 fn in_dyn_Fn_return_in_return() -> &'static dyn Fn() -> impl Debug { panic!() }
+//~^ ERROR: type annotations needed
 
 // Disallowed
 fn in_impl_Fn_parameter_in_parameters(_: &impl Fn(impl Debug)) { panic!() }
@@ -61,6 +62,7 @@ fn in_impl_Fn_parameter_in_return() -> &'static impl Fn(impl Debug) { panic!() }
 
 // Allowed
 fn in_impl_Fn_return_in_return() -> &'static impl Fn() -> impl Debug { panic!() }
+//~^ ERROR: type annotations needed
 
 // Disallowed
 fn in_Fn_parameter_in_generics<F: Fn(impl Debug)> (_: F) { panic!() }
@@ -118,11 +120,13 @@ trait DummyTrait {
 impl DummyTrait for () {
     type Out = impl Debug;
     //~^ ERROR `impl Trait` in associated types is unstable
+    //~| ERROR unconstrained opaque type
 
     fn in_trait_impl_parameter(_: impl Debug) { }
     // Allowed
 
     fn in_trait_impl_return() -> impl Debug { () }
+    //~^ ERROR `in_trait_impl_return` has an incompatible type for trait
     // Allowed
 }
 
@@ -153,6 +157,7 @@ extern "C" fn in_extern_fn_return() -> impl Debug {
 
 type InTypeAlias<R> = impl Debug;
 //~^ ERROR `impl Trait` in type aliases is unstable
+//~| ERROR unconstrained opaque type
 
 type InReturnInTypeAlias<R> = fn() -> impl Debug;
 //~^ ERROR `impl Trait` is not allowed in `fn` pointer
@@ -231,17 +236,15 @@ type InTypeAliasGenericParamDefault<T = impl Debug> = T;
 //~^ ERROR `impl Trait` is not allowed in generic parameter defaults
 
 // Disallowed
-impl <T = impl Debug> T {}
-//~^ ERROR defaults for type parameters are only allowed in `struct`, `enum`, `type`, or `trait` definitions
-//~| WARNING this was previously accepted by the compiler but is being phased out
-//~| ERROR `impl Trait` is not allowed in generic parameter defaults
+#[expect(invalid_type_param_default)]
+impl<T = impl Debug> T {}
+//~^ ERROR `impl Trait` is not allowed in generic parameter defaults
 //~| ERROR no nominal type found
 
 // Disallowed
+#[expect(invalid_type_param_default)]
 fn in_method_generic_param_default<T = impl Debug>(_: T) {}
-//~^ ERROR defaults for type parameters are only allowed in `struct`, `enum`, `type`, or `trait` definitions
-//~| WARNING this was previously accepted by the compiler but is being phased out
-//~| ERROR `impl Trait` is not allowed in generic parameter defaults
+//~^ ERROR `impl Trait` is not allowed in generic parameter defaults
 
 fn main() {
     let _in_local_variable: impl Fn() = || {};

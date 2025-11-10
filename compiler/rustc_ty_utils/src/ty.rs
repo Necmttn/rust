@@ -1,82 +1,97 @@
 use rustc_data_structures::fx::FxHashSet;
 use rustc_hir as hir;
 use rustc_hir::def::DefKind;
-use rustc_index::bit_set::BitSet;
+use rustc_index::bit_set::DenseBitSet;
+use rustc_infer::infer::TyCtxtInferExt;
+use rustc_middle::bug;
 use rustc_middle::query::Providers;
-use rustc_middle::ty::{self, EarlyBinder, Ty, TyCtxt, TypeVisitor};
-use rustc_middle::ty::{ToPredicate, TypeSuperVisitable, TypeVisitable};
-use rustc_span::def_id::{DefId, LocalDefId, CRATE_DEF_ID};
+use rustc_middle::ty::{
+    self, SizedTraitKind, Ty, TyCtxt, TypeSuperVisitable, TypeVisitable, TypeVisitor, Upcast,
+    fold_regions,
+};
 use rustc_span::DUMMY_SP;
+use rustc_span::def_id::{CRATE_DEF_ID, DefId, LocalDefId};
 use rustc_trait_selection::traits;
+use tracing::instrument;
 
-fn sized_constraint_for_ty<'tcx>(
+/// If `ty` implements the given `sizedness` trait, returns `None`. Otherwise, returns the type
+/// that must implement the given `sizedness` for `ty` to implement it.
+#[instrument(level = "debug", skip(tcx), ret)]
+fn sizedness_constraint_for_ty<'tcx>(
     tcx: TyCtxt<'tcx>,
-    adtdef: ty::AdtDef<'tcx>,
+    sizedness: SizedTraitKind,
     ty: Ty<'tcx>,
-) -> Vec<Ty<'tcx>> {
-    use rustc_type_ir::TyKind::*;
+) -> Option<Ty<'tcx>> {
+    match ty.kind() {
+        // Always `Sized` or `MetaSized`
+        ty::Bool
+        | ty::Char
+        | ty::Int(..)
+        | ty::Uint(..)
+        | ty::Float(..)
+        | ty::RawPtr(..)
+        | ty::Ref(..)
+        | ty::FnDef(..)
+        | ty::FnPtr(..)
+        | ty::Array(..)
+        | ty::Closure(..)
+        | ty::CoroutineClosure(..)
+        | ty::Coroutine(..)
+        | ty::CoroutineWitness(..)
+        | ty::Never => None,
 
-    let result = match ty.kind() {
-        Bool | Char | Int(..) | Uint(..) | Float(..) | RawPtr(..) | Ref(..) | FnDef(..)
-        | FnPtr(_) | Array(..) | Closure(..) | Coroutine(..) | Never => vec![],
-
-        Str | Dynamic(..) | Slice(_) | Foreign(..) | Error(_) | CoroutineWitness(..) => {
-            // these are never sized - return the target type
-            vec![ty]
-        }
-
-        Tuple(tys) => match tys.last() {
-            None => vec![],
-            Some(&ty) => sized_constraint_for_ty(tcx, adtdef, ty),
+        ty::Str | ty::Slice(..) | ty::Dynamic(_, _) => match sizedness {
+            // Never `Sized`
+            SizedTraitKind::Sized => Some(ty),
+            // Always `MetaSized`
+            SizedTraitKind::MetaSized => None,
         },
 
-        Adt(adt, args) => {
-            // recursive case
-            let adt_tys = adt.sized_constraint(tcx);
-            debug!("sized_constraint_for_ty({:?}) intermediate = {:?}", ty, adt_tys);
-            adt_tys
-                .iter_instantiated(tcx, args)
-                .flat_map(|ty| sized_constraint_for_ty(tcx, adtdef, ty))
-                .collect()
+        // Maybe `Sized` or `MetaSized`
+        ty::Param(..) | ty::Alias(..) | ty::Error(_) => Some(ty),
+
+        // We cannot instantiate the binder, so just return the *original* type back,
+        // but only if the inner type has a sized constraint. Thus we skip the binder,
+        // but don't actually use the result from `sized_constraint_for_ty`.
+        ty::UnsafeBinder(inner_ty) => {
+            sizedness_constraint_for_ty(tcx, sizedness, inner_ty.skip_binder()).map(|_| ty)
         }
 
-        Alias(..) => {
-            // must calculate explicitly.
-            // FIXME: consider special-casing always-Sized projections
-            vec![ty]
+        // Never `MetaSized` or `Sized`
+        ty::Foreign(..) => Some(ty),
+
+        // Recursive cases
+        ty::Pat(ty, _) => sizedness_constraint_for_ty(tcx, sizedness, *ty),
+
+        ty::Tuple(tys) => {
+            tys.last().and_then(|&ty| sizedness_constraint_for_ty(tcx, sizedness, ty))
         }
 
-        Param(..) => {
-            // perf hack: if there is a `T: Sized` bound, then
-            // we know that `T` is Sized and do not need to check
-            // it on the impl.
+        ty::Adt(adt, args) => adt.sizedness_constraint(tcx, sizedness).and_then(|intermediate| {
+            let ty = intermediate.instantiate(tcx, args);
+            sizedness_constraint_for_ty(tcx, sizedness, ty)
+        }),
 
-            let Some(sized_trait_def_id) = tcx.lang_items().sized_trait() else { return vec![ty] };
-            let predicates = tcx.predicates_of(adtdef.did()).predicates;
-            if predicates.iter().any(|(p, _)| {
-                p.as_trait_clause().is_some_and(|trait_pred| {
-                    trait_pred.def_id() == sized_trait_def_id
-                        && trait_pred.self_ty().skip_binder() == ty
-                })
-            }) {
-                vec![]
-            } else {
-                vec![ty]
-            }
+        ty::Placeholder(..) | ty::Bound(..) | ty::Infer(..) => {
+            bug!("unexpected type `{ty:?}` in `sizedness_constraint_for_ty`")
         }
-
-        Placeholder(..) | Bound(..) | Infer(..) => {
-            bug!("unexpected type `{:?}` in sized_constraint_for_ty", ty)
-        }
-    };
-    debug!("sized_constraint_for_ty({:?}) = {:?}", ty, result);
-    result
+    }
 }
 
 fn defaultness(tcx: TyCtxt<'_>, def_id: LocalDefId) -> hir::Defaultness {
     match tcx.hir_node_by_def_id(def_id) {
-        hir::Node::Item(hir::Item { kind: hir::ItemKind::Impl(impl_), .. }) => impl_.defaultness,
-        hir::Node::ImplItem(hir::ImplItem { defaultness, .. })
+        hir::Node::Item(hir::Item {
+            kind:
+                hir::ItemKind::Impl(hir::Impl {
+                    of_trait: Some(hir::TraitImplHeader { defaultness, .. }),
+                    ..
+                }),
+            ..
+        })
+        | hir::Node::ImplItem(hir::ImplItem {
+            impl_kind: hir::ImplItemImplKind::Trait { defaultness, .. },
+            ..
+        })
         | hir::Node::TraitItem(hir::TraitItem { defaultness, .. }) => *defaultness,
         node => {
             bug!("`defaultness` called on {:?}", node);
@@ -84,33 +99,53 @@ fn defaultness(tcx: TyCtxt<'_>, def_id: LocalDefId) -> hir::Defaultness {
     }
 }
 
-/// Calculates the `Sized` constraint.
+/// Returns the type of the last field of a struct ("the constraint") which must implement the
+/// `sizedness` trait for the whole ADT to be considered to implement that `sizedness` trait.
+/// `def_id` is assumed to be the `AdtDef` of a struct and will panic otherwise.
 ///
-/// In fact, there are only a few options for the types in the constraint:
-///     - an obviously-unsized type
-///     - a type parameter or projection whose Sizedness can't be known
-///     - a tuple of type parameters or projections, if there are multiple
-///       such.
-///     - an Error, if a type is infinitely sized
-fn adt_sized_constraint<'tcx>(
+/// For `Sized`, there are only a few options for the types in the constraint:
+///     - an meta-sized type (str, slices, trait objects, etc)
+///     - an pointee-sized type (extern types)
+///     - a type parameter or projection whose sizedness can't be known
+///
+/// For `MetaSized`, there are only a few options for the types in the constraint:
+///     - an pointee-sized type (extern types)
+///     - a type parameter or projection whose sizedness can't be known
+#[instrument(level = "debug", skip(tcx), ret)]
+fn adt_sizedness_constraint<'tcx>(
     tcx: TyCtxt<'tcx>,
-    def_id: DefId,
-) -> ty::EarlyBinder<&'tcx ty::List<Ty<'tcx>>> {
-    if let Some(def_id) = def_id.as_local() {
-        if matches!(tcx.representability(def_id), ty::Representability::Infinite) {
-            return ty::EarlyBinder::bind(tcx.mk_type_list(&[Ty::new_misc_error(tcx)]));
-        }
+    (def_id, sizedness): (DefId, SizedTraitKind),
+) -> Option<ty::EarlyBinder<'tcx, Ty<'tcx>>> {
+    if let Some(def_id) = def_id.as_local()
+        && let ty::Representability::Infinite(_) = tcx.representability(def_id)
+    {
+        return None;
     }
     let def = tcx.adt_def(def_id);
 
-    let result =
-        tcx.mk_type_list_from_iter(def.variants().iter().filter_map(|v| v.tail_opt()).flat_map(
-            |f| sized_constraint_for_ty(tcx, def, tcx.type_of(f.did).instantiate_identity()),
-        ));
+    if !def.is_struct() {
+        bug!("`adt_sizedness_constraint` called on non-struct type: {def:?}");
+    }
 
-    debug!("adt_sized_constraint: {:?} => {:?}", def, result);
+    let tail_def = def.non_enum_variant().tail_opt()?;
+    let tail_ty = tcx.type_of(tail_def.did).instantiate_identity();
 
-    ty::EarlyBinder::bind(result)
+    let constraint_ty = sizedness_constraint_for_ty(tcx, sizedness, tail_ty)?;
+
+    // perf hack: if there is a `constraint_ty: {Meta,}Sized` bound, then we know
+    // that the type is sized and do not need to check it on the impl.
+    let sizedness_trait_def_id = sizedness.require_lang_item(tcx);
+    let predicates = tcx.predicates_of(def.did()).predicates;
+    if predicates.iter().any(|(p, _)| {
+        p.as_trait_clause().is_some_and(|trait_pred| {
+            trait_pred.def_id() == sizedness_trait_def_id
+                && trait_pred.self_ty().skip_binder() == constraint_ty
+        })
+    }) {
+        return None;
+    }
+
+    Some(ty::EarlyBinder::bind(constraint_ty))
 }
 
 /// See `ParamEnv` struct definition for details.
@@ -133,7 +168,7 @@ fn param_env(tcx: TyCtxt<'_>, def_id: DefId) -> ty::ParamEnv<'_> {
 
     if tcx.def_kind(def_id) == DefKind::AssocFn
         && let assoc_item = tcx.associated_item(def_id)
-        && assoc_item.container == ty::AssocItemContainer::TraitContainer
+        && assoc_item.container == ty::AssocContainer::Trait
         && assoc_item.defaultness(tcx).has_value()
     {
         let sig = tcx.fn_sig(def_id).instantiate_identity();
@@ -148,10 +183,19 @@ fn param_env(tcx: TyCtxt<'_>, def_id: DefId) -> ty::ParamEnv<'_> {
         });
     }
 
+    // We extend the param-env of our item with the const conditions of the item,
+    // since we're allowed to assume `[const]` bounds hold within the item itself.
+    if tcx.is_conditionally_const(def_id) {
+        predicates.extend(
+            tcx.const_conditions(def_id).instantiate_identity(tcx).into_iter().map(
+                |(trait_ref, _)| trait_ref.to_host_effect_clause(tcx, ty::BoundConstness::Maybe),
+            ),
+        );
+    }
+
     let local_did = def_id.as_local();
 
-    let unnormalized_env =
-        ty::ParamEnv::new(tcx.mk_clauses(&predicates), traits::Reveal::UserFacing);
+    let unnormalized_env = ty::ParamEnv::new(tcx.mk_clauses(&predicates));
 
     let body_id = local_did.unwrap_or(CRATE_DEF_ID);
     let cause = traits::ObligationCause::misc(tcx.def_span(def_id), body_id);
@@ -172,17 +216,13 @@ struct ImplTraitInTraitFinder<'a, 'tcx> {
 }
 
 impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for ImplTraitInTraitFinder<'_, 'tcx> {
-    fn visit_binder<T: TypeVisitable<TyCtxt<'tcx>>>(
-        &mut self,
-        binder: &ty::Binder<'tcx, T>,
-    ) -> std::ops::ControlFlow<Self::BreakTy> {
+    fn visit_binder<T: TypeVisitable<TyCtxt<'tcx>>>(&mut self, binder: &ty::Binder<'tcx, T>) {
         self.depth.shift_in(1);
-        let binder = binder.super_visit_with(self);
+        binder.super_visit_with(self);
         self.depth.shift_out(1);
-        binder
     }
 
-    fn visit_ty(&mut self, ty: Ty<'tcx>) -> std::ops::ControlFlow<Self::BreakTy> {
+    fn visit_ty(&mut self, ty: Ty<'tcx>) {
         if let ty::Alias(ty::Projection, unshifted_alias_ty) = *ty.kind()
             && let Some(
                 ty::ImplTraitInTraitData::Trait { fn_def_id, .. }
@@ -194,8 +234,8 @@ impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for ImplTraitInTraitFinder<'_, 'tcx> {
             // We have entered some binders as we've walked into the
             // bounds of the RPITIT. Shift these binders back out when
             // constructing the top-level projection predicate.
-            let shifted_alias_ty = self.tcx.fold_regions(unshifted_alias_ty, |re, depth| {
-                if let ty::ReBound(index, bv) = re.kind() {
+            let shifted_alias_ty = fold_regions(self.tcx, unshifted_alias_ty, |re, depth| {
+                if let ty::ReBound(ty::BoundVarIndexKind::Bound(index), bv) = re.kind() {
                     if depth != ty::INNERMOST {
                         return ty::Region::new_error_with_message(
                             self.tcx,
@@ -220,12 +260,12 @@ impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for ImplTraitInTraitFinder<'_, 'tcx> {
             self.predicates.push(
                 ty::Binder::bind_with_vars(
                     ty::ProjectionPredicate {
-                        projection_ty: shifted_alias_ty,
+                        projection_term: shifted_alias_ty.into(),
                         term: default_ty.into(),
                     },
                     self.bound_vars,
                 )
-                .to_predicate(self.tcx),
+                .upcast(self.tcx),
             );
 
             // We walk the *un-shifted* alias ty, because we're tracking the de bruijn
@@ -245,57 +285,8 @@ impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for ImplTraitInTraitFinder<'_, 'tcx> {
     }
 }
 
-fn param_env_reveal_all_normalized(tcx: TyCtxt<'_>, def_id: DefId) -> ty::ParamEnv<'_> {
-    tcx.param_env(def_id).with_reveal_all_normalized(tcx)
-}
-
-/// If `def_id` is an issue 33140 hack impl, returns its self type; otherwise, returns `None`.
-///
-/// See [`ty::ImplOverlapKind::Issue33140`] for more details.
-fn issue33140_self_ty(tcx: TyCtxt<'_>, def_id: DefId) -> Option<EarlyBinder<Ty<'_>>> {
-    debug!("issue33140_self_ty({:?})", def_id);
-
-    let trait_ref = tcx
-        .impl_trait_ref(def_id)
-        .unwrap_or_else(|| bug!("issue33140_self_ty called on inherent impl {:?}", def_id))
-        .skip_binder();
-
-    debug!("issue33140_self_ty({:?}), trait-ref={:?}", def_id, trait_ref);
-
-    let is_marker_like = tcx.impl_polarity(def_id) == ty::ImplPolarity::Positive
-        && tcx.associated_item_def_ids(trait_ref.def_id).is_empty();
-
-    // Check whether these impls would be ok for a marker trait.
-    if !is_marker_like {
-        debug!("issue33140_self_ty - not marker-like!");
-        return None;
-    }
-
-    // impl must be `impl Trait for dyn Marker1 + Marker2 + ...`
-    if trait_ref.args.len() != 1 {
-        debug!("issue33140_self_ty - impl has args!");
-        return None;
-    }
-
-    let predicates = tcx.predicates_of(def_id);
-    if predicates.parent.is_some() || !predicates.predicates.is_empty() {
-        debug!("issue33140_self_ty - impl has predicates {:?}!", predicates);
-        return None;
-    }
-
-    let self_ty = trait_ref.self_ty();
-    let self_ty_matches = match self_ty.kind() {
-        ty::Dynamic(data, re, _) if re.is_static() => data.principal().is_none(),
-        _ => false,
-    };
-
-    if self_ty_matches {
-        debug!("issue33140_self_ty - MATCHES!");
-        Some(EarlyBinder::bind(self_ty))
-    } else {
-        debug!("issue33140_self_ty - non-matching self type");
-        None
-    }
+fn typing_env_normalized_for_post_analysis(tcx: TyCtxt<'_>, def_id: DefId) -> ty::TypingEnv<'_> {
+    ty::TypingEnv::non_body_analysis(tcx, def_id).with_post_analysis_normalized(tcx)
 }
 
 /// Check if a function is async.
@@ -307,11 +298,11 @@ fn asyncness(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::Asyncness {
     })
 }
 
-fn unsizing_params_for_adt<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> BitSet<u32> {
+fn unsizing_params_for_adt<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> DenseBitSet<u32> {
     let def = tcx.adt_def(def_id);
     let num_params = tcx.generics_of(def_id).count();
 
-    let maybe_unsizing_param_idx = |arg: ty::GenericArg<'tcx>| match arg.unpack() {
+    let maybe_unsizing_param_idx = |arg: ty::GenericArg<'tcx>| match arg.kind() {
         ty::GenericArgKind::Type(ty) => match ty.kind() {
             ty::Param(p) => Some(p.index),
             _ => None,
@@ -328,10 +319,10 @@ fn unsizing_params_for_adt<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> BitSet<u32
 
     // The last field of the structure has to exist and contain type/const parameters.
     let Some((tail_field, prefix_fields)) = def.non_enum_variant().fields.raw.split_last() else {
-        return BitSet::new_empty(num_params);
+        return DenseBitSet::new_empty(num_params);
     };
 
-    let mut unsizing_params = BitSet::new_empty(num_params);
+    let mut unsizing_params = DenseBitSet::new_empty(num_params);
     for arg in tcx.type_of(tail_field.did).instantiate_identity().walk() {
         if let Some(i) = maybe_unsizing_param_idx(arg) {
             unsizing_params.insert(i);
@@ -351,15 +342,70 @@ fn unsizing_params_for_adt<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> BitSet<u32
     unsizing_params
 }
 
+fn impl_self_is_guaranteed_unsized<'tcx>(tcx: TyCtxt<'tcx>, impl_def_id: DefId) -> bool {
+    debug_assert_eq!(tcx.def_kind(impl_def_id), DefKind::Impl { of_trait: true });
+
+    let infcx = tcx.infer_ctxt().ignoring_regions().build(ty::TypingMode::non_body_analysis());
+
+    let ocx = traits::ObligationCtxt::new(&infcx);
+    let cause = traits::ObligationCause::dummy();
+    let param_env = tcx.param_env(impl_def_id);
+
+    let tail = tcx.struct_tail_raw(
+        tcx.type_of(impl_def_id).instantiate_identity(),
+        &cause,
+        |ty| {
+            ocx.structurally_normalize_ty(&cause, param_env, ty).unwrap_or_else(|_| {
+                Ty::new_error_with_message(
+                    tcx,
+                    tcx.def_span(impl_def_id),
+                    "struct tail should be computable",
+                )
+            })
+        },
+        || (),
+    );
+
+    match tail.kind() {
+        ty::Dynamic(_, _) | ty::Slice(_) | ty::Str => true,
+        ty::Bool
+        | ty::Char
+        | ty::Int(_)
+        | ty::Uint(_)
+        | ty::Float(_)
+        | ty::Adt(_, _)
+        | ty::Foreign(_)
+        | ty::Array(_, _)
+        | ty::Pat(_, _)
+        | ty::RawPtr(_, _)
+        | ty::Ref(_, _, _)
+        | ty::FnDef(_, _)
+        | ty::FnPtr(_, _)
+        | ty::UnsafeBinder(_)
+        | ty::Closure(_, _)
+        | ty::CoroutineClosure(_, _)
+        | ty::Coroutine(_, _)
+        | ty::CoroutineWitness(_, _)
+        | ty::Never
+        | ty::Tuple(_)
+        | ty::Alias(_, _)
+        | ty::Param(_)
+        | ty::Bound(_, _)
+        | ty::Placeholder(_)
+        | ty::Infer(_)
+        | ty::Error(_) => false,
+    }
+}
+
 pub(crate) fn provide(providers: &mut Providers) {
     *providers = Providers {
         asyncness,
-        adt_sized_constraint,
+        adt_sizedness_constraint,
         param_env,
-        param_env_reveal_all_normalized,
-        issue33140_self_ty,
+        typing_env_normalized_for_post_analysis,
         defaultness,
         unsizing_params_for_adt,
+        impl_self_is_guaranteed_unsized,
         ..*providers
     };
 }

@@ -1,25 +1,18 @@
-// revisions: x86_64 aarch64
+//@ add-minicore
+//@ revisions: x86_64 aarch64
 
-// [x86_64] compile-flags: --target x86_64-unknown-linux-gnu
-// [aarch64] compile-flags: --target aarch64-unknown-linux-gnu
+//@ [x86_64] compile-flags: --target x86_64-unknown-linux-gnu
+//@ [aarch64] compile-flags: --target aarch64-unknown-linux-gnu
 
-// [x86_64] needs-llvm-components: x86
-// [aarch64] needs-llvm-components: aarch64
+//@ [x86_64] needs-llvm-components: x86
+//@ [aarch64] needs-llvm-components: aarch64
+//@ ignore-backends: gcc
 
-#![feature(no_core, lang_items, rustc_attrs, asm_const)]
+#![feature(no_core)]
 #![no_core]
 
-#[rustc_builtin_macro]
-macro_rules! asm {
-    () => {};
-}
-#[rustc_builtin_macro]
-macro_rules! global_asm {
-    () => {};
-}
-
-#[lang = "sized"]
-trait Sized {}
+extern crate minicore;
+use minicore::*;
 
 fn main() {
     let mut foo = 0;

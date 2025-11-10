@@ -6,8 +6,8 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{bail, format_err};
-use xshell::{cmd, Shell};
+use anyhow::format_err;
+use xshell::{Shell, cmd};
 
 use crate::flags::{self, MeasurementType};
 
@@ -16,13 +16,16 @@ type Unit = String;
 impl flags::Metrics {
     pub(crate) fn run(self, sh: &Shell) -> anyhow::Result<()> {
         let mut metrics = Metrics::new(sh)?;
-        if !Path::new("./target/rustc-perf").exists() {
-            sh.create_dir("./target/rustc-perf")?;
-            cmd!(sh, "git clone https://github.com/rust-lang/rustc-perf.git ./target/rustc-perf")
-                .run()?;
+        if !Path::new("./target/metrics/rustc-perf").exists() {
+            sh.create_dir("./target/metrics/rustc-perf")?;
+            cmd!(
+                sh,
+                "git clone https://github.com/rust-lang/rustc-perf.git ./target/metrics/rustc-perf"
+            )
+            .run()?;
         }
         {
-            let _d = sh.push_dir("./target/rustc-perf");
+            let _d = sh.push_dir("./target/metrics/rustc-perf");
             let revision = &metrics.perf_revision;
             cmd!(sh, "git reset --hard {revision}").run()?;
         }
@@ -64,7 +67,7 @@ impl flags::Metrics {
         };
 
         let mut file =
-            fs::File::options().write(true).create(true).open(format!("target/{}.json", name))?;
+            fs::File::options().write(true).create(true).open(format!("target/{name}.json"))?;
         writeln!(file, "{}", metrics.json())?;
         eprintln!("{metrics:#?}");
         Ok(())
@@ -86,9 +89,14 @@ impl Metrics {
     fn measure_rustc_tests(&mut self, sh: &Shell) -> anyhow::Result<()> {
         eprintln!("\nMeasuring rustc tests");
 
-        cmd!(sh, "git clone --depth=1 https://github.com/rust-lang/rust").run()?;
+        cmd!(
+            sh,
+            "git clone --depth=1 --branch 1.76.0 https://github.com/rust-lang/rust.git --single-branch ./target/metrics/rust"
+        )
+        .run()?;
 
-        let output = cmd!(sh, "./target/release/rust-analyzer rustc-tests ./rust").read()?;
+        let output =
+            cmd!(sh, "./target/release/rust-analyzer rustc-tests ./target/metrics/rust").read()?;
         for (metric, value, unit) in parse_metrics(&output) {
             self.report(metric, value, unit.into());
         }
@@ -102,7 +110,7 @@ impl Metrics {
         self.measure_analysis_stats_path(
             sh,
             bench,
-            &format!("./target/rustc-perf/collector/compile-benchmarks/{bench}"),
+            &format!("./target/metrics/rustc-perf/collector/compile-benchmarks/{bench}"),
         )
     }
     fn measure_analysis_stats_path(
@@ -113,13 +121,7 @@ impl Metrics {
     ) -> anyhow::Result<()> {
         assert!(Path::new(path).exists(), "unable to find bench in {path}");
         eprintln!("\nMeasuring analysis-stats/{name}");
-        let output = cmd!(
-            sh,
-            "./target/release/rust-analyzer -q analysis-stats {path} --query-sysroot-metadata"
-        )
-        // the sysroot uses `public-dependency`, so we make cargo think it's a nightly
-        .env("__CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS", "nightly")
-        .read()?;
+        let output = cmd!(sh, "./target/release/rust-analyzer -q analysis-stats {path}").read()?;
         for (metric, value, unit) in parse_metrics(&output) {
             self.report(&format!("analysis-stats/{name}/{metric}"), value, unit.into());
         }
@@ -158,7 +160,7 @@ struct Host {
 
 impl Metrics {
     fn new(sh: &Shell) -> anyhow::Result<Metrics> {
-        let host = Host::new(sh)?;
+        let host = Host::new(sh).unwrap_or_else(|_| Host::unknown());
         let timestamp = SystemTime::now();
         let revision = cmd!(sh, "git rev-parse HEAD").read()?;
         let perf_revision = "a584462e145a0c04760fd9391daefb4f6bd13a99".into();
@@ -189,17 +191,21 @@ impl Metrics {
 }
 
 impl Host {
+    fn unknown() -> Host {
+        Host { os: "unknown".into(), cpu: "unknown".into(), mem: "unknown".into() }
+    }
+
     fn new(sh: &Shell) -> anyhow::Result<Host> {
         if cfg!(not(target_os = "linux")) {
-            bail!("can only collect metrics on Linux ");
+            return Ok(Host::unknown());
         }
 
-        let os = read_field(sh, "/etc/os-release", "PRETTY_NAME=")?.trim_matches('"').to_string();
+        let os = read_field(sh, "/etc/os-release", "PRETTY_NAME=")?.trim_matches('"').to_owned();
 
         let cpu = read_field(sh, "/proc/cpuinfo", "model name")?
             .trim_start_matches(':')
             .trim()
-            .to_string();
+            .to_owned();
 
         let mem = read_field(sh, "/proc/meminfo", "MemTotal:")?;
 
@@ -210,7 +216,7 @@ impl Host {
 
             text.lines()
                 .find_map(|it| it.strip_prefix(field))
-                .map(|it| it.trim().to_string())
+                .map(|it| it.trim().to_owned())
                 .ok_or_else(|| format_err!("can't parse {}", path))
         }
     }

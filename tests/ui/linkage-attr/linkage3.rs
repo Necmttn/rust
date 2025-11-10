@@ -1,11 +1,11 @@
-// check-fail
+//@ check-fail
 
 #![feature(linkage)]
 
 extern "C" {
     #[linkage = "foo"]
     static foo: *const i32;
-//~^ ERROR: invalid linkage specified
+//~^^ ERROR: malformed `linkage` attribute input [E0539]
 }
 
 fn main() {

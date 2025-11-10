@@ -1,5 +1,10 @@
+//@aux-build:proc_macro_derive.rs
 #![allow(clippy::clone_on_copy, unused)]
+#![allow(clippy::assigning_clones)]
 #![no_main]
+
+extern crate proc_macros;
+use proc_macros::inline_macros;
 
 // lint
 
@@ -7,10 +12,12 @@ struct A(u32);
 
 impl Clone for A {
     fn clone(&self) -> Self {
+        //~^ non_canonical_clone_impl
         Self(self.0)
     }
 
     fn clone_from(&mut self, source: &Self) {
+        //~^ non_canonical_clone_impl
         source.clone();
         *self = source.clone();
     }
@@ -78,10 +85,12 @@ struct F(u32);
 
 impl Clone for F {
     fn clone(&self) -> Self {
+        //~^ non_canonical_clone_impl
         Self(self.0)
     }
 
     fn clone_from(&mut self, source: &Self) {
+        //~^ non_canonical_clone_impl
         source.clone();
         *self = source.clone();
     }
@@ -104,3 +113,49 @@ impl<A: Copy> Clone for Uwu<A> {
 }
 
 impl<A: std::fmt::Debug + Copy + Clone> Copy for Uwu<A> {}
+
+#[inline_macros]
+mod issue12788 {
+    use proc_macros::{external, with_span};
+
+    // lint -- not an external macro
+    inline!(
+        #[derive(Copy)]
+        pub struct A;
+
+        impl Clone for A {
+            fn clone(&self) -> Self {
+                //~^ non_canonical_clone_impl
+                todo!()
+            }
+        }
+    );
+
+    // do not lint -- should skip external macros
+    external!(
+        #[derive(Copy)]
+        pub struct B;
+
+        impl Clone for B {
+            fn clone(&self) -> Self {
+                todo!()
+            }
+        }
+    );
+
+    // do not lint -- should skip proc macros
+    #[derive(proc_macro_derive::NonCanonicalClone)]
+    pub struct C;
+
+    with_span!(
+        span
+
+        #[derive(Copy)]
+        struct D;
+        impl Clone for D {
+            fn clone(&self) -> Self {
+                todo!()
+            }
+        }
+    );
+}

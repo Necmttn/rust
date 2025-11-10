@@ -1,7 +1,4 @@
-// edition: 2021
-
-#![feature(unsized_locals)]
-//~^ WARN the feature `unsized_locals` is incomplete
+//@ edition: 2021
 
 async fn f() {}
 

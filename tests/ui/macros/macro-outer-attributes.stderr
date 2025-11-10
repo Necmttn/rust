@@ -7,6 +7,8 @@ LL |     a::bar();
 note: found an item that was configured out
   --> $DIR/macro-outer-attributes.rs:9:14
    |
+LL |       #[cfg(false)],
+   |             ----- the item is gated here
 LL |       pub fn bar() { });
    |              ^^^
 help: consider importing this function

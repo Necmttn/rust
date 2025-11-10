@@ -1,9 +1,8 @@
-// check-pass
+//@ check-pass
 // issue: 114035
-// revisions: current next
-//[next] compile-flags: -Znext-solver
-
-#![feature(trait_upcasting)]
+//@ revisions: current next
+//@ ignore-compare-mode-next-solver (explicit revisions)
+//@[next] compile-flags: -Znext-solver
 
 trait A: B {
     type Assoc;

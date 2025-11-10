@@ -1,6 +1,8 @@
 //@revisions: stack tree
+// Ensure this even hits the aliasing model
+//@compile-flags: -Zmiri-disable-validation
 //@[tree]compile-flags: -Zmiri-tree-borrows
-//@error-in-other-file: pointer to 4 bytes starting at offset 0 is out-of-bounds
+//@error-in-other-file: pointer not dereferenceable
 
 fn main() {
     unsafe {

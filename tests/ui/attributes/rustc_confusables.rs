@@ -1,4 +1,4 @@
-// aux-build: rustc_confusables_across_crate.rs
+//@ aux-build: rustc_confusables_across_crate.rs
 
 #![feature(rustc_attrs)]
 
@@ -11,7 +11,7 @@ fn main() {
     let x = BTreeSet {};
     x.inser();
     //~^ ERROR no method named
-    //~| HELP there is a method with a similar name
+    //~| HELP there is a method `insert` with a similar name
     x.foo();
     //~^ ERROR no method named
     x.push();
@@ -21,7 +21,7 @@ fn main() {
     //~^ ERROR no method named
     x.pulled();
     //~^ ERROR no method named
-    //~| HELP there is a method with a similar name
+    //~| HELP you might have meant to use `pull`
 }
 
 struct Bar;
@@ -37,11 +37,13 @@ impl Bar {
     fn qux() {}
 
     #[rustc_confusables(invalid_meta_item)]
-    //~^ ERROR expected a quoted string literal
-    //~| HELP consider surrounding this with quotes
+    //~^ ERROR malformed `rustc_confusables` attribute input [E0539]
+    //~| HELP must be of the form
     fn quux() {}
 }
 
 #[rustc_confusables("blah")]
-//~^ ERROR attribute should be applied to an inherent method
+//~^ ERROR attribute cannot be used on
+//~| HELP can only be applied to
+//~| HELP remove the attribute
 fn not_inherent_impl_method() {}

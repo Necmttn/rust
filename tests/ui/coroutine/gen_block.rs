@@ -1,6 +1,7 @@
-// revisions: e2024 none
-//[e2024] compile-flags: --edition 2024 -Zunstable-options
+//@ revisions: e2024 none
+//@[e2024] edition: 2024
 #![cfg_attr(e2024, feature(gen_blocks))]
+#![feature(stmt_expr_attributes)]
 
 fn main() {
     let x = gen {};
@@ -13,5 +14,13 @@ fn main() {
     //[none]~^ ERROR: cannot find
 
     let _ = || yield true; //[none]~ ERROR yield syntax is experimental
-    //~^ ERROR yield syntax is experimental
+    //[none]~^ ERROR yield syntax is experimental
+    //~^^ ERROR `yield` can only be used in
+
+    let _ = #[coroutine] || yield true; //[none]~ ERROR yield syntax is experimental
+    //~^ ERROR `#[coroutine]` attribute is an experimental feature
+    //[none]~^^ ERROR yield syntax is experimental
+
+    let _ = #[coroutine] || {};
+    //~^ ERROR `#[coroutine]` attribute is an experimental feature
 }

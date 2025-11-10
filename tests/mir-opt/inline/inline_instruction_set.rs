@@ -2,8 +2,8 @@
 //
 // A function is "compatible" when the *callee* has the same attribute or no attribute.
 //
-// compile-flags: --target thumbv4t-none-eabi
-// needs-llvm-components: arm
+//@ compile-flags: --target thumbv4t-none-eabi
+//@ needs-llvm-components: arm
 
 #![crate_type = "lib"]
 #![feature(rustc_attrs)]
@@ -22,8 +22,14 @@ macro_rules! asm {
     };
 }
 
+#[lang = "pointee_sized"]
+pub trait PointeeSized {}
+
+#[lang = "meta_sized"]
+pub trait MetaSized: PointeeSized {}
+
 #[lang = "sized"]
-trait Sized {}
+pub trait Sized: MetaSized {}
 #[lang = "copy"]
 trait Copy {}
 

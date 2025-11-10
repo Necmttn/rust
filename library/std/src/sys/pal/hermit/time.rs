@@ -1,12 +1,13 @@
 #![allow(dead_code)]
 
-use super::abi;
-use super::abi::timespec;
-use super::abi::{CLOCK_MONOTONIC, CLOCK_REALTIME, NSEC_PER_SEC};
+use core::hash::{Hash, Hasher};
+
+use super::hermit_abi::{self, CLOCK_MONOTONIC, CLOCK_REALTIME, timespec};
 use crate::cmp::Ordering;
 use crate::ops::{Add, AddAssign, Sub, SubAssign};
 use crate::time::Duration;
-use core::hash::{Hash, Hasher};
+
+const NSEC_PER_SEC: i32 = 1_000_000_000;
 
 #[derive(Copy, Clone, Debug)]
 struct Timespec {
@@ -18,17 +19,30 @@ impl Timespec {
         Timespec { t: timespec { tv_sec: 0, tv_nsec: 0 } }
     }
 
+    const fn new(tv_sec: i64, tv_nsec: i32) -> Timespec {
+        assert!(tv_nsec >= 0 && tv_nsec < NSEC_PER_SEC);
+        // SAFETY: The assert above checks tv_nsec is within the valid range
+        Timespec { t: timespec { tv_sec, tv_nsec } }
+    }
+
     fn sub_timespec(&self, other: &Timespec) -> Result<Duration, Duration> {
+        fn sub_ge_to_unsigned(a: i64, b: i64) -> u64 {
+            debug_assert!(a >= b);
+            a.wrapping_sub(b).cast_unsigned()
+        }
+
         if self >= other {
+            // Logic here is identical to Unix version of `Timestamp::sub_timespec`,
+            // check comments there why operations do not overflow.
             Ok(if self.t.tv_nsec >= other.t.tv_nsec {
                 Duration::new(
-                    (self.t.tv_sec - other.t.tv_sec) as u64,
+                    sub_ge_to_unsigned(self.t.tv_sec, other.t.tv_sec),
                     (self.t.tv_nsec - other.t.tv_nsec) as u32,
                 )
             } else {
                 Duration::new(
-                    (self.t.tv_sec - 1 - other.t.tv_sec) as u64,
-                    self.t.tv_nsec as u32 + (NSEC_PER_SEC as u32) - other.t.tv_nsec as u32,
+                    sub_ge_to_unsigned(self.t.tv_sec - 1, other.t.tv_sec),
+                    (self.t.tv_nsec + NSEC_PER_SEC - other.t.tv_nsec) as u32,
                 )
             })
         } else {
@@ -44,9 +58,9 @@ impl Timespec {
 
         // Nano calculations can't overflow because nanos are <1B which fit
         // in a u32.
-        let mut nsec = other.subsec_nanos() + self.t.tv_nsec as u32;
-        if nsec >= NSEC_PER_SEC as u32 {
-            nsec -= NSEC_PER_SEC as u32;
+        let mut nsec = other.subsec_nanos() + u32::try_from(self.t.tv_nsec).unwrap();
+        if nsec >= NSEC_PER_SEC.try_into().unwrap() {
+            nsec -= u32::try_from(NSEC_PER_SEC).unwrap();
             secs = secs.checked_add(1)?;
         }
         Some(Timespec { t: timespec { tv_sec: secs, tv_nsec: nsec as _ } })
@@ -100,7 +114,7 @@ pub struct Instant(Timespec);
 impl Instant {
     pub fn now() -> Instant {
         let mut time: Timespec = Timespec::zero();
-        let _ = unsafe { abi::clock_gettime(CLOCK_MONOTONIC, &mut time.t as *mut timespec) };
+        let _ = unsafe { hermit_abi::clock_gettime(CLOCK_MONOTONIC, &raw mut time.t) };
 
         Instant(time)
     }
@@ -179,7 +193,7 @@ impl Sub<Instant> for Instant {
     ///
     /// # Panics
     ///
-    /// Previous rust versions panicked when `other` was later than `self`. Currently this
+    /// Previous Rust versions panicked when `other` was later than `self`. Currently this
     /// method saturates. Future versions may reintroduce the panic in some circumstances.
     /// See [Monotonicity].
     ///
@@ -195,9 +209,13 @@ pub struct SystemTime(Timespec);
 pub const UNIX_EPOCH: SystemTime = SystemTime(Timespec::zero());
 
 impl SystemTime {
+    pub fn new(tv_sec: i64, tv_nsec: i32) -> SystemTime {
+        SystemTime(Timespec::new(tv_sec, tv_nsec))
+    }
+
     pub fn now() -> SystemTime {
         let mut time: Timespec = Timespec::zero();
-        let _ = unsafe { abi::clock_gettime(CLOCK_REALTIME, &mut time.t as *mut timespec) };
+        let _ = unsafe { hermit_abi::clock_gettime(CLOCK_REALTIME, &raw mut time.t) };
 
         SystemTime(time)
     }

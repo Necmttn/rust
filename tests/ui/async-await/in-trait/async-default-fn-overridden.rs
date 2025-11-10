@@ -1,7 +1,5 @@
-// run-pass
-// edition:2021
-
-#![feature(noop_waker)]
+//@ run-pass
+//@ edition:2021
 
 use std::future::Future;
 

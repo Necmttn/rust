@@ -6,16 +6,19 @@ import { type CommandFactory, Ctx, fetchWorkspace } from "./ctx";
 import * as diagnostics from "./diagnostics";
 import { activateTaskProvider } from "./tasks";
 import { setContextValue } from "./util";
-import type { JsonProject } from "./rust_project";
+import { initializeDebugSessionTrackingAndRebuild } from "./debug";
 
 const RUST_PROJECT_CONTEXT_NAME = "inRustProject";
 
-// This API is not stable and may break in between minor releases.
 export interface RustAnalyzerExtensionApi {
+    // FIXME: this should be non-optional
     readonly client?: lc.LanguageClient;
 
-    setWorkspaces(workspaces: JsonProject[]): void;
-    notifyRustAnalyzer(): Promise<void>;
+    // Allows adding a configuration override from another extension.
+    // `extensionId` is used to only merge configuration override from present
+    // extensions. `configuration` is map of rust-analyzer-specific setting
+    // overrides, e.g., `{"cargo.cfgs": ["foo", "bar"]}`.
+    addConfiguration(extensionId: string, configuration: Record<string, unknown>): Promise<void>;
 }
 
 export async function deactivate() {
@@ -25,16 +28,7 @@ export async function deactivate() {
 export async function activate(
     context: vscode.ExtensionContext,
 ): Promise<RustAnalyzerExtensionApi> {
-    if (vscode.extensions.getExtension("rust-lang.rust")) {
-        vscode.window
-            .showWarningMessage(
-                `You have both the rust-analyzer (rust-lang.rust-analyzer) and Rust (rust-lang.rust) ` +
-                    "plugins enabled. These are known to conflict and cause various functions of " +
-                    "both plugins to not work correctly. You should disable one of them.",
-                "Got it",
-            )
-            .then(() => {}, console.error);
-    }
+    checkConflictingExtensions();
 
     const ctx = new Ctx(context, createCommands(), fetchWorkspace());
     // VS Code doesn't show a notification when an extension fails to activate
@@ -115,7 +109,18 @@ async function activateServer(ctx: Ctx): Promise<RustAnalyzerExtensionApi> {
         ctx.subscriptions,
     );
 
-    await ctx.start();
+    if (ctx.config.debug.buildBeforeRestart) {
+        initializeDebugSessionTrackingAndRebuild(ctx);
+    }
+
+    if (ctx.config.initializeStopped) {
+        ctx.setServerStatus({
+            health: "stopped",
+        });
+    } else {
+        await ctx.start();
+    }
+
     return ctx;
 }
 
@@ -154,13 +159,12 @@ function createCommands(): Record<string, CommandFactory> {
 
         analyzerStatus: { enabled: commands.analyzerStatus },
         memoryUsage: { enabled: commands.memoryUsage },
-        shuffleCrateGraph: { enabled: commands.shuffleCrateGraph },
         reloadWorkspace: { enabled: commands.reloadWorkspace },
         rebuildProcMacros: { enabled: commands.rebuildProcMacros },
         matchingBrace: { enabled: commands.matchingBrace },
         joinLines: { enabled: commands.joinLines },
         parentModule: { enabled: commands.parentModule },
-        syntaxTree: { enabled: commands.syntaxTree },
+        childModules: { enabled: commands.childModules },
         viewHir: { enabled: commands.viewHir },
         viewMir: { enabled: commands.viewMir },
         interpretFunction: { enabled: commands.interpretFunction },
@@ -169,7 +173,7 @@ function createCommands(): Record<string, CommandFactory> {
         viewCrateGraph: { enabled: commands.viewCrateGraph },
         viewFullCrateGraph: { enabled: commands.viewFullCrateGraph },
         expandMacro: { enabled: commands.expandMacro },
-        run: { enabled: commands.run },
+        run: { enabled: (ctx) => (mode?: "cursor") => commands.run(ctx, mode)() },
         copyRunCommandLine: { enabled: commands.copyRunCommandLine },
         debug: { enabled: commands.debug },
         newDebugConfig: { enabled: commands.newDebugConfig },
@@ -186,17 +190,44 @@ function createCommands(): Record<string, CommandFactory> {
         serverVersion: { enabled: commands.serverVersion },
         viewMemoryLayout: { enabled: commands.viewMemoryLayout },
         toggleCheckOnSave: { enabled: commands.toggleCheckOnSave },
+        toggleLSPLogs: { enabled: commands.toggleLSPLogs },
+        openWalkthrough: { enabled: commands.openWalkthrough },
         // Internal commands which are invoked by the server.
         applyActionGroup: { enabled: commands.applyActionGroup },
-        applySnippetWorkspaceEdit: { enabled: commands.applySnippetWorkspaceEditCommand },
+        applySnippetWorkspaceEdit: {
+            enabled: commands.applySnippetWorkspaceEditCommand,
+        },
         debugSingle: { enabled: commands.debugSingle },
         gotoLocation: { enabled: commands.gotoLocation },
-        linkToCommand: { enabled: commands.linkToCommand },
+        hoverRefCommandProxy: { enabled: commands.hoverRefCommandProxy },
         resolveCodeAction: { enabled: commands.resolveCodeAction },
         runSingle: { enabled: commands.runSingle },
         showReferences: { enabled: commands.showReferences },
         triggerParameterHints: { enabled: commands.triggerParameterHints },
+        rename: { enabled: commands.rename },
         openLogs: { enabled: commands.openLogs },
         revealDependency: { enabled: commands.revealDependency },
+        syntaxTreeReveal: { enabled: commands.syntaxTreeReveal },
+        syntaxTreeCopy: { enabled: commands.syntaxTreeCopy },
+        syntaxTreeHideWhitespace: {
+            enabled: commands.syntaxTreeHideWhitespace,
+        },
+        syntaxTreeShowWhitespace: {
+            enabled: commands.syntaxTreeShowWhitespace,
+        },
     };
+}
+
+function checkConflictingExtensions() {
+    if (vscode.extensions.getExtension("rust-lang.rust")) {
+        vscode.window
+            .showWarningMessage(
+                `You have both the rust-analyzer (rust-lang.rust-analyzer) and Rust (rust-lang.rust) ` +
+                    "plugins enabled. These are known to conflict and cause various functions of " +
+                    "both plugins to not work correctly. You should disable one of them.",
+                "Got it",
+            )
+            // eslint-disable-next-line no-console
+            .then(() => {}, console.error);
+    }
 }

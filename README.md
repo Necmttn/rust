@@ -1,27 +1,36 @@
-# The Rust Programming Language
+<div align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/rust-lang/www.rust-lang.org/master/static/images/rust-social-wide-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/rust-lang/www.rust-lang.org/master/static/images/rust-social-wide-light.svg">
+    <img alt="The Rust Programming Language: A language empowering everyone to build reliable and efficient software"
+         src="https://raw.githubusercontent.com/rust-lang/www.rust-lang.org/master/static/images/rust-social-wide-light.svg"
+         width="50%">
+  </picture>
 
-[![Rust Community](https://img.shields.io/badge/Rust_Community%20-Join_us-brightgreen?style=plastic&logo=rust)](https://www.rust-lang.org/community)
+[Website][Rust] | [Getting started] | [Learn] | [Documentation] | [Contributing]
+</div>
 
 This is the main source code repository for [Rust]. It contains the compiler,
 standard library, and documentation.
 
 [Rust]: https://www.rust-lang.org/
+[Getting Started]: https://www.rust-lang.org/learn/get-started
+[Learn]: https://www.rust-lang.org/learn
+[Documentation]: https://www.rust-lang.org/learn#learn-use
+[Contributing]: CONTRIBUTING.md
 
-**Note: this README is for _users_ rather than _contributors_.**
-If you wish to _contribute_ to the compiler, you should read
-[CONTRIBUTING.md](CONTRIBUTING.md) instead.
+## Why Rust?
 
-<details>
-<summary>Table of Contents</summary>
+- **Performance:** Fast and memory-efficient, suitable for critical services, embedded devices, and easily integrated with other languages.
 
-- [Quick Start](#quick-start)
-- [Installing from Source](#installing-from-source)
-- [Getting Help](#getting-help)
-- [Contributing](#contributing)
-- [License](#license)
-- [Trademark](#trademark)
+- **Reliability:** Our rich type system and ownership model ensure memory and thread safety, reducing bugs at compile-time.
 
-</details>
+- **Productivity:** Comprehensive documentation, a compiler committed to providing great diagnostics, and advanced tooling including package manager and build tool ([Cargo]), auto-formatter ([rustfmt]), linter ([Clippy]) and editor support ([rust-analyzer]).
+
+[Cargo]: https://github.com/rust-lang/cargo
+[rustfmt]: https://github.com/rust-lang/rustfmt
+[Clippy]: https://github.com/rust-lang/rust-clippy
+[rust-analyzer]: https://github.com/rust-lang/rust-analyzer
 
 ## Quick Start
 
@@ -58,11 +67,11 @@ See [LICENSE-APACHE](LICENSE-APACHE), [LICENSE-MIT](LICENSE-MIT), and
 trademarks and logos (the "Rust Trademarks").
 
 If you want to use these names or brands, please read the
-[media guide][media-guide].
+[Rust language trademark policy][trademark-policy].
 
 Third-party logos may be subject to third-party copyrights and trademarks. See
 [Licenses][policies-licenses] for details.
 
-[rust-foundation]: https://foundation.rust-lang.org/
-[media-guide]: https://foundation.rust-lang.org/policies/logo-policy-and-media-guide/
+[rust-foundation]: https://rustfoundation.org/
+[trademark-policy]: https://rustfoundation.org/policy/rust-trademark-policy/
 [policies-licenses]: https://www.rust-lang.org/policies/licenses

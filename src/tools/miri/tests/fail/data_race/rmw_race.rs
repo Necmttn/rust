@@ -1,4 +1,5 @@
-//@compile-flags: -Zmiri-disable-weak-memory-emulation -Zmiri-preemption-rate=0 -Zmiri-disable-stacked-borrows
+// We want to control preemption here. Stacked borrows interferes by having its own accesses.
+//@compile-flags: -Zmiri-deterministic-concurrency -Zmiri-disable-stacked-borrows
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::spawn;
@@ -11,7 +12,7 @@ unsafe impl<T> Sync for EvilSend<T> {}
 
 static SYNC: AtomicUsize = AtomicUsize::new(0);
 
-pub fn main() {
+fn main() {
     let mut a = 0u32;
     let b = &mut a as *mut u32;
     let c = EvilSend(b);
@@ -40,7 +41,7 @@ pub fn main() {
         let j3 = spawn(move || {
             let c = c; // capture `c`, not just its field.
             if SYNC.load(Ordering::Acquire) == 3 {
-                *c.0 //~ ERROR: Data race detected between (1) non-atomic write on thread `<unnamed>` and (2) non-atomic read on thread `<unnamed>`
+                *c.0 //~ ERROR: Data race detected between (1) non-atomic write on thread `unnamed-1` and (2) non-atomic read on thread `unnamed-3`
             } else {
                 0
             }

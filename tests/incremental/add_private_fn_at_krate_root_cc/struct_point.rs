@@ -2,10 +2,11 @@
 // crate. This should not cause anything we use to be invalidated.
 // Regression test for #36168.
 
-// revisions:cfail1 cfail2
-// compile-flags: -Z query-dep-graph
-// aux-build:point.rs
-// build-pass
+//@ revisions:cfail1 cfail2
+//@ compile-flags: -Z query-dep-graph
+//@ aux-build:point.rs
+//@ build-pass
+//@ ignore-backends: gcc
 
 #![feature(rustc_attrs)]
 #![feature(stmt_expr_attributes)]

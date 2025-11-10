@@ -1,9 +1,7 @@
 // Tests #73631: closures inherit `#[target_feature]` annotations
 
-// check-pass
-// only-x86_64
-
-#![feature(target_feature_11)]
+//@ check-pass
+//@ only-x86_64
 
 #[target_feature(enable = "avx")]
 fn also_use_avx() {

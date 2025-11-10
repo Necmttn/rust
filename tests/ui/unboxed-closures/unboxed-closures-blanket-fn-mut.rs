@@ -1,8 +1,6 @@
-// run-pass
+//@ run-pass
 #![allow(unused_variables)]
 // Test that you can supply `&F` where `F: FnMut()`.
-
-#![feature(lang_items)]
 
 fn a<F:FnMut() -> i32>(mut f: F) -> i32 {
     f()

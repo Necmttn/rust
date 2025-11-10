@@ -5,7 +5,9 @@ use rustc_span::DUMMY_SP;
 use rustc_trait_selection::traits::query::CanonicalPredicateGoal;
 use rustc_trait_selection::traits::{
     EvaluationResult, Obligation, ObligationCause, OverflowError, SelectionContext, TraitQueryMode,
+    sizedness_fast_path,
 };
+use tracing::debug;
 
 pub(crate) fn provide(p: &mut Providers) {
     *p = Providers { evaluate_obligation, ..*p };
@@ -17,10 +19,14 @@ fn evaluate_obligation<'tcx>(
 ) -> Result<EvaluationResult, OverflowError> {
     assert!(!tcx.next_trait_solver_globally());
     debug!("evaluate_obligation(canonical_goal={:#?})", canonical_goal);
-    let (ref infcx, goal, _canonical_inference_vars) =
+    let (ref infcx, goal, _var_values) =
         tcx.infer_ctxt().build_with_canonical(DUMMY_SP, &canonical_goal);
     debug!("evaluate_obligation: goal={:#?}", goal);
     let ParamEnvAnd { param_env, value: predicate } = goal;
+
+    if sizedness_fast_path(tcx, predicate, param_env) {
+        return Ok(EvaluationResult::EvaluatedToOk);
+    }
 
     let mut selcx = SelectionContext::with_query_mode(infcx, TraitQueryMode::Canonical);
     let obligation = Obligation::new(tcx, ObligationCause::dummy(), param_env, predicate);

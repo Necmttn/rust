@@ -1,7 +1,7 @@
-//~ ERROR
+//~? ERROR values of the type `[u8; usize::MAX]` are too big for the target architecture
 
-// build-fail
-// ignore-32bit
+//@ build-fail
+//@ ignore-32bit
 
 struct S<T> {
     x: [T; !0],

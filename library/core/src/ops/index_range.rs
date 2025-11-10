@@ -1,6 +1,7 @@
-use crate::intrinsics::{unchecked_add, unchecked_sub};
 use crate::iter::{FusedIterator, TrustedLen};
-use crate::num::NonZeroUsize;
+use crate::num::NonZero;
+use crate::ops::{NeverShortCircuit, Try};
+use crate::ub_checks;
 
 /// Like a `Range<usize>`, but with a safety invariant that `start <= end`.
 ///
@@ -8,7 +9,8 @@ use crate::num::NonZeroUsize;
 ///
 /// (Normal `Range` code needs to handle degenerate ranges like `10..0`,
 ///  which takes extra checks compared to only handling the canonical form.)
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug)]
+#[derive_const(Clone, Eq, PartialEq)]
 pub(crate) struct IndexRange {
     start: usize,
     end: usize,
@@ -18,55 +20,58 @@ impl IndexRange {
     /// # Safety
     /// - `start <= end`
     #[inline]
-    pub const unsafe fn new_unchecked(start: usize, end: usize) -> Self {
-        crate::panic::debug_assert_nounwind!(
-            start <= end,
-            "IndexRange::new_unchecked requires `start <= end`"
+    #[track_caller]
+    pub(crate) const unsafe fn new_unchecked(start: usize, end: usize) -> Self {
+        ub_checks::assert_unsafe_precondition!(
+            check_library_ub,
+            "IndexRange::new_unchecked requires `start <= end`",
+            (start: usize = start, end: usize = end) => start <= end,
         );
         IndexRange { start, end }
     }
 
     #[inline]
-    pub const fn zero_to(end: usize) -> Self {
+    pub(crate) const fn zero_to(end: usize) -> Self {
         IndexRange { start: 0, end }
     }
 
     #[inline]
-    pub const fn start(&self) -> usize {
+    pub(crate) const fn start(&self) -> usize {
         self.start
     }
 
     #[inline]
-    pub const fn end(&self) -> usize {
+    pub(crate) const fn end(&self) -> usize {
         self.end
     }
 
     #[inline]
-    pub const fn len(&self) -> usize {
+    pub(crate) const fn len(&self) -> usize {
         // SAFETY: By invariant, this cannot wrap
-        unsafe { unchecked_sub(self.end, self.start) }
+        // Using the intrinsic because a UB check here impedes LLVM optimization. (#131563)
+        unsafe { crate::intrinsics::unchecked_sub(self.end, self.start) }
     }
 
     /// # Safety
     /// - Can only be called when `start < end`, aka when `len > 0`.
     #[inline]
-    unsafe fn next_unchecked(&mut self) -> usize {
+    const unsafe fn next_unchecked(&mut self) -> usize {
         debug_assert!(self.start < self.end);
 
         let value = self.start;
         // SAFETY: The range isn't empty, so this cannot overflow
-        self.start = unsafe { unchecked_add(value, 1) };
+        self.start = unsafe { value.unchecked_add(1) };
         value
     }
 
     /// # Safety
     /// - Can only be called when `start < end`, aka when `len > 0`.
     #[inline]
-    unsafe fn next_back_unchecked(&mut self) -> usize {
+    const unsafe fn next_back_unchecked(&mut self) -> usize {
         debug_assert!(self.start < self.end);
 
         // SAFETY: The range isn't empty, so this cannot overflow
-        let value = unsafe { unchecked_sub(self.end, 1) };
+        let value = unsafe { self.end.unchecked_sub(1) };
         self.end = value;
         value
     }
@@ -77,11 +82,12 @@ impl IndexRange {
     ///
     /// This is designed to help implement `Iterator::advance_by`.
     #[inline]
-    pub fn take_prefix(&mut self, n: usize) -> Self {
+    pub(crate) fn take_prefix(&mut self, n: usize) -> Self {
         let mid = if n <= self.len() {
             // SAFETY: We just checked that this will be between start and end,
             // and thus the addition cannot overflow.
-            unsafe { unchecked_add(self.start, n) }
+            // Using the intrinsic avoids a superfluous UB check.
+            unsafe { crate::intrinsics::unchecked_add(self.start, n) }
         } else {
             self.end
         };
@@ -96,17 +102,24 @@ impl IndexRange {
     ///
     /// This is designed to help implement `Iterator::advance_back_by`.
     #[inline]
-    pub fn take_suffix(&mut self, n: usize) -> Self {
+    pub(crate) fn take_suffix(&mut self, n: usize) -> Self {
         let mid = if n <= self.len() {
             // SAFETY: We just checked that this will be between start and end,
-            // and thus the addition cannot overflow.
-            unsafe { unchecked_sub(self.end, n) }
+            // and thus the subtraction cannot overflow.
+            // Using the intrinsic avoids a superfluous UB check.
+            unsafe { crate::intrinsics::unchecked_sub(self.end, n) }
         } else {
             self.start
         };
         let suffix = Self { start: mid, end: self.end };
         self.end = mid;
         suffix
+    }
+
+    #[inline]
+    const fn assume_range(&self) {
+        // SAFETY: This is the type invariant
+        unsafe { crate::hint::assert_unchecked(self.start <= self.end) }
     }
 }
 
@@ -130,9 +143,33 @@ impl Iterator for IndexRange {
     }
 
     #[inline]
-    fn advance_by(&mut self, n: usize) -> Result<(), NonZeroUsize> {
+    fn advance_by(&mut self, n: usize) -> Result<(), NonZero<usize>> {
         let taken = self.take_prefix(n);
-        NonZeroUsize::new(n - taken.len()).map_or(Ok(()), Err)
+        NonZero::new(n - taken.len()).map_or(Ok(()), Err)
+    }
+
+    #[inline]
+    fn fold<B, F: FnMut(B, usize) -> B>(mut self, init: B, f: F) -> B {
+        self.try_fold(init, NeverShortCircuit::wrap_mut_2(f)).0
+    }
+
+    #[inline]
+    fn try_fold<B, F, R>(&mut self, mut accum: B, mut f: F) -> R
+    where
+        Self: Sized,
+        F: FnMut(B, Self::Item) -> R,
+        R: Try<Output = B>,
+    {
+        // `Range` needs to check `start < end`, but thanks to our type invariant
+        // we can loop on the stricter `start != end`.
+
+        self.assume_range();
+        while self.start != self.end {
+            // SAFETY: We just checked that the range is non-empty
+            let i = unsafe { self.next_unchecked() };
+            accum = f(accum, i)?;
+        }
+        try { accum }
     }
 }
 
@@ -148,9 +185,33 @@ impl DoubleEndedIterator for IndexRange {
     }
 
     #[inline]
-    fn advance_back_by(&mut self, n: usize) -> Result<(), NonZeroUsize> {
+    fn advance_back_by(&mut self, n: usize) -> Result<(), NonZero<usize>> {
         let taken = self.take_suffix(n);
-        NonZeroUsize::new(n - taken.len()).map_or(Ok(()), Err)
+        NonZero::new(n - taken.len()).map_or(Ok(()), Err)
+    }
+
+    #[inline]
+    fn rfold<B, F: FnMut(B, usize) -> B>(mut self, init: B, f: F) -> B {
+        self.try_rfold(init, NeverShortCircuit::wrap_mut_2(f)).0
+    }
+
+    #[inline]
+    fn try_rfold<B, F, R>(&mut self, mut accum: B, mut f: F) -> R
+    where
+        Self: Sized,
+        F: FnMut(B, Self::Item) -> R,
+        R: Try<Output = B>,
+    {
+        // `Range` needs to check `start < end`, but thanks to our type invariant
+        // we can loop on the stricter `start != end`.
+
+        self.assume_range();
+        while self.start != self.end {
+            // SAFETY: We just checked that the range is non-empty
+            let i = unsafe { self.next_back_unchecked() };
+            accum = f(accum, i)?;
+        }
+        try { accum }
     }
 }
 

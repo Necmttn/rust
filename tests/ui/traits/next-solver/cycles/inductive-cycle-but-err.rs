@@ -1,4 +1,4 @@
-// compile-flags: -Znext-solver
+//@ compile-flags: -Znext-solver
 #![feature(trivial_bounds, marker_trait_attr)]
 #![allow(trivial_bounds)]
 // This previously triggered a bug in the provisional cache.
@@ -34,9 +34,17 @@ where
     MultipleNested: Trait,
 {}
 
+// We ignore the trivially true global where-bounds when checking that this
+// impl is well-formed, meaning that we depend on `MultipleNested: Trait` when
+// recursively proving `MultipleCandidates: Trait`.
+//
+// These overflow errors will disappear once we treat these cycles as either
+// productive or an error.
 impl Trait for MultipleNested
+//~^ ERROR overflow evaluating the requirement `MultipleNested: Trait`
 where
     MultipleCandidates: Trait,
+    //~^ ERROR overflow evaluating the requirement `MultipleCandidates: Trait`
     DoesNotImpl: Trait,
 {}
 

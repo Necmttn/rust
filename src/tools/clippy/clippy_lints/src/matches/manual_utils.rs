@@ -1,19 +1,20 @@
 use crate::map_unit_fn::OPTION_MAP_UNIT_FN;
 use crate::matches::MATCH_AS_REF;
+use clippy_utils::res::{MaybeDef, MaybeQPath, MaybeResPath};
 use clippy_utils::source::{snippet_with_applicability, snippet_with_context};
 use clippy_utils::sugg::Sugg;
-use clippy_utils::ty::{is_copy, is_type_diagnostic_item, peel_mid_ty_refs_is_mutable, type_is_unsafe_function};
+use clippy_utils::ty::{is_copy, is_unsafe_fn, peel_and_count_ty_refs};
 use clippy_utils::{
-    can_move_expr_to_closure, is_else_clause, is_lint_allowed, is_res_lang_ctor, path_res, path_to_local_id,
-    peel_blocks, peel_hir_expr_refs, peel_hir_expr_while, CaptureKind,
+    CaptureKind, can_move_expr_to_closure, expr_requires_coercion, is_else_clause, is_lint_allowed, peel_blocks,
+    peel_hir_expr_refs, peel_hir_expr_while,
 };
-use rustc_ast::util::parser::PREC_POSTFIX;
+use rustc_ast::util::parser::ExprPrecedence;
 use rustc_errors::Applicability;
-use rustc_hir::def::Res;
 use rustc_hir::LangItem::{OptionNone, OptionSome};
-use rustc_hir::{BindingAnnotation, Expr, ExprKind, HirId, Mutability, Pat, PatKind, Path, QPath};
+use rustc_hir::def::Res;
+use rustc_hir::{BindingMode, Expr, ExprKind, HirId, Mutability, Pat, PatExpr, PatExprKind, PatKind, Path, QPath};
 use rustc_lint::LateContext;
-use rustc_span::{sym, SyntaxContext};
+use rustc_span::{SyntaxContext, sym};
 
 #[expect(clippy::too_many_arguments)]
 #[expect(clippy::too_many_lines)]
@@ -30,10 +31,10 @@ pub(super) fn check_with<'tcx, F>(
 where
     F: Fn(&LateContext<'tcx>, &'tcx Pat<'_>, &'tcx Expr<'_>, SyntaxContext) -> Option<SomeExpr<'tcx>>,
 {
-    let (scrutinee_ty, ty_ref_count, ty_mutability) =
-        peel_mid_ty_refs_is_mutable(cx.typeck_results().expr_ty(scrutinee));
-    if !(is_type_diagnostic_item(cx, scrutinee_ty, sym::Option)
-        && is_type_diagnostic_item(cx, cx.typeck_results().expr_ty(expr), sym::Option))
+    let (scrutinee_ty, ty_ref_count, ty_mutability) = peel_and_count_ty_refs(cx.typeck_results().expr_ty(scrutinee));
+    let ty_mutability = ty_mutability.unwrap_or(Mutability::Mut);
+
+    if !(scrutinee_ty.is_diag_item(cx, sym::Option) && cx.typeck_results().expr_ty(expr).is_diag_item(cx, sym::Option))
     {
         return None;
     }
@@ -73,7 +74,7 @@ where
     }
 
     // `map` won't perform any adjustments.
-    if !cx.typeck_results().expr_adjustments(some_expr.expr).is_empty() {
+    if expr_requires_coercion(cx, expr) {
         return None;
     }
 
@@ -99,7 +100,7 @@ where
                 });
                 if let ExprKind::Path(QPath::Resolved(None, Path { res: Res::Local(l), .. })) = e.kind {
                     match captures.get(l) {
-                        Some(CaptureKind::Value | CaptureKind::Ref(Mutability::Mut)) => return None,
+                        Some(CaptureKind::Value | CaptureKind::Use | CaptureKind::Ref(Mutability::Mut)) => return None,
                         Some(CaptureKind::Ref(Mutability::Not)) if binding_ref_mutability == Mutability::Mut => {
                             return None;
                         },
@@ -109,7 +110,7 @@ where
             }
         },
         None => return None,
-    };
+    }
 
     let mut app = Applicability::MachineApplicable;
 
@@ -117,13 +118,19 @@ where
     // it's being passed by value.
     let scrutinee = peel_hir_expr_refs(scrutinee).0;
     let (scrutinee_str, _) = snippet_with_context(cx, scrutinee.span, expr_ctxt, "..", &mut app);
-    let scrutinee_str = if scrutinee.span.eq_ctxt(expr.span) && scrutinee.precedence().order() < PREC_POSTFIX {
+    let scrutinee_str = if scrutinee.span.eq_ctxt(expr.span) && cx.precedence(scrutinee) < ExprPrecedence::Unambiguous {
         format!("({scrutinee_str})")
     } else {
         scrutinee_str.into()
     };
 
     let closure_expr_snip = some_expr.to_snippet_with_context(cx, expr_ctxt, &mut app);
+    let closure_body = if some_expr.needs_unsafe_block {
+        format!("unsafe {}", closure_expr_snip.blockify())
+    } else {
+        closure_expr_snip.to_string()
+    };
+
     let body_str = if let PatKind::Binding(annotation, id, some_binding, None) = some_pat.kind {
         if !some_expr.needs_unsafe_block
             && let Some(func) = can_pass_as_func(cx, id, some_expr.expr)
@@ -131,7 +138,7 @@ where
         {
             snippet_with_applicability(cx, func.span, "..", &mut app).into_owned()
         } else {
-            if path_to_local_id(some_expr.expr, id)
+            if some_expr.expr.res_local_id() == Some(id)
                 && !is_lint_allowed(cx, MATCH_AS_REF, expr.hir_id)
                 && binding_ref.is_some()
             {
@@ -139,26 +146,18 @@ where
             }
 
             // `ref` and `ref mut` annotations were handled earlier.
-            let annotation = if matches!(annotation, BindingAnnotation::MUT) {
+            let annotation = if matches!(annotation, BindingMode::MUT) {
                 "mut "
             } else {
                 ""
             };
 
-            if some_expr.needs_unsafe_block {
-                format!("|{annotation}{some_binding}| unsafe {{ {closure_expr_snip} }}")
-            } else {
-                format!("|{annotation}{some_binding}| {closure_expr_snip}")
-            }
+            format!("|{annotation}{some_binding}| {closure_body}")
         }
     } else if !is_wild_none && explicit_ref.is_none() {
         // TODO: handle explicit reference annotations.
         let pat_snip = snippet_with_context(cx, some_pat.span, expr_ctxt, "..", &mut app).0;
-        if some_expr.needs_unsafe_block {
-            format!("|{pat_snip}| unsafe {{ {closure_expr_snip} }}")
-        } else {
-            format!("|{pat_snip}| {closure_expr_snip}")
-        }
+        format!("|{pat_snip}| {closure_body}")
     } else {
         // Refutable bindings and mixed reference annotations can't be handled by `map`.
         return None;
@@ -191,9 +190,9 @@ pub struct SuggInfo<'a> {
 fn can_pass_as_func<'tcx>(cx: &LateContext<'tcx>, binding: HirId, expr: &'tcx Expr<'_>) -> Option<&'tcx Expr<'tcx>> {
     match expr.kind {
         ExprKind::Call(func, [arg])
-            if path_to_local_id(arg, binding)
+            if arg.res_local_id() == Some(binding)
                 && cx.typeck_results().expr_adjustments(arg).is_empty()
-                && !type_is_unsafe_function(cx, cx.typeck_results().expr_ty(func).peel_refs()) =>
+                && !is_unsafe_fn(cx, cx.typeck_results().expr_ty(func).peel_refs()) =>
         {
             Some(func)
         },
@@ -256,11 +255,23 @@ pub(super) fn try_parse_pattern<'tcx>(
         match pat.kind {
             PatKind::Wild => Some(OptionPat::Wild),
             PatKind::Ref(pat, _) => f(cx, pat, ref_count + 1, ctxt),
-            PatKind::Path(ref qpath) if is_res_lang_ctor(cx, cx.qpath_res(qpath, pat.hir_id), OptionNone) => {
+            PatKind::Expr(PatExpr {
+                kind: PatExprKind::Path(qpath),
+                hir_id,
+                ..
+            }) if cx
+                .qpath_res(qpath, *hir_id)
+                .ctor_parent(cx)
+                .is_lang_item(cx, OptionNone) =>
+            {
                 Some(OptionPat::None)
             },
             PatKind::TupleStruct(ref qpath, [pattern], _)
-                if is_res_lang_ctor(cx, cx.qpath_res(qpath, pat.hir_id), OptionSome) && pat.span.ctxt() == ctxt =>
+                if cx
+                    .qpath_res(qpath, pat.hir_id)
+                    .ctor_parent(cx)
+                    .is_lang_item(cx, OptionSome)
+                    && pat.span.ctxt() == ctxt =>
             {
                 Some(OptionPat::Some { pattern, ref_count })
             },
@@ -272,5 +283,5 @@ pub(super) fn try_parse_pattern<'tcx>(
 
 // Checks for the `None` value.
 fn is_none_expr(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
-    is_res_lang_ctor(cx, path_res(cx, peel_blocks(expr)), OptionNone)
+    peel_blocks(expr).res(cx).ctor_parent(cx).is_lang_item(cx, OptionNone)
 }

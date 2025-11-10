@@ -1,5 +1,5 @@
-// [full] build-pass
-// revisions: full min
+//@ [full] build-pass
+//@ revisions: full min
 #![cfg_attr(full, feature(adt_const_params))]
 #![cfg_attr(full, allow(incomplete_features))]
 
@@ -15,13 +15,11 @@ struct Inner;
 // - impl PartialEq
 // - impl Eq
 // - impl StructuralPartialEq
-// - impl StructuralEq
 #[derive(PartialEq, Eq)]
 struct Outer<const I: Inner>;
-//[min]~^ `Inner` is forbidden
-//[min]~| `Inner` is forbidden
-//[min]~| `Inner` is forbidden
-//[min]~| `Inner` is forbidden
-//[min]~| `Inner` is forbidden
+//[min]~^ ERROR `Inner` is forbidden
+//[min]~| ERROR `Inner` is forbidden
+//[min]~| ERROR `Inner` is forbidden
+//[min]~| ERROR `Inner` is forbidden
 
 fn main() {}

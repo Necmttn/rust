@@ -1,5 +1,6 @@
 #![allow(unused_assignments)]
-// failure-status: 1
+#![cfg_attr(rustfmt, rustfmt::skip)]
+//@ failure-status: 1
 
 fn call(return_error: bool) -> Result<(), ()> {
     if return_error {
@@ -9,7 +10,6 @@ fn call(return_error: bool) -> Result<(), ()> {
     }
 }
 
-#[rustfmt::skip]
 fn test1() -> Result<(), ()> {
     let mut
         countdown = 10
@@ -58,7 +58,6 @@ impl Thing2 {
     }
 }
 
-#[rustfmt::skip]
 fn test2() -> Result<(), ()> {
     let thing1 = Thing1{};
     let mut
@@ -111,7 +110,6 @@ fn test2() -> Result<(), ()> {
     Ok(())
 }
 
-#[rustfmt::skip]
 fn main() -> Result<(), ()> {
     test1().expect_err("test1 should fail");
     test2()

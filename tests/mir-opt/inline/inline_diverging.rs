@@ -1,7 +1,7 @@
 // Tests inlining of diverging calls.
 //
 // EMIT_MIR_FOR_EACH_PANIC_STRATEGY
-// compile-flags: -Zinline-mir-hint-threshold=1000
+//@ compile-flags: -Zinline-mir-hint-threshold=1000 -C debuginfo=full
 #![crate_type = "lib"]
 
 // EMIT_MIR inline_diverging.f.Inline.diff
@@ -26,7 +26,8 @@ pub fn g(i: i32) -> u32 {
 pub fn h() {
     // CHECK-LABEL: fn h(
     // CHECK: (inlined call_twice::<!, fn() -> ! {sleep}>)
-    // CHECK-NOT: inlined
+    // CHECK: (inlined <fn() -> ! {sleep} as Fn<()>>::call - shim(fn() -> ! {sleep}))
+    // CHECK: (inlined sleep)
     call_twice(sleep);
 }
 

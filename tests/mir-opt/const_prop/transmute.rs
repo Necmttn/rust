@@ -1,6 +1,6 @@
-// unit-test: GVN
-// compile-flags: -O --crate-type=lib
-// ignore-endian-big
+//@ test-mir-pass: GVN
+//@ compile-flags: -O --crate-type=lib
+//@ ignore-endian-big
 // EMIT_MIR_FOR_EACH_BIT_WIDTH
 
 use std::mem::transmute;
@@ -43,9 +43,12 @@ pub unsafe fn invalid_bool() -> bool {
 // EMIT_MIR transmute.undef_union_as_integer.GVN.diff
 pub unsafe fn undef_union_as_integer() -> u32 {
     // CHECK-LABEL: fn undef_union_as_integer(
-    // CHECK: _1 = Union32 {
-    // CHECK: _0 = move _1 as u32 (Transmute);
-    union Union32 { value: u32, unit: () }
+    // CHECK: _1 = const Union32
+    // CHECK: _0 = const {{.*}}: u32;
+    union Union32 {
+        value: u32,
+        unit: (),
+    }
     unsafe { transmute(Union32 { unit: () }) }
 }
 
@@ -53,7 +56,7 @@ pub unsafe fn undef_union_as_integer() -> u32 {
 pub unsafe fn unreachable_direct() -> ! {
     // CHECK-LABEL: fn unreachable_direct(
     // CHECK: = const ();
-    // CHECK: = const () as Never (Transmute);
+    // CHECK: = const ZeroSized: Never;
     let x: Never = unsafe { transmute(()) };
     match x {}
 }

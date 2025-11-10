@@ -1,15 +1,22 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
-#[cfg(all(test, not(any(target_os = "emscripten", target_os = "xous"))))]
+#[cfg(all(
+    test,
+    not(any(
+        target_os = "emscripten",
+        all(target_os = "wasi", target_env = "p1"),
+        target_os = "xous",
+        target_os = "trusty",
+    ))
+))]
 mod tests;
 
-use crate::io::prelude::*;
-
 use crate::fmt;
+use crate::io::prelude::*;
 use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut};
 use crate::iter::FusedIterator;
 use crate::net::{Shutdown, SocketAddr, ToSocketAddrs};
-use crate::sys_common::net as net_imp;
+use crate::sys::net as net_imp;
 use crate::sys_common::{AsInner, FromInner, IntoInner};
 use crate::time::Duration;
 
@@ -46,6 +53,12 @@ use crate::time::Duration;
 ///     Ok(())
 /// } // the stream is closed here
 /// ```
+///
+/// # Platform-specific Behavior
+///
+/// On Unix, writes to the underlying socket in `SOCK_STREAM` mode are made with
+/// `MSG_NOSIGNAL` flag. This suppresses the emission of the  `SIGPIPE` signal when writing
+/// to disconnected socket. In some cases, getting a `SIGPIPE` would trigger process termination.
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct TcpStream(net_imp::TcpStream);
 
@@ -105,7 +118,7 @@ pub struct Incoming<'a> {
 ///
 /// [`accept`]: TcpListener::accept
 #[derive(Debug)]
-#[unstable(feature = "tcplistener_into_incoming", issue = "88339")]
+#[unstable(feature = "tcplistener_into_incoming", issue = "88373")]
 pub struct IntoIncoming {
     listener: TcpListener,
 }
@@ -154,7 +167,7 @@ impl TcpStream {
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn connect<A: ToSocketAddrs>(addr: A) -> io::Result<TcpStream> {
-        super::each_addr(addr, net_imp::TcpStream::connect).map(TcpStream)
+        net_imp::TcpStream::connect(addr).map(TcpStream)
     }
 
     /// Opens a TCP connection to a remote host with a timeout.
@@ -563,7 +576,7 @@ impl TcpStream {
 
     /// Moves this TCP stream into or out of nonblocking mode.
     ///
-    /// This will result in `read`, `write`, `recv` and `send` operations
+    /// This will result in `read`, `write`, `recv` and `send` system operations
     /// becoming nonblocking, i.e., immediately returning from their calls.
     /// If the IO operation is successful, `Ok` is returned and no further
     /// action is required. If the IO operation could not be completed and needs
@@ -769,7 +782,7 @@ impl TcpListener {
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<TcpListener> {
-        super::each_addr(addr, net_imp::TcpListener::bind).map(TcpListener)
+        net_imp::TcpListener::bind(addr).map(TcpListener)
     }
 
     /// Returns the local socket address of this listener.
@@ -894,7 +907,7 @@ impl TcpListener {
     /// }
     /// ```
     #[must_use = "`self` will be dropped if the result is not used"]
-    #[unstable(feature = "tcplistener_into_incoming", issue = "88339")]
+    #[unstable(feature = "tcplistener_into_incoming", issue = "88373")]
     pub fn into_incoming(self) -> IntoIncoming {
         IntoIncoming { listener: self }
     }
@@ -1033,7 +1046,7 @@ impl<'a> Iterator for Incoming<'a> {
 #[stable(feature = "tcp_listener_incoming_fused_iterator", since = "1.64.0")]
 impl FusedIterator for Incoming<'_> {}
 
-#[unstable(feature = "tcplistener_into_incoming", issue = "88339")]
+#[unstable(feature = "tcplistener_into_incoming", issue = "88373")]
 impl Iterator for IntoIncoming {
     type Item = io::Result<TcpStream>;
     fn next(&mut self) -> Option<io::Result<TcpStream>> {
@@ -1041,7 +1054,7 @@ impl Iterator for IntoIncoming {
     }
 }
 
-#[unstable(feature = "tcplistener_into_incoming", issue = "88339")]
+#[unstable(feature = "tcplistener_into_incoming", issue = "88373")]
 impl FusedIterator for IntoIncoming {}
 
 impl AsInner<net_imp::TcpListener> for TcpListener {

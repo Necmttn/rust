@@ -1,10 +1,10 @@
 // All constant items (associated or otherwise) may syntactically use `_` as a name.
 
-// check-pass
+//@ check-pass
 
 fn main() {}
 
-#[cfg(FALSE)]
+#[cfg(false)]
 const _: () = {
     pub trait A {
         const _: () = ();

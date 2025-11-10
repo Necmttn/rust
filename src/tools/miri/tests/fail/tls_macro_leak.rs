@@ -1,16 +1,15 @@
-//@error-in-other-file: memory leaked
 //@normalize-stderr-test: ".*│.*" -> "$$stripped$$"
 
 use std::cell::Cell;
 
-pub fn main() {
+fn main() {
     thread_local! {
         static TLS: Cell<Option<&'static i32>> = Cell::new(None);
     }
 
     std::thread::spawn(|| {
         TLS.with(|cell| {
-            cell.set(Some(Box::leak(Box::new(123))));
+            cell.set(Some(Box::leak(Box::new(123)))); //~ERROR: memory leaked
         });
     })
     .join()

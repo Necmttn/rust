@@ -1,5 +1,8 @@
-// edition: 2021
-// known-bug: #110963
+//@ edition: 2021
+//@ revisions: assumptions no_assumptions
+//@[assumptions] compile-flags: -Zhigher-ranked-assumptions
+//@[assumptions] check-pass
+//@[no_assumptions] known-bug: #110338
 
 #![feature(return_type_notation)]
 
@@ -9,7 +12,7 @@ trait HealthCheck {
 
 async fn do_health_check_par<HC>(hc: HC)
 where
-    HC: HealthCheck<check(): Send> + Send + 'static,
+    HC: HealthCheck<check(..): Send> + Send + 'static,
 {
     spawn(async move {
         let mut hc = hc;

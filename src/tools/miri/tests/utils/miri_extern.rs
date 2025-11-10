@@ -56,7 +56,7 @@ extern "Rust" {
     ///
     /// This is internal and unstable and should not be used; we give it here
     /// just to be complete.
-    pub fn miri_start_panic(payload: *mut u8) -> !;
+    pub fn miri_start_unwind(payload: *mut u8) -> !;
 
     /// Miri-provided extern function to get the internal unique identifier for the allocation that a pointer
     /// points to. If this pointer is invalid (not pointing to an allocation), interpretation will abort.
@@ -119,6 +119,11 @@ extern "Rust" {
     /// Miri-provided extern function to deallocate memory.
     pub fn miri_dealloc(ptr: *mut u8, size: usize, align: usize);
 
+    /// Add the allocation that this pointer points to to the "tracked" allocations.
+    /// This is equivalent to `-Zmiri-track-allic-id=<id>`, but also works if the ID is
+    /// only known at runtime.
+    pub fn miri_track_alloc(ptr: *const u8);
+
     /// Convert a path from the host Miri runs on to the target Miri interprets.
     /// Performs conversion of path separators as needed.
     ///
@@ -133,8 +138,8 @@ extern "Rust" {
     /// with a null terminator.
     /// Returns 0 if the `out` buffer was large enough, and the required size otherwise.
     pub fn miri_host_to_target_path(
-        path: *const std::ffi::c_char,
-        out: *mut std::ffi::c_char,
+        path: *const core::ffi::c_char,
+        out: *mut core::ffi::c_char,
         out_size: usize,
     ) -> usize;
 
@@ -147,4 +152,7 @@ extern "Rust" {
     /// "symbolic" alignment checks. Will fail if the pointer is not actually aligned or `align` is
     /// not a power of two. Has no effect when alignment checks are concrete (which is the default).
     pub fn miri_promise_symbolic_alignment(ptr: *const (), align: usize);
+
+    /// Blocks the current execution if the argument is false
+    pub fn miri_genmc_assume(condition: bool);
 }

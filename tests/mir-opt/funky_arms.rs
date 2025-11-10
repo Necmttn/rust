@@ -1,6 +1,6 @@
 // skip-filecheck
 // EMIT_MIR_FOR_EACH_PANIC_STRATEGY
-// compile-flags: --crate-type lib -Cdebug-assertions=no
+// EMIT_MIR_FOR_EACH_BIT_WIDTH
 
 #![feature(flt2dec)]
 

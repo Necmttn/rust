@@ -2,6 +2,7 @@
 
 pub type Successors<'a> = impl Iterator<Item = &'a ()>;
 
+#[define_opaque(Successors)]
 pub fn f<'a>() -> Successors<'a> {
     None.into_iter()
 }
@@ -15,8 +16,8 @@ impl<'a> Tr for &'a () {
 }
 
 pub fn kazusa<'a>() -> <&'a () as Tr>::Item {
-    //~^ ERROR item constrains opaque type that is not in its signature
     None.into_iter()
+    //~^ ERROR mismatched types
 }
 
 fn main() {}

@@ -1,10 +1,19 @@
-use crate::spec::{LinkerFlavor, MergeFunctions, PanicStrategy, Target, TargetOptions};
+use crate::spec::{
+    Arch, LinkSelfContainedDefault, LinkerFlavor, MergeFunctions, PanicStrategy, Target,
+    TargetMetadata, TargetOptions,
+};
 
-pub fn target() -> Target {
+pub(crate) fn target() -> Target {
     Target {
-        arch: "nvptx64".into(),
-        data_layout: "e-i64:64-i128:128-v16:16-v32:32-n16:32:64".into(),
+        arch: Arch::Nvptx64,
+        data_layout: "e-p6:32:32-i64:64-i128:128-i256:256-v16:16-v32:32-n16:32:64".into(),
         llvm_target: "nvptx64-nvidia-cuda".into(),
+        metadata: TargetMetadata {
+            description: Some("--emit=asm generates PTX code that runs on NVIDIA GPUs".into()),
+            tier: Some(2),
+            host_tools: Some(false),
+            std: Some(false),
+        },
         pointer_width: 64,
 
         options: TargetOptions {
@@ -33,6 +42,9 @@ pub fn target() -> Target {
             // Let the `ptx-linker` to handle LLVM lowering into MC / assembly.
             obj_is_bitcode: true,
 
+            // Clearly a GPU
+            is_like_gpu: true,
+
             // Convenient and predicable naming scheme.
             dll_prefix: "".into(),
             dll_suffix: ".ptx".into(),
@@ -45,6 +57,9 @@ pub fn target() -> Target {
 
             // The LLVM backend does not support stack canaries for this target
             supports_stack_protector: false,
+
+            // Support using `self-contained` linkers like the llvm-bitcode-linker
+            link_self_contained: LinkSelfContainedDefault::True,
 
             ..Default::default()
         },

@@ -1,8 +1,6 @@
-// only-aarch64
-// run-pass
-// needs-asm-support
-
-#![feature(asm_const)]
+//@ only-aarch64
+//@ run-pass
+//@ needs-asm-support
 
 use std::arch::{asm, global_asm};
 

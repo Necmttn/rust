@@ -1,25 +1,36 @@
+//@ compile-flags: -Zmir-opt-level=0
 // skip-filecheck
 // EMIT_MIR enum_cast.foo.built.after.mir
 // EMIT_MIR enum_cast.bar.built.after.mir
 // EMIT_MIR enum_cast.boo.built.after.mir
 // EMIT_MIR enum_cast.far.built.after.mir
 
+// Previously MIR building included range `Assume`s in the MIR statements,
+// which these tests demonstrated, but now that we have range metadata on
+// parameters in LLVM (in addition to !range metadata on loads) the impact
+// of the extra volume of MIR is worse than its value.
+// Thus these are now about the discriminant type and the cast type,
+// both of which might be different from the backend type of the tag.
+
 enum Foo {
-    A
+    A,
 }
 
 enum Bar {
-    A, B
+    A,
+    B,
 }
 
 #[repr(u8)]
 enum Boo {
-    A, B
+    A,
+    B,
 }
 
 #[repr(i16)]
 enum Far {
-    A, B
+    A,
+    B,
 }
 
 fn foo(foo: Foo) -> usize {
@@ -36,25 +47,6 @@ fn boo(boo: Boo) -> usize {
 
 fn far(far: Far) -> isize {
     far as isize
-}
-
-// EMIT_MIR enum_cast.droppy.built.after.mir
-enum Droppy {
-    A, B, C
-}
-
-impl Drop for Droppy {
-    fn drop(&mut self) {}
-}
-
-fn droppy() {
-    {
-        let x = Droppy::C;
-        // remove this entire test once `cenum_impl_drop_cast` becomes a hard error
-        #[allow(cenum_impl_drop_cast)]
-        let y = x as usize;
-    }
-    let z = Droppy::B;
 }
 
 #[repr(i16)]
@@ -82,12 +74,15 @@ fn unsigny(x: UnsignedAroundZero) -> u16 {
     x as u16
 }
 
-enum NotStartingAtZero { A = 4, B = 6, C = 8 }
+enum NotStartingAtZero {
+    A = 4,
+    B = 6,
+    C = 8,
+}
 
 // EMIT_MIR enum_cast.offsetty.built.after.mir
 fn offsetty(x: NotStartingAtZero) -> u32 {
     x as u32
 }
 
-fn main() {
-}
+fn main() {}

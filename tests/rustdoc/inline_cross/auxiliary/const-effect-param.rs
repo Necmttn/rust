@@ -1,9 +1,9 @@
-#![feature(effects, const_trait_impl)]
+//@ compile-flags: -Znext-solver
+#![feature(const_trait_impl)]
 
-#[const_trait]
-pub trait Resource {}
+pub const trait Resource {}
 
-pub const fn load<R: ~const Resource>() -> i32 {
+pub const fn load<R: [const] Resource>() -> i32 {
     0
 }
 

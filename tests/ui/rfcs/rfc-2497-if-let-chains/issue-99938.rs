@@ -1,6 +1,7 @@
-// compile-flags: -Zvalidate-mir -C opt-level=3
-// build-pass
-#![feature(let_chains)]
+//@ compile-flags: -Zvalidate-mir -C opt-level=3
+//@ build-pass
+//@ edition: 2024
+
 struct TupleIter<T, I: Iterator<Item = T>> {
     inner: I,
 }

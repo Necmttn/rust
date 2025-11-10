@@ -18,16 +18,12 @@ error[E0277]: the trait bound `&dyn MyTrait: MyTrait` is not satisfied
 LL |         MyTrait::foo(&self)
    |         ^^^^^^^^^^^^^^^^^^^ the trait `MyTrait` is not implemented for `&dyn MyTrait`
    |
-   = help: the trait `MyTrait` is implemented for `Outer`
-
-error[E0277]: the trait bound `&dyn MyTrait: MyTrait` is not satisfied
-  --> $DIR/issue-102140.rs:20:9
+help: the trait `MyTrait` is implemented for `Outer`
+  --> $DIR/issue-102140.rs:12:1
    |
-LL |         MyTrait::foo(&self)
-   |         ^^^^^^^^^^^^ the trait `MyTrait` is not implemented for `&dyn MyTrait`
-   |
-   = help: the trait `MyTrait` is implemented for `Outer`
+LL | impl MyTrait for Outer {
+   | ^^^^^^^^^^^^^^^^^^^^^^
 
-error: aborting due to 3 previous errors
+error: aborting due to 2 previous errors
 
 For more information about this error, try `rustc --explain E0277`.

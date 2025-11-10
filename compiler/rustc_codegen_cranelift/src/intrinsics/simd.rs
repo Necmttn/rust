@@ -1,7 +1,8 @@
-//! Codegen `extern "platform-intrinsic"` intrinsics.
+//! Codegen SIMD intrinsics.
 
 use cranelift_codegen::ir::immediates::Offset32;
-use rustc_target::abi::Endian;
+use rustc_abi::Endian;
+use rustc_middle::ty::SimdAlign;
 
 use super::*;
 use crate::prelude::*;
@@ -14,7 +15,7 @@ fn report_simd_type_validation_error(
 ) {
     fx.tcx.dcx().span_err(span, format!("invalid monomorphization of `{}` intrinsic: expected SIMD input type, found non-SIMD `{}`", intrinsic, ty));
     // Prevent verifier error
-    fx.bcx.ins().trap(TrapCode::UnreachableCodeReached);
+    fx.bcx.ins().trap(TrapCode::user(1 /* unreachable */).unwrap());
 }
 
 pub(super) fn codegen_simd_intrinsic_call<'tcx>(
@@ -116,8 +117,8 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
             });
         }
 
-        // simd_shuffle_generic<T, U, const I: &[u32]>(x: T, y: T) -> U
-        sym::simd_shuffle_generic => {
+        // simd_shuffle_const_generic<T, U, const I: &[u32]>(x: T, y: T) -> U
+        sym::simd_shuffle_const_generic => {
             let [x, y] = args else {
                 bug!("wrong number of args for intrinsic {intrinsic}");
             };
@@ -129,11 +130,7 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
                 return;
             }
 
-            let idx = generic_args[2]
-                .expect_const()
-                .eval(fx.tcx, ty::ParamEnv::reveal_all(), Some(span))
-                .unwrap()
-                .unwrap_branch();
+            let idx = generic_args[2].expect_const().to_value().valtree.unwrap_branch();
 
             assert_eq!(x.layout(), y.layout());
             let layout = x.layout();
@@ -146,8 +143,7 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
 
             let total_len = lane_count * 2;
 
-            let indexes =
-                idx.iter().map(|idx| idx.unwrap_leaf().try_to_u32().unwrap()).collect::<Vec<u32>>();
+            let indexes = idx.iter().map(|idx| idx.unwrap_leaf().to_u32()).collect::<Vec<u32>>();
 
             for &idx in &indexes {
                 assert!(u64::from(idx) < total_len, "idx {} out of range 0..{}", idx, total_len);
@@ -180,27 +176,20 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
                 return;
             }
 
-            // Make sure this is actually an array, since typeck only checks the length-suffixed
-            // version of this intrinsic.
+            // Make sure this is actually a SIMD vector.
             let idx_ty = fx.monomorphize(idx.node.ty(fx.mir, fx.tcx));
-            let n: u16 = match idx_ty.kind() {
-                ty::Array(ty, len) if matches!(ty.kind(), ty::Uint(ty::UintTy::U32)) => len
-                    .try_eval_target_usize(fx.tcx, ty::ParamEnv::reveal_all())
-                    .unwrap_or_else(|| {
-                        span_bug!(span, "could not evaluate shuffle index array length")
-                    })
-                    .try_into()
-                    .unwrap(),
-                _ => {
-                    fx.tcx.dcx().span_err(
-                        span,
-                        format!("simd_shuffle index must be an array of `u32`, got `{}`", idx_ty),
-                    );
-                    // Prevent verifier error
-                    fx.bcx.ins().trap(TrapCode::UnreachableCodeReached);
-                    return;
-                }
+            if !idx_ty.is_simd()
+                || !matches!(idx_ty.simd_size_and_type(fx.tcx).1.kind(), ty::Uint(ty::UintTy::U32))
+            {
+                fx.tcx.dcx().span_err(
+                    span,
+                    format!("simd_shuffle index must be a SIMD vector of `u32`, got `{}`", idx_ty),
+                );
+                // Prevent verifier error
+                fx.bcx.ins().trap(TrapCode::user(1 /* unreachable */).unwrap());
+                return;
             };
+            let n: u16 = idx_ty.simd_size_and_type(fx.tcx).0.try_into().unwrap();
 
             assert_eq!(x.layout(), y.layout());
             let layout = x.layout();
@@ -213,11 +202,14 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
 
             let total_len = lane_count * 2;
 
+            // FIXME: this is a terrible abstraction-breaking hack.
+            // Find a way to reuse `immediate_const_vector` from `codegen_ssa` instead.
             let indexes = {
                 use rustc_middle::mir::interpret::*;
-                let idx_const = match &idx.node {
-                    Operand::Constant(const_) => crate::constant::eval_mir_constant(fx, const_).0,
-                    Operand::Copy(_) | Operand::Move(_) => unreachable!("{idx:?}"),
+                let idx_const = if let Some(const_) = idx.node.constant() {
+                    crate::constant::eval_mir_constant(fx, const_).0
+                } else {
+                    unreachable!("{idx:?}")
                 };
 
                 let idx_bytes = match idx_const {
@@ -273,17 +265,13 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
             let val = codegen_operand(fx, &val.node);
 
             // FIXME validate
-            let idx_const = if let Some(idx_const) =
-                crate::constant::mir_operand_get_const_val(fx, &idx.node)
-            {
-                idx_const
+            let idx_const = if let Some(idx_const) = idx.node.constant() {
+                crate::constant::eval_mir_constant(fx, idx_const).0.try_to_scalar_int().unwrap()
             } else {
                 fx.tcx.dcx().span_fatal(span, "Index argument for `simd_insert` is not a constant");
             };
 
-            let idx: u32 = idx_const
-                .try_to_u32()
-                .unwrap_or_else(|_| panic!("kind not scalar: {:?}", idx_const));
+            let idx: u32 = idx_const.to_u32();
             let (lane_count, _lane_ty) = base.layout().ty.simd_size_and_type(fx.tcx);
             if u64::from(idx) >= lane_count {
                 fx.tcx.dcx().span_fatal(
@@ -293,8 +281,22 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
             }
 
             ret.write_cvalue(fx, base);
-            let ret_lane = ret.place_lane(fx, idx.try_into().unwrap());
+            let ret_lane = ret.place_lane(fx, idx.into());
             ret_lane.write_cvalue(fx, val);
+        }
+
+        sym::simd_insert_dyn => {
+            intrinsic_args!(fx, args => (base, idx, val); intrinsic);
+
+            if !base.layout().ty.is_simd() {
+                report_simd_type_validation_error(fx, intrinsic, span, base.layout().ty);
+                return;
+            }
+
+            let idx = idx.load_scalar(fx);
+
+            ret.write_cvalue(fx, base);
+            ret.write_lane_dyn(fx, idx, val);
         }
 
         sym::simd_extract => {
@@ -311,27 +313,15 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
                 return;
             }
 
-            let idx_const = if let Some(idx_const) =
-                crate::constant::mir_operand_get_const_val(fx, &idx.node)
-            {
-                idx_const
+            let idx_const = if let Some(idx_const) = idx.node.constant() {
+                crate::constant::eval_mir_constant(fx, idx_const).0.try_to_scalar_int().unwrap()
             } else {
-                fx.tcx.dcx().span_warn(span, "Index argument for `simd_extract` is not a constant");
-                let trap_block = fx.bcx.create_block();
-                let true_ = fx.bcx.ins().iconst(types::I8, 1);
-                let ret_block = fx.get_block(target);
-                fx.bcx.ins().brif(true_, trap_block, &[], ret_block, &[]);
-                fx.bcx.switch_to_block(trap_block);
-                crate::trap::trap_unimplemented(
-                    fx,
-                    "Index argument for `simd_extract` is not a constant",
-                );
-                return;
+                fx.tcx
+                    .dcx()
+                    .span_fatal(span, "Index argument for `simd_extract` is not a constant");
             };
 
-            let idx = idx_const
-                .try_to_u32()
-                .unwrap_or_else(|_| panic!("kind not scalar: {:?}", idx_const));
+            let idx = idx_const.to_u32();
             let (lane_count, _lane_ty) = v.layout().ty.simd_size_and_type(fx.tcx);
             if u64::from(idx) >= lane_count {
                 fx.tcx.dcx().span_fatal(
@@ -340,7 +330,21 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
                 );
             }
 
-            let ret_lane = v.value_lane(fx, idx.try_into().unwrap());
+            let ret_lane = v.value_lane(fx, idx.into());
+            ret.write_cvalue(fx, ret_lane);
+        }
+
+        sym::simd_extract_dyn => {
+            intrinsic_args!(fx, args => (v, idx); intrinsic);
+
+            if !v.layout().ty.is_simd() {
+                report_simd_type_validation_error(fx, intrinsic, span, v.layout().ty);
+                return;
+            }
+
+            let idx = idx.load_scalar(fx);
+
+            let ret_lane = v.value_lane_dyn(fx, idx);
             ret.write_cvalue(fx, ret_lane);
         }
 
@@ -348,6 +352,7 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
         | sym::simd_bswap
         | sym::simd_bitreverse
         | sym::simd_ctlz
+        | sym::simd_ctpop
         | sym::simd_cttz => {
             intrinsic_args!(fx, args => (a); intrinsic);
 
@@ -367,6 +372,7 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
                 (ty::Uint(_) | ty::Int(_), sym::simd_bswap) => fx.bcx.ins().bswap(lane),
                 (ty::Uint(_) | ty::Int(_), sym::simd_bitreverse) => fx.bcx.ins().bitrev(lane),
                 (ty::Uint(_) | ty::Int(_), sym::simd_ctlz) => fx.bcx.ins().clz(lane),
+                (ty::Uint(_) | ty::Int(_), sym::simd_ctpop) => fx.bcx.ins().popcnt(lane),
                 (ty::Uint(_) | ty::Int(_), sym::simd_cttz) => fx.bcx.ins().ctz(lane),
 
                 _ => unreachable!(),
@@ -434,7 +440,8 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
             });
         }
 
-        sym::simd_fma => {
+        // FIXME: simd_relaxed_fma doesn't relax to non-fused multiply-add
+        sym::simd_fma | sym::simd_relaxed_fma => {
             intrinsic_args!(fx, args => (a, b, c); intrinsic);
 
             if !a.layout().ty.is_simd() {
@@ -483,64 +490,6 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
             });
         }
 
-        sym::simd_fpow => {
-            intrinsic_args!(fx, args => (a, b); intrinsic);
-
-            if !a.layout().ty.is_simd() {
-                report_simd_type_validation_error(fx, intrinsic, span, a.layout().ty);
-                return;
-            }
-
-            simd_pair_for_each_lane(fx, a, b, ret, &|fx, lane_ty, _ret_lane_ty, a_lane, b_lane| {
-                match lane_ty.kind() {
-                    ty::Float(FloatTy::F32) => fx.lib_call(
-                        "powf",
-                        vec![AbiParam::new(types::F32), AbiParam::new(types::F32)],
-                        vec![AbiParam::new(types::F32)],
-                        &[a_lane, b_lane],
-                    )[0],
-                    ty::Float(FloatTy::F64) => fx.lib_call(
-                        "pow",
-                        vec![AbiParam::new(types::F64), AbiParam::new(types::F64)],
-                        vec![AbiParam::new(types::F64)],
-                        &[a_lane, b_lane],
-                    )[0],
-                    _ => unreachable!("{:?}", lane_ty),
-                }
-            });
-        }
-
-        sym::simd_fpowi => {
-            intrinsic_args!(fx, args => (a, exp); intrinsic);
-            let exp = exp.load_scalar(fx);
-
-            if !a.layout().ty.is_simd() {
-                report_simd_type_validation_error(fx, intrinsic, span, a.layout().ty);
-                return;
-            }
-
-            simd_for_each_lane(
-                fx,
-                a,
-                ret,
-                &|fx, lane_ty, _ret_lane_ty, lane| match lane_ty.kind() {
-                    ty::Float(FloatTy::F32) => fx.lib_call(
-                        "__powisf2", // compiler-builtins
-                        vec![AbiParam::new(types::F32), AbiParam::new(types::I32)],
-                        vec![AbiParam::new(types::F32)],
-                        &[lane, exp],
-                    )[0],
-                    ty::Float(FloatTy::F64) => fx.lib_call(
-                        "__powidf2", // compiler-builtins
-                        vec![AbiParam::new(types::F64), AbiParam::new(types::I32)],
-                        vec![AbiParam::new(types::F64)],
-                        &[lane, exp],
-                    )[0],
-                    _ => unreachable!("{:?}", lane_ty),
-                },
-            );
-        }
-
         sym::simd_fsin
         | sym::simd_fcos
         | sym::simd_fexp
@@ -548,7 +497,8 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
         | sym::simd_flog
         | sym::simd_flog10
         | sym::simd_flog2
-        | sym::simd_round => {
+        | sym::simd_round
+        | sym::simd_round_ties_even => {
             intrinsic_args!(fx, args => (a); intrinsic);
 
             if !a.layout().ty.is_simd() {
@@ -579,6 +529,8 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
                     (sym::simd_flog2, types::F64) => "log2",
                     (sym::simd_round, types::F32) => "roundf",
                     (sym::simd_round, types::F64) => "round",
+                    (sym::simd_round_ties_even, types::F32) => "rintf",
+                    (sym::simd_round_ties_even, types::F64) => "rint",
                     _ => unreachable!("{:?}", intrinsic),
                 };
                 fx.lib_call(
@@ -743,7 +695,7 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
             simd_reduce(fx, v, None, ret, &|fx, _ty, a, b| fx.bcx.ins().bxor(a, b));
         }
 
-        sym::simd_reduce_min | sym::simd_reduce_min_nanless => {
+        sym::simd_reduce_min => {
             intrinsic_args!(fx, args => (v); intrinsic);
 
             if !v.layout().ty.is_simd() {
@@ -762,7 +714,7 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
             });
         }
 
-        sym::simd_reduce_max | sym::simd_reduce_max_nanless => {
+        sym::simd_reduce_max => {
             intrinsic_args!(fx, args => (v); intrinsic);
 
             if !v.layout().ty.is_simd() {
@@ -822,10 +774,46 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
             let (lane_count, lane_ty) = a.layout().ty.simd_size_and_type(fx.tcx);
             let lane_layout = fx.layout_of(lane_ty);
 
-            let m = m.load_scalar(fx);
+            let expected_int_bits = lane_count.max(8);
+            let expected_bytes = expected_int_bits / 8 + ((expected_int_bits % 8 > 0) as u64);
+
+            let m = match m.layout().ty.kind() {
+                ty::Uint(i) if i.bit_width() == Some(expected_int_bits) => m.load_scalar(fx),
+                ty::Array(elem, len)
+                    if matches!(elem.kind(), ty::Uint(ty::UintTy::U8))
+                        && len
+                            .try_to_target_usize(fx.tcx)
+                            .expect("expected monomorphic const in codegen")
+                            == expected_bytes =>
+                {
+                    m.force_stack(fx).0.load(
+                        fx,
+                        Type::int(expected_int_bits as u16).unwrap(),
+                        MemFlags::trusted(),
+                    )
+                }
+                _ => {
+                    fx.tcx.dcx().span_fatal(
+                        span,
+                        format!(
+                            "invalid monomorphization of `simd_select_bitmask` intrinsic: \
+                            cannot accept `{}` as mask, expected `u{}` or `[u8; {}]`",
+                            ret.layout().ty,
+                            expected_int_bits,
+                            expected_bytes
+                        ),
+                    );
+                }
+            };
 
             for lane in 0..lane_count {
-                let m_lane = fx.bcx.ins().ushr_imm(m, u64::from(lane) as i64);
+                // The bit order of the mask depends on the byte endianness, LSB-first for
+                // little endian and MSB-first for big endian.
+                let mask_lane = match fx.tcx.sess.target.endian {
+                    Endian::Big => lane_count - 1 - lane,
+                    Endian::Little => lane,
+                };
+                let m_lane = fx.bcx.ins().ushr_imm(m, mask_lane.cast_signed());
                 let m_lane = fx.bcx.ins().band_imm(m_lane, 1);
                 let a_lane = a.value_lane(fx, lane).load_scalar(fx);
                 let b_lane = b.value_lane(fx, lane).load_scalar(fx);
@@ -896,8 +884,10 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
                 ty::Uint(i) if i.bit_width() == Some(expected_int_bits) => {}
                 ty::Array(elem, len)
                     if matches!(elem.kind(), ty::Uint(ty::UintTy::U8))
-                        && len.try_eval_target_usize(fx.tcx, ty::ParamEnv::reveal_all())
-                            == Some(expected_bytes) => {}
+                        && len
+                            .try_to_target_usize(fx.tcx)
+                            .expect("expected monomorphic const in codegen")
+                            == expected_bytes => {}
                 _ => {
                     fx.tcx.dcx().span_fatal(
                         span,
@@ -931,7 +921,7 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
             });
         }
 
-        sym::simd_expose_addr | sym::simd_from_exposed_addr | sym::simd_cast_ptr => {
+        sym::simd_expose_provenance | sym::simd_with_exposed_provenance | sym::simd_cast_ptr => {
             intrinsic_args!(fx, args => (arg); intrinsic);
             ret.write_cvalue_transmute(fx, arg);
         }
@@ -940,7 +930,7 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
             intrinsic_args!(fx, args => (ptr, offset); intrinsic);
 
             let (lane_count, ptr_lane_ty) = ptr.layout().ty.simd_size_and_type(fx.tcx);
-            let pointee_ty = ptr_lane_ty.builtin_deref(true).unwrap().ty;
+            let pointee_ty = ptr_lane_ty.builtin_deref(true).unwrap();
             let pointee_size = fx.layout_of(pointee_ty).size.bytes();
             let (ret_lane_count, ret_lane_ty) = ret.layout().ty.simd_size_and_type(fx.tcx);
             let ret_lane_layout = fx.layout_of(ret_lane_ty);
@@ -971,6 +961,15 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
             let lane_clif_ty = fx.clif_type(val_lane_ty).unwrap();
             let ptr_val = ptr.load_scalar(fx);
 
+            let alignment = generic_args[3].expect_const().to_value().valtree.unwrap_branch()[0]
+                .unwrap_leaf()
+                .to_simd_alignment();
+
+            let memflags = match alignment {
+                SimdAlign::Unaligned => MemFlags::new().with_notrap(),
+                _ => MemFlags::trusted(),
+            };
+
             for lane_idx in 0..val_lane_count {
                 let val_lane = val.value_lane(fx, lane_idx).load_scalar(fx);
                 let mask_lane = mask.value_lane(fx, lane_idx).load_scalar(fx);
@@ -983,7 +982,7 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
 
                 fx.bcx.switch_to_block(if_enabled);
                 let offset = lane_idx as i32 * lane_clif_ty.bytes() as i32;
-                fx.bcx.ins().store(MemFlags::trusted(), val_lane, ptr_val, Offset32::new(offset));
+                fx.bcx.ins().store(memflags, val_lane, ptr_val, Offset32::new(offset));
                 fx.bcx.ins().jump(next, &[]);
 
                 fx.bcx.seal_block(next);
@@ -1007,6 +1006,15 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
             let lane_clif_ty = fx.clif_type(val_lane_ty).unwrap();
             let ret_lane_layout = fx.layout_of(ret_lane_ty);
 
+            let alignment = generic_args[3].expect_const().to_value().valtree.unwrap_branch()[0]
+                .unwrap_leaf()
+                .to_simd_alignment();
+
+            let memflags = match alignment {
+                SimdAlign::Unaligned => MemFlags::new().with_notrap(),
+                _ => MemFlags::trusted(),
+            };
+
             for lane_idx in 0..ptr_lane_count {
                 let val_lane = val.value_lane(fx, lane_idx).load_scalar(fx);
                 let ptr_lane = ptr.value_lane(fx, lane_idx).load_scalar(fx);
@@ -1022,11 +1030,11 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
                 fx.bcx.seal_block(if_disabled);
 
                 fx.bcx.switch_to_block(if_enabled);
-                let res = fx.bcx.ins().load(lane_clif_ty, MemFlags::trusted(), ptr_lane, 0);
-                fx.bcx.ins().jump(next, &[res]);
+                let res = fx.bcx.ins().load(lane_clif_ty, memflags, ptr_lane, 0);
+                fx.bcx.ins().jump(next, &[res.into()]);
 
                 fx.bcx.switch_to_block(if_disabled);
-                fx.bcx.ins().jump(next, &[val_lane]);
+                fx.bcx.ins().jump(next, &[val_lane.into()]);
 
                 fx.bcx.seal_block(next);
                 fx.bcx.switch_to_block(next);
@@ -1051,6 +1059,15 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
             let ret_lane_layout = fx.layout_of(ret_lane_ty);
             let ptr_val = ptr.load_scalar(fx);
 
+            let alignment = generic_args[3].expect_const().to_value().valtree.unwrap_branch()[0]
+                .unwrap_leaf()
+                .to_simd_alignment();
+
+            let memflags = match alignment {
+                SimdAlign::Unaligned => MemFlags::new().with_notrap(),
+                _ => MemFlags::trusted(),
+            };
+
             for lane_idx in 0..ret_lane_count {
                 let val_lane = val.value_lane(fx, lane_idx).load_scalar(fx);
                 let mask_lane = mask.value_lane(fx, lane_idx).load_scalar(fx);
@@ -1066,16 +1083,11 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
 
                 fx.bcx.switch_to_block(if_enabled);
                 let offset = lane_idx as i32 * lane_clif_ty.bytes() as i32;
-                let res = fx.bcx.ins().load(
-                    lane_clif_ty,
-                    MemFlags::trusted(),
-                    ptr_val,
-                    Offset32::new(offset),
-                );
-                fx.bcx.ins().jump(next, &[res]);
+                let res = fx.bcx.ins().load(lane_clif_ty, memflags, ptr_val, Offset32::new(offset));
+                fx.bcx.ins().jump(next, &[res.into()]);
 
                 fx.bcx.switch_to_block(if_disabled);
-                fx.bcx.ins().jump(next, &[val_lane]);
+                fx.bcx.ins().jump(next, &[val_lane.into()]);
 
                 fx.bcx.seal_block(next);
                 fx.bcx.switch_to_block(next);
@@ -1119,7 +1131,7 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
         _ => {
             fx.tcx.dcx().span_err(span, format!("Unknown SIMD intrinsic {}", intrinsic));
             // Prevent verifier error
-            fx.bcx.ins().trap(TrapCode::UnreachableCodeReached);
+            fx.bcx.ins().trap(TrapCode::user(1 /* unreachable */).unwrap());
             return;
         }
     }

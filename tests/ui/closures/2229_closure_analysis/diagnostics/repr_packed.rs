@@ -1,4 +1,4 @@
-// edition:2021
+//@ edition:2021
 
 // Given how the closure desugaring is implemented (at least at the time of writing this test),
 // we don't need to truncate the captured path to a reference into a packed-struct if the field
@@ -19,7 +19,7 @@ fn test_missing_unsafe_warning_on_repr_packed() {
 
     let c = || {
         println!("{}", foo.x);
-        //~^ ERROR: reference to packed field is unaligned
+        //~^ ERROR: reference to field of packed struct is unaligned
         let _z = foo.x;
     };
 

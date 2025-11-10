@@ -1,7 +1,5 @@
-// compile-flags: -Znext-solver
-// check-pass
-
-#![feature(unsized_tuple_coercion)]
+//@ compile-flags: -Znext-solver
+//@ check-pass
 
 trait Foo {}
 
@@ -14,10 +12,6 @@ fn main() {
     // Slice unsizing
     let y = [1, 2, 3];
     let _: &[i32] = &y;
-
-    // Tuple unsizing
-    let hi = (1i32,);
-    let _: &(dyn Foo,) = &hi;
 
     // Dropping auto traits
     let a: &(dyn Foo + Send) = &1;

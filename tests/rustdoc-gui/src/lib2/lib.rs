@@ -1,7 +1,6 @@
 // ignore-tidy-linelength
 
 #![feature(doc_cfg)]
-#![feature(doc_auto_cfg)]
 
 pub mod another_folder;
 pub mod another_mod;
@@ -117,6 +116,7 @@ pub mod too_long {
     pub type ReallyLongTypeNameLongLongLong =
         Option<unsafe extern "C" fn(a: *const u8, b: *const u8) -> *const u8>;
 
+    /// Short doc.
     pub const ReallyLongTypeNameLongLongLongConstBecauseWhyNotAConstRightGigaGigaSupraLong: u32 = 0;
 
     /// This also has a really long doccomment. Lorem ipsum dolor sit amet,
@@ -353,5 +353,15 @@ pub mod scroll_traits {
     /// scrolls as expected.
     pub trait TraitWithLongItemsName {
         fn this_is_a_method_with_a_long_name_returning_something() -> String;
+    }
+}
+
+pub struct Derefer(String);
+
+impl std::ops::Deref for Derefer {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
 }

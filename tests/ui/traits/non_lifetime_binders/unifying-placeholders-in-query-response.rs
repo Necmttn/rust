@@ -1,16 +1,20 @@
-// revisions: current next
-//[next] compile-flags: -Znext-solver
-// check-pass
+//@ revisions: current next
+//@ ignore-compare-mode-next-solver (explicit revisions)
+//@[next] compile-flags: -Znext-solver
+//@ check-pass
 
+#![feature(sized_hierarchy)]
 #![feature(non_lifetime_binders)]
 //~^ WARN the feature `non_lifetime_binders` is incomplete
 
-pub trait Foo<T: ?Sized> {
-    type Bar<K: ?Sized>: ?Sized;
+use std::marker::PointeeSized;
+
+pub trait Foo<T: PointeeSized> {
+    type Bar<K: PointeeSized>: PointeeSized;
 }
 
 impl Foo<usize> for () {
-    type Bar<K: ?Sized> = K;
+    type Bar<K: PointeeSized> = K;
 }
 
 pub fn f<T1, T2>(a: T1, b: T2)

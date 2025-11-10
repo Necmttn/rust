@@ -8,7 +8,7 @@ use triomphe::Arc;
 use crate::{
     global_state::GlobalState,
     line_index::{LineEndings, LineIndex, PositionEncoding},
-    lsp::{from_proto, LspError},
+    lsp::{LspError, from_proto},
     lsp_ext,
 };
 
@@ -74,13 +74,12 @@ impl GlobalState {
         }
     }
 
-    /// Sends a notification to the client containing the error `message`.
     /// If `additional_info` is [`Some`], appends a note to the notification telling to check the logs.
     /// This will always log `message` + `additional_info` to the server's error log.
     pub(crate) fn show_and_log_error(&mut self, message: String, additional_info: Option<String>) {
         match additional_info {
             Some(additional_info) => {
-                tracing::error!("{}:\n{}", &message, &additional_info);
+                tracing::error!("{message}:\n{additional_info}");
                 self.show_message(
                     lsp_types::MessageType::ERROR,
                     message,
@@ -88,7 +87,7 @@ impl GlobalState {
                 );
             }
             None => {
-                tracing::error!("{}", &message);
+                tracing::error!("{message}");
                 self.send_notification::<lsp_types::notification::ShowMessage>(
                     lsp_types::ShowMessageParams { typ: lsp_types::MessageType::ERROR, message },
                 );
@@ -109,8 +108,7 @@ impl GlobalState {
     /// edge users from being upset!
     pub(crate) fn poke_rust_analyzer_developer(&mut self, message: String) {
         let from_source_build = option_env!("POKE_RA_DEVS").is_some();
-        let profiling_enabled = std::env::var("RA_PROFILE").is_ok();
-        if from_source_build || profiling_enabled {
+        if from_source_build {
             self.show_and_log_error(message, None);
         }
     }
@@ -134,6 +132,7 @@ impl GlobalState {
         let token = lsp_types::ProgressToken::String(
             cancel_token.unwrap_or_else(|| format!("rustAnalyzer/{title}")),
         );
+        tracing::debug!(?token, ?state, "report_progress {message:?}");
         let work_done_progress = match state {
             Progress::Begin => {
                 self.send_request::<lsp_types::request::WorkDoneProgressCreate>(
@@ -333,21 +332,20 @@ mod tests {
 
     #[test]
     fn empty_completion_disjoint_tests() {
-        let empty_completion =
-            CompletionItem::new_simple("label".to_string(), "detail".to_string());
+        let empty_completion = CompletionItem::new_simple("label".to_owned(), "detail".to_owned());
 
         let disjoint_edit_1 = lsp_types::TextEdit::new(
             Range::new(Position::new(2, 2), Position::new(3, 3)),
-            "new_text".to_string(),
+            "new_text".to_owned(),
         );
         let disjoint_edit_2 = lsp_types::TextEdit::new(
             Range::new(Position::new(3, 3), Position::new(4, 4)),
-            "new_text".to_string(),
+            "new_text".to_owned(),
         );
 
         let joint_edit = lsp_types::TextEdit::new(
             Range::new(Position::new(1, 1), Position::new(5, 5)),
-            "new_text".to_string(),
+            "new_text".to_owned(),
         );
 
         assert!(
@@ -375,19 +373,19 @@ mod tests {
     fn completion_with_joint_edits_disjoint_tests() {
         let disjoint_edit = lsp_types::TextEdit::new(
             Range::new(Position::new(1, 1), Position::new(2, 2)),
-            "new_text".to_string(),
+            "new_text".to_owned(),
         );
         let disjoint_edit_2 = lsp_types::TextEdit::new(
             Range::new(Position::new(2, 2), Position::new(3, 3)),
-            "new_text".to_string(),
+            "new_text".to_owned(),
         );
         let joint_edit = lsp_types::TextEdit::new(
             Range::new(Position::new(1, 1), Position::new(5, 5)),
-            "new_text".to_string(),
+            "new_text".to_owned(),
         );
 
         let mut completion_with_joint_edits =
-            CompletionItem::new_simple("label".to_string(), "detail".to_string());
+            CompletionItem::new_simple("label".to_owned(), "detail".to_owned());
         completion_with_joint_edits.additional_text_edits =
             Some(vec![disjoint_edit.clone(), joint_edit.clone()]);
         assert!(
@@ -405,7 +403,7 @@ mod tests {
 
         completion_with_joint_edits.text_edit =
             Some(CompletionTextEdit::InsertAndReplace(InsertReplaceEdit {
-                new_text: "new_text".to_string(),
+                new_text: "new_text".to_owned(),
                 insert: disjoint_edit.range,
                 replace: disjoint_edit_2.range,
             }));
@@ -420,19 +418,19 @@ mod tests {
     fn completion_with_disjoint_edits_disjoint_tests() {
         let disjoint_edit = lsp_types::TextEdit::new(
             Range::new(Position::new(1, 1), Position::new(2, 2)),
-            "new_text".to_string(),
+            "new_text".to_owned(),
         );
         let disjoint_edit_2 = lsp_types::TextEdit::new(
             Range::new(Position::new(2, 2), Position::new(3, 3)),
-            "new_text".to_string(),
+            "new_text".to_owned(),
         );
         let joint_edit = lsp_types::TextEdit::new(
             Range::new(Position::new(1, 1), Position::new(5, 5)),
-            "new_text".to_string(),
+            "new_text".to_owned(),
         );
 
         let mut completion_with_disjoint_edits =
-            CompletionItem::new_simple("label".to_string(), "detail".to_string());
+            CompletionItem::new_simple("label".to_owned(), "detail".to_owned());
         completion_with_disjoint_edits.text_edit = Some(CompletionTextEdit::Edit(disjoint_edit));
         let completion_with_disjoint_edits = completion_with_disjoint_edits;
 

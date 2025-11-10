@@ -1,9 +1,12 @@
-use super::FnCtxt;
-use hir::def_id::DefId;
 use hir::Node;
+use hir::def_id::DefId;
 use rustc_hir as hir;
-use rustc_middle::middle::region::{RvalueCandidateType, Scope, ScopeTree};
+use rustc_middle::bug;
+use rustc_middle::middle::region::{RvalueCandidate, Scope, ScopeTree};
 use rustc_middle::ty::RvalueScopes;
+use tracing::debug;
+
+use super::FnCtxt;
 
 /// Applied to an expression `expr` if `expr` -- or something owned or partially owned by
 /// `expr` -- is going to be indirectly referenced by a variable in a let statement. In that
@@ -52,18 +55,14 @@ fn record_rvalue_scope_rec(
 fn record_rvalue_scope(
     rvalue_scopes: &mut RvalueScopes,
     expr: &hir::Expr<'_>,
-    candidate: &RvalueCandidateType,
+    candidate: &RvalueCandidate,
 ) {
     debug!("resolve_rvalue_scope(expr={expr:?}, candidate={candidate:?})");
-    match candidate {
-        RvalueCandidateType::Borrow { lifetime, .. }
-        | RvalueCandidateType::Pattern { lifetime, .. } => {
-            record_rvalue_scope_rec(rvalue_scopes, expr, *lifetime)
-        } // FIXME(@dingxiangfei2009): handle the candidates in the function call arguments
-    }
+    record_rvalue_scope_rec(rvalue_scopes, expr, candidate.lifetime)
+    // FIXME(@dingxiangfei2009): handle the candidates in the function call arguments
 }
 
-pub fn resolve_rvalue_scopes<'a, 'tcx>(
+pub(crate) fn resolve_rvalue_scopes<'a, 'tcx>(
     fcx: &'a FnCtxt<'a, 'tcx>,
     scope_tree: &'a ScopeTree,
     def_id: DefId,
@@ -73,9 +72,7 @@ pub fn resolve_rvalue_scopes<'a, 'tcx>(
     debug!("start resolving rvalue scopes, def_id={def_id:?}");
     debug!("rvalue_scope: rvalue_candidates={:?}", scope_tree.rvalue_candidates);
     for (&hir_id, candidate) in &scope_tree.rvalue_candidates {
-        let Some(Node::Expr(expr)) = tcx.opt_hir_node(hir_id) else {
-            bug!("hir node does not exist")
-        };
+        let Node::Expr(expr) = tcx.hir_node(hir_id) else { bug!("hir node does not exist") };
         record_rvalue_scope(&mut rvalue_scopes, expr, candidate);
     }
     rvalue_scopes

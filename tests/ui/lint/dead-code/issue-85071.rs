@@ -4,7 +4,7 @@
 // in this regard, which led to confusing "unused variable" warnings
 // without an accompanying explanatory "unreachable expression" warning.
 
-// check-pass
+//@ check-pass
 
 #![warn(unused_variables,unreachable_code)]
 
@@ -14,6 +14,6 @@ fn f() -> Foo {todo!()}
 fn main() {
     let x = f();
     //~^ WARNING: unused variable: `x`
+    //~| WARNING: unreachable definition
     let _ = x;
-    //~^ WARNING: unreachable expression
 }

@@ -27,9 +27,8 @@ fn main() {
     }
 }
 
-unsafe fn print(msg: &str) {
-    utils::miri_write_to_stderr(msg.as_bytes());
-    utils::miri_write_to_stderr("\n".as_bytes());
+fn print(msg: &str) {
+    eprintln!("{msg}");
 }
 
 unsafe fn read_second<T>(x: &mut T, y: *mut u8) {
@@ -44,11 +43,11 @@ unsafe fn read_second<T>(x: &mut T, y: *mut u8) {
 unsafe fn cell_protected_read() {
     print("[interior mut + protected] Foreign Read: Re* -> Frz");
     let base = &mut UnsafeCell::new(0u8);
-    name!(base.get(), "base");
+    name!(base as *mut _, "base");
     let alloc_id = alloc_id!(base.get());
     let x = &mut *(base as *mut UnsafeCell<u8>);
-    name!(x.get(), "x");
-    let y = (&mut *base).get();
+    name!(x as *mut _, "x");
+    let y = &mut *base as *mut UnsafeCell<u8> as *mut u8;
     name!(y);
     read_second(x, y); // Foreign Read for callee:x
     print_state!(alloc_id);
@@ -58,26 +57,26 @@ unsafe fn cell_protected_read() {
 unsafe fn cell_unprotected_read() {
     print("[interior mut] Foreign Read: Re* -> Re*");
     let base = &mut UnsafeCell::new(0u64);
-    name!(base.get(), "base");
+    name!(base as *mut _, "base");
     let alloc_id = alloc_id!(base.get());
     let x = &mut *(base as *mut UnsafeCell<_>);
-    name!(x.get(), "x");
-    let y = (&mut *base).get();
+    name!(x as *mut _, "x");
+    let y = &mut *base as *mut UnsafeCell<u64> as *mut u64;
     name!(y);
     let _val = *y; // Foreign Read for x
     print_state!(alloc_id);
 }
 
 // Foreign Write on an interior mutable pointer is a noop.
-// Also y must become Active.
+// Also y must become Unique.
 unsafe fn cell_unprotected_write() {
     print("[interior mut] Foreign Write: Re* -> Re*");
     let base = &mut UnsafeCell::new(0u64);
-    name!(base.get(), "base");
+    name!(base as *mut _, "base");
     let alloc_id = alloc_id!(base.get());
     let x = &mut *(base as *mut UnsafeCell<u64>);
-    name!(x.get(), "x");
-    let y = (&mut *base).get();
+    name!(x as *mut _, "x");
+    let y = &mut *base as *mut UnsafeCell<u64> as *mut u64;
     name!(y);
     *y = 1; // Foreign Write for x
     print_state!(alloc_id);
@@ -98,7 +97,7 @@ unsafe fn int_protected_read() {
 }
 
 // Foreign Read on a Reserved is a noop.
-// Also y must become Active.
+// Also y must become Unique.
 unsafe fn int_unprotected_read() {
     print("[] Foreign Read: Res -> Res");
     let base = &mut 0u8;

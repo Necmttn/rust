@@ -229,10 +229,10 @@ fn t10() {
     let SourceFile {
         name,
         src_hash,
+        checksum_hash,
         source_len,
         lines,
         multibyte_chars,
-        non_narrow_chars,
         normalized_pos,
         stable_id,
         ..
@@ -241,12 +241,12 @@ fn t10() {
     let imported_src_file = sm.new_imported_source_file(
         name,
         src_hash,
+        checksum_hash,
         stable_id,
         source_len.to_u32(),
-        CrateNum::new(0),
+        CrateNum::ZERO,
         FreezeLock::new(lines.read().clone()),
         multibyte_chars,
-        non_narrow_chars,
         normalized_pos,
         0,
     );
@@ -257,57 +257,10 @@ fn t10() {
     );
     imported_src_file.add_external_src(|| Some(unnormalized.to_string()));
     assert_eq!(
-        imported_src_file.external_src.borrow().get_source().unwrap().as_ref(),
+        imported_src_file.external_src.borrow().get_source().unwrap(),
         normalized,
         "imported source file should be normalized"
     );
-}
-
-/// Returns the span corresponding to the `n`th occurrence of `substring` in `source_text`.
-trait SourceMapExtension {
-    fn span_substr(
-        &self,
-        file: &Lrc<SourceFile>,
-        source_text: &str,
-        substring: &str,
-        n: usize,
-    ) -> Span;
-}
-
-impl SourceMapExtension for SourceMap {
-    fn span_substr(
-        &self,
-        file: &Lrc<SourceFile>,
-        source_text: &str,
-        substring: &str,
-        n: usize,
-    ) -> Span {
-        eprintln!(
-            "span_substr(file={:?}/{:?}, substring={:?}, n={})",
-            file.name, file.start_pos, substring, n
-        );
-        let mut i = 0;
-        let mut hi = 0;
-        loop {
-            let offset = source_text[hi..].find(substring).unwrap_or_else(|| {
-                panic!(
-                    "source_text `{}` does not have {} occurrences of `{}`, only {}",
-                    source_text, n, substring, i
-                );
-            });
-            let lo = hi + offset;
-            hi = lo + substring.len();
-            if i == n {
-                let span = Span::with_root_ctxt(
-                    BytePos(lo as u32 + file.start_pos.0),
-                    BytePos(hi as u32 + file.start_pos.0),
-                );
-                assert_eq!(&self.span_to_snippet(span).unwrap()[..], substring);
-                return span;
-            }
-            i += 1;
-        }
-    }
 }
 
 // Takes a unix-style path and returns a platform specific path.
@@ -352,6 +305,7 @@ fn path_prefix_remapping() {
         let mapping = &FilePathMapping::new(
             vec![(path("abc/def"), path("foo"))],
             FileNameDisplayPreference::Remapped,
+            FileNameEmbeddablePreference::RemappedOnly,
         );
 
         assert_eq!(map_path_prefix(mapping, "abc/def/src/main.rs"), path_str("foo/src/main.rs"));
@@ -363,6 +317,7 @@ fn path_prefix_remapping() {
         let mapping = &FilePathMapping::new(
             vec![(path("abc/def"), path("/foo"))],
             FileNameDisplayPreference::Remapped,
+            FileNameEmbeddablePreference::RemappedOnly,
         );
 
         assert_eq!(map_path_prefix(mapping, "abc/def/src/main.rs"), path_str("/foo/src/main.rs"));
@@ -374,6 +329,7 @@ fn path_prefix_remapping() {
         let mapping = &FilePathMapping::new(
             vec![(path("/abc/def"), path("foo"))],
             FileNameDisplayPreference::Remapped,
+            FileNameEmbeddablePreference::RemappedOnly,
         );
 
         assert_eq!(map_path_prefix(mapping, "/abc/def/src/main.rs"), path_str("foo/src/main.rs"));
@@ -385,6 +341,7 @@ fn path_prefix_remapping() {
         let mapping = &FilePathMapping::new(
             vec![(path("/abc/def"), path("/foo"))],
             FileNameDisplayPreference::Remapped,
+            FileNameEmbeddablePreference::RemappedOnly,
         );
 
         assert_eq!(map_path_prefix(mapping, "/abc/def/src/main.rs"), path_str("/foo/src/main.rs"));
@@ -398,6 +355,7 @@ fn path_prefix_remapping_expand_to_absolute() {
     let mapping = &FilePathMapping::new(
         vec![(path("/foo"), path("FOO")), (path("/bar"), path("BAR"))],
         FileNameDisplayPreference::Remapped,
+        FileNameEmbeddablePreference::RemappedOnly,
     );
     let working_directory = path("/foo");
     let working_directory = RealFileName::Remapped {
@@ -496,12 +454,78 @@ fn path_prefix_remapping_expand_to_absolute() {
 }
 
 #[test]
+fn path_prefix_remapping_expand_to_absolute_and_local() {
+    // "virtual" working directory is relative path
+    let mapping = &FilePathMapping::new(
+        vec![(path("/foo"), path("FOO")), (path("/bar"), path("BAR"))],
+        FileNameDisplayPreference::Remapped,
+        FileNameEmbeddablePreference::LocalAndRemapped,
+    );
+    let working_directory = path("/foo");
+    let working_directory = RealFileName::Remapped {
+        local_path: Some(working_directory.clone()),
+        virtual_name: mapping.map_prefix(working_directory).0.into_owned(),
+    };
+
+    assert_eq!(working_directory.remapped_path_if_available(), path("FOO"));
+
+    // Unmapped absolute path
+    assert_eq!(
+        mapping.to_embeddable_absolute_path(
+            RealFileName::LocalPath(path("/foo/src/main.rs")),
+            &working_directory
+        ),
+        RealFileName::Remapped {
+            local_path: Some(path("/foo/src/main.rs")),
+            virtual_name: path("FOO/src/main.rs")
+        }
+    );
+
+    // Unmapped absolute path with unrelated working directory
+    assert_eq!(
+        mapping.to_embeddable_absolute_path(
+            RealFileName::LocalPath(path("/bar/src/main.rs")),
+            &working_directory
+        ),
+        RealFileName::Remapped {
+            local_path: Some(path("/bar/src/main.rs")),
+            virtual_name: path("BAR/src/main.rs")
+        }
+    );
+
+    // Already remapped absolute path, with unrelated working directory
+    assert_eq!(
+        mapping.to_embeddable_absolute_path(
+            RealFileName::Remapped {
+                local_path: Some(path("/bar/src/main.rs")),
+                virtual_name: path("BAR/src/main.rs"),
+            },
+            &working_directory
+        ),
+        RealFileName::Remapped {
+            local_path: Some(path("/bar/src/main.rs")),
+            virtual_name: path("BAR/src/main.rs")
+        }
+    );
+
+    // Already remapped relative path
+    assert_eq!(
+        mapping.to_embeddable_absolute_path(
+            RealFileName::Remapped { local_path: None, virtual_name: path("XYZ/src/main.rs") },
+            &working_directory
+        ),
+        RealFileName::Remapped { local_path: None, virtual_name: path("XYZ/src/main.rs") }
+    );
+}
+
+#[test]
 fn path_prefix_remapping_reverse() {
     // Ignores options without alphanumeric chars.
     {
         let mapping = &FilePathMapping::new(
             vec![(path("abc"), path("/")), (path("def"), path("."))],
             FileNameDisplayPreference::Remapped,
+            FileNameEmbeddablePreference::RemappedOnly,
         );
 
         assert_eq!(reverse_map_prefix(mapping, "/hello.rs"), None);
@@ -513,6 +537,7 @@ fn path_prefix_remapping_reverse() {
         let mapping = &FilePathMapping::new(
             vec![(path("abc"), path("/redacted")), (path("def"), path("/redacted"))],
             FileNameDisplayPreference::Remapped,
+            FileNameEmbeddablePreference::RemappedOnly,
         );
 
         assert_eq!(reverse_map_prefix(mapping, "/redacted/hello.rs"), None);
@@ -523,6 +548,7 @@ fn path_prefix_remapping_reverse() {
         let mapping = &FilePathMapping::new(
             vec![(path("abc"), path("/redacted")), (path("def/ghi"), path("/fake/dir"))],
             FileNameDisplayPreference::Remapped,
+            FileNameEmbeddablePreference::RemappedOnly,
         );
 
         assert_eq!(
@@ -585,7 +611,7 @@ fn test_next_point() {
 #[cfg(target_os = "linux")]
 #[test]
 fn read_binary_file_handles_lying_stat() {
-    // read_binary_file tries to read the contents of a file into an Lrc<[u8]> while
+    // read_binary_file tries to read the contents of a file into an Arc<[u8]> while
     // never having two copies of the data in memory at once. This is an optimization
     // to support include_bytes! with large files. But since Rust allocators are
     // sensitive to alignment, our implementation can't be bootstrapped off calling

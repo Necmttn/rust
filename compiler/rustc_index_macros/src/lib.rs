@@ -1,5 +1,7 @@
-#![cfg_attr(feature = "nightly", feature(allow_internal_unstable))]
+// tidy-alphabetical-start
 #![cfg_attr(feature = "nightly", allow(internal_features))]
+#![cfg_attr(feature = "nightly", feature(allow_internal_unstable))]
+// tidy-alphabetical-end
 
 use proc_macro::TokenStream;
 
@@ -31,17 +33,8 @@ mod newtype;
 /// - `#[max = 0xFFFF_FFFD]`: specifies the max value, which allows niche
 ///   optimizations. The default max value is 0xFFFF_FF00.
 /// - `#[gate_rustc_only]`: makes parts of the generated code nightly-only.
-///
-/// `SpecOptionPartialEq` is specialized by this macro, so using it requires enabling
-/// `#![feature(min_specialization)]` for the crate.
 #[proc_macro]
-#[cfg_attr(
-    feature = "nightly",
-    allow_internal_unstable(step_trait, rustc_attrs, trusted_step, spec_option_partial_eq)
-)]
-// FIXME: Remove the above comment about `min_specialization` once bootstrap is bumped,
-// and the corresponding one on SpecOptionPartialEq
-#[cfg_attr(all(feature = "nightly", not(bootstrap)), allow_internal_unstable(min_specialization))]
+#[cfg_attr(feature = "nightly", allow_internal_unstable(step_trait, rustc_attrs, trusted_step))]
 pub fn newtype_index(input: TokenStream) -> TokenStream {
     newtype::newtype(input)
 }

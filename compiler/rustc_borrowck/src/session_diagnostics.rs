@@ -1,4 +1,5 @@
 use rustc_errors::MultiSpan;
+use rustc_errors::codes::*;
 use rustc_macros::{Diagnostic, LintDiagnostic, Subdiagnostic};
 use rustc_middle::ty::{GenericArg, Ty};
 use rustc_span::Span;
@@ -6,7 +7,7 @@ use rustc_span::Span;
 use crate::diagnostics::RegionName;
 
 #[derive(Diagnostic)]
-#[diag(borrowck_move_unsized, code = "E0161")]
+#[diag(borrowck_move_unsized, code = E0161)]
 pub(crate) struct MoveUnsized<'tcx> {
     pub ty: Ty<'tcx>,
     #[primary_span]
@@ -281,7 +282,7 @@ pub(crate) enum CaptureVarCause {
 }
 
 #[derive(Diagnostic)]
-#[diag(borrowck_cannot_move_when_borrowed, code = "E0505")]
+#[diag(borrowck_cannot_move_when_borrowed, code = E0505)]
 pub(crate) struct MoveBorrow<'a> {
     pub place: &'a str,
     pub borrow_place: &'a str,
@@ -294,14 +295,16 @@ pub(crate) struct MoveBorrow<'a> {
 }
 
 #[derive(Diagnostic)]
-#[diag(borrowck_opaque_type_non_generic_param, code = "E0792")]
-pub(crate) struct NonGenericOpaqueTypeParam<'a, 'tcx> {
-    pub ty: GenericArg<'tcx>,
-    pub kind: &'a str,
+#[diag(borrowck_opaque_type_lifetime_mismatch)]
+pub(crate) struct LifetimeMismatchOpaqueParam<'tcx> {
+    pub arg: GenericArg<'tcx>,
+    pub prev: GenericArg<'tcx>,
     #[primary_span]
-    pub span: Span,
     #[label]
-    pub param_span: Span,
+    #[note]
+    pub span: Span,
+    #[label(borrowck_prev_lifetime_label)]
+    pub prev_span: Span,
 }
 
 #[derive(Subdiagnostic)]
@@ -368,6 +371,11 @@ pub(crate) enum CaptureReasonNote {
         #[primary_span]
         var_span: Span,
     },
+    #[note(borrowck_calling_operator_moves)]
+    UnOpMoveByOperator {
+        #[primary_span]
+        span: Span,
+    },
     #[note(borrowck_calling_operator_moves_lhs)]
     LhsMoveByOperator {
         #[primary_span]
@@ -396,7 +404,7 @@ pub(crate) enum CaptureReasonSuggest<'tcx> {
         span: Span,
     },
     #[suggestion(
-        borrowck_suggest_create_freash_reborrow,
+        borrowck_suggest_create_fresh_reborrow,
         applicability = "maybe-incorrect",
         code = ".as_mut()",
         style = "verbose"
@@ -454,8 +462,17 @@ pub(crate) enum TypeNoCopy<'a, 'tcx> {
 }
 
 #[derive(Diagnostic)]
-#[diag(borrowck_simd_shuffle_last_const)]
-pub(crate) struct SimdShuffleLastConst {
+#[diag(borrowck_simd_intrinsic_arg_const)]
+pub(crate) struct SimdIntrinsicArgConst {
     #[primary_span]
     pub span: Span,
+    pub arg: usize,
+    pub intrinsic: String,
+}
+
+#[derive(LintDiagnostic)]
+#[diag(borrowck_tail_expr_drop_order)]
+pub(crate) struct TailExprDropOrder {
+    #[label]
+    pub borrowed: Span,
 }

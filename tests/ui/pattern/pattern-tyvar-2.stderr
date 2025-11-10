@@ -5,6 +5,11 @@ LL | fn foo(t: Bar) -> isize { match t { Bar::T1(_, Some(x)) => { return x * 3; 
    |                                                                     - ^ - {integer}
    |                                                                     |
    |                                                                     Vec<isize>
+   |
+note: `Vec<isize>` does not implement `Mul<{integer}>`
+  --> $SRC_DIR/alloc/src/vec/mod.rs:LL:COL
+   |
+   = note: `Vec<isize>` is defined in another crate
 
 error: aborting due to 1 previous error
 

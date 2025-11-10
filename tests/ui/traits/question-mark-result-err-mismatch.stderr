@@ -1,5 +1,5 @@
 error[E0277]: `?` couldn't convert the error to `String`
-  --> $DIR/question-mark-result-err-mismatch.rs:14:22
+  --> $DIR/question-mark-result-err-mismatch.rs:15:22
    |
 LL |   fn foo() -> Result<String, String> {
    |               ---------------------- expected `String` because of this
@@ -17,7 +17,7 @@ LL |           .map(|()| "")?;
    = note: required for `Result<String, String>` to implement `FromResidual<Result<Infallible, ()>>`
 
 error[E0277]: `?` couldn't convert the error to `String`
-  --> $DIR/question-mark-result-err-mismatch.rs:28:25
+  --> $DIR/question-mark-result-err-mismatch.rs:29:25
    |
 LL | fn bar() -> Result<(), String> {
    |             ------------------ expected `String` because of this
@@ -31,16 +31,16 @@ LL |         .map_err(|_| ())?;
    |
    = note: the question mark operation (`?`) implicitly performs a conversion on the error value using the `From` trait
    = help: the following other types implement trait `From<T>`:
-             <String as From<char>>
-             <String as From<Box<str>>>
-             <String as From<Cow<'a, str>>>
-             <String as From<&str>>
-             <String as From<&mut str>>
-             <String as From<&String>>
+             `String` implements `From<&String>`
+             `String` implements `From<&mut str>`
+             `String` implements `From<&str>`
+             `String` implements `From<Box<str>>`
+             `String` implements `From<Cow<'_, str>>`
+             `String` implements `From<char>`
    = note: required for `Result<(), String>` to implement `FromResidual<Result<Infallible, ()>>`
 
 error[E0277]: `?` couldn't convert the error to `String`
-  --> $DIR/question-mark-result-err-mismatch.rs:48:11
+  --> $DIR/question-mark-result-err-mismatch.rs:49:11
    |
 LL |   fn baz() -> Result<String, String> {
    |               ---------------------- expected `String` because of this

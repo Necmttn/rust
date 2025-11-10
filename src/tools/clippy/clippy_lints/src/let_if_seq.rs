@@ -1,10 +1,10 @@
-use clippy_utils::diagnostics::span_lint_and_then;
-use clippy_utils::path_to_local_id;
+use clippy_utils::diagnostics::span_lint_hir_and_then;
+use clippy_utils::res::MaybeResPath;
 use clippy_utils::source::snippet;
 use clippy_utils::visitors::is_local_used;
 use rustc_errors::Applicability;
 use rustc_hir as hir;
-use rustc_hir::{BindingAnnotation, Mutability};
+use rustc_hir::{BindingMode, Mutability};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_session::declare_lint_pass;
 
@@ -58,21 +58,12 @@ declare_lint_pass!(LetIfSeq => [USELESS_LET_IF_SEQ]);
 
 impl<'tcx> LateLintPass<'tcx> for LetIfSeq {
     fn check_block(&mut self, cx: &LateContext<'tcx>, block: &'tcx hir::Block<'_>) {
-        let mut it = block.stmts.iter().peekable();
-        while let Some(stmt) = it.next() {
-            if let Some(expr) = it.peek()
-                && let hir::StmtKind::Local(local) = stmt.kind
+        for [stmt, next] in block.stmts.array_windows::<2>() {
+            if let hir::StmtKind::Let(local) = stmt.kind
                 && let hir::PatKind::Binding(mode, canonical_id, ident, None) = local.pat.kind
-                && let hir::StmtKind::Expr(if_) = expr.kind
-                && let hir::ExprKind::If(
-                    hir::Expr {
-                        kind: hir::ExprKind::DropTemps(cond),
-                        ..
-                    },
-                    then,
-                    else_,
-                ) = if_.kind
-                && !is_local_used(cx, *cond, canonical_id)
+                && let hir::StmtKind::Expr(if_) = next.kind
+                && let hir::ExprKind::If(cond, then, else_) = if_.kind
+                && !is_local_used(cx, cond, canonical_id)
                 && let hir::ExprKind::Block(then, _) = then.kind
                 && let Some(value) = check_assign(cx, canonical_id, then)
                 && !is_local_used(cx, value, canonical_id)
@@ -82,7 +73,7 @@ impl<'tcx> LateLintPass<'tcx> for LetIfSeq {
                 let has_interior_mutability = !cx
                     .typeck_results()
                     .node_type(canonical_id)
-                    .is_freeze(cx.tcx, cx.param_env);
+                    .is_freeze(cx.tcx, cx.typing_env());
                 if has_interior_mutability {
                     return;
                 }
@@ -106,7 +97,7 @@ impl<'tcx> LateLintPass<'tcx> for LetIfSeq {
                 };
 
                 let mutability = match mode {
-                    BindingAnnotation(_, Mutability::Mut) => "<mut> ",
+                    BindingMode(_, Mutability::Mut) => "<mut> ",
                     _ => "",
                 };
 
@@ -122,9 +113,10 @@ impl<'tcx> LateLintPass<'tcx> for LetIfSeq {
                     value=snippet(cx, value.span, "<value>"),
                     default=snippet(cx, default.span, "<default>"),
                 );
-                span_lint_and_then(
+                span_lint_hir_and_then(
                     cx,
                     USELESS_LET_IF_SEQ,
+                    local.hir_id,
                     span,
                     "`if _ { .. } else { .. }` is an expression",
                     |diag| {
@@ -153,7 +145,7 @@ fn check_assign<'tcx>(
         && let Some(expr) = block.stmts.iter().last()
         && let hir::StmtKind::Semi(expr) = expr.kind
         && let hir::ExprKind::Assign(var, value, _) = expr.kind
-        && path_to_local_id(var, decl)
+        && var.res_local_id() == Some(decl)
     {
         if block
             .stmts

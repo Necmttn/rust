@@ -1,4 +1,4 @@
-// check-pass
+//@ check-pass
 
 #![warn(unused_must_use)]
 
@@ -39,6 +39,8 @@ impl Replaceable for MyStruct {
     // method won't work; the attribute should be on the method signature in
     // the trait's definition.
     #[must_use]
+    //~^ WARN attribute cannot be used on trait methods in impl blocks
+    //~| WARN previously accepted
     fn replace(&mut self, substitute: usize) -> usize {
         let previously = self.n;
         self.n = substitute;

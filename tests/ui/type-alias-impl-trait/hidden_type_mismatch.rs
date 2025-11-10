@@ -9,7 +9,7 @@
 mod sus {
     use super::*;
     pub type Sep = impl Sized + std::fmt::Display;
-    //~^ ERROR: concrete type differs from previous defining opaque type use
+    #[define_opaque(Sep)]
     pub fn mk_sep() -> Sep {
         String::from("hello")
     }
@@ -35,6 +35,7 @@ mod sus {
     // `define_tait` is not actually callable, and thus assumed
     // `Bar<()>: Copy` even though it isn't.
     pub type Tait = impl Copy + From<Bar<()>> + Into<Bar<()>>;
+    #[define_opaque(Tait)]
     pub fn define_tait() -> Tait
     where
         // this proves `Bar<()>: Copy`, but `define_tait` is
@@ -42,6 +43,7 @@ mod sus {
         (): Proj<Assoc = i32>,
     {
         Bar { inner: 1i32, _marker: () }
+        //~^ ERROR type mismatch
     }
 }
 

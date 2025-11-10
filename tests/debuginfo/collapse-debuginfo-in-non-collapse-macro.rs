@@ -1,13 +1,12 @@
-// ignore-lldb
-#![feature(collapse_debuginfo)]
+//@ ignore-lldb
 
 // Test that statement, skipped/added/reordered by macros, is correctly processed in debuginfo.
 // When nested macros instantiations are tagged with collapse_debuginfo attribute,
 // debug info should be corrected to the first outer macro instantiation
 // without collapse_debuginfo attribute.
-// collapse_debuginfo feature enabled.
 
-// compile-flags:-g
+//@ compile-flags:-g
+//@ ignore-backends: gcc
 
 // === GDB TESTS ===================================================================================
 
@@ -61,7 +60,7 @@ fn myprintln_impl(text: &str) {
     println!("{}", text)
 }
 
-#[collapse_debuginfo]
+#[collapse_debuginfo(yes)]
 macro_rules! myprintln {
     ($($arg:tt)*) => {{
         myprintln_impl($($arg)*);

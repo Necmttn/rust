@@ -1,7 +1,8 @@
 //! This test checks the behaviour of walking into binders
 //! and normalizing something behind them actually works.
 
-// edition: 2021
+//@ edition: 2021
+//@ check-pass
 
 #![feature(type_alias_impl_trait)]
 
@@ -22,9 +23,9 @@ struct Terminator;
 type Successors<'a> = impl std::fmt::Debug + 'a;
 
 impl Terminator {
+    #[define_opaque(Successors, Tait)]
     fn successors(&self, mut f: for<'x> fn(&'x ()) -> <&'x A as B>::C) -> Successors<'_> {
         f = g;
-        //~^ ERROR item constrains opaque type that is not in its signature
     }
 }
 

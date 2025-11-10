@@ -3,16 +3,19 @@
 //! This primitive is meant to be used to run one-time initialization. An
 //! example use case would be for initializing an FFI library.
 
-#[cfg(all(test, not(target_os = "emscripten")))]
-mod tests;
-
 use crate::fmt;
 use crate::panic::{RefUnwindSafe, UnwindSafe};
-use crate::sys_common::once as sys;
+use crate::sys::sync as sys;
 
-/// A synchronization primitive which can be used to run a one-time global
-/// initialization. Useful for one-time initialization for FFI or related
-/// functionality. This type can only be constructed with [`Once::new()`].
+/// A low-level synchronization primitive for one-time global execution.
+///
+/// Previously this was the only "execute once" synchronization in `std`.
+/// Other libraries implemented novel synchronizing types with `Once`, like
+/// [`OnceLock<T>`] or [`LazyLock<T, F>`], before those were added to `std`.
+/// `OnceLock<T>` in particular supersedes `Once` in functionality and should
+/// be preferred for the common case where the `Once` is associated with data.
+///
+/// This type can only be constructed with [`Once::new()`].
 ///
 /// # Examples
 ///
@@ -25,6 +28,9 @@ use crate::sys_common::once as sys;
 ///     // run initialization here
 /// });
 /// ```
+///
+/// [`OnceLock<T>`]: crate::sync::OnceLock
+/// [`LazyLock<T, F>`]: crate::sync::LazyLock
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct Once {
     inner: sys::Once,
@@ -43,7 +49,9 @@ pub struct OnceState {
     pub(crate) inner: sys::OnceState,
 }
 
-pub(crate) enum ExclusiveState {
+/// Used for the internal implementation of `sys::sync::once` on different platforms and the
+/// [`LazyLock`](crate::sync::LazyLock) implementation.
+pub(crate) enum OnceExclusiveState {
     Incomplete,
     Poisoned,
     Complete,
@@ -61,7 +69,7 @@ pub(crate) enum ExclusiveState {
 #[stable(feature = "rust1", since = "1.0.0")]
 #[deprecated(
     since = "1.38.0",
-    note = "the `new` function is now preferred",
+    note = "the `Once::new()` function is now preferred",
     suggestion = "Once::new()"
 )]
 pub const ONCE_INIT: Once = Once::new();
@@ -130,7 +138,8 @@ impl Once {
     /// it will *poison* this [`Once`] instance, causing all future invocations of
     /// `call_once` to also panic.
     ///
-    /// This is similar to [poisoning with mutexes][poison].
+    /// This is similar to [poisoning with mutexes][poison], but this mechanism
+    /// is guaranteed to never skip panics within `f`.
     ///
     /// [poison]: struct.Mutex.html#poisoning
     #[inline]
@@ -255,14 +264,66 @@ impl Once {
         self.inner.is_completed()
     }
 
+    /// Blocks the current thread until initialization has completed.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use std::sync::Once;
+    /// use std::thread;
+    ///
+    /// static READY: Once = Once::new();
+    ///
+    /// let thread = thread::spawn(|| {
+    ///     READY.wait();
+    ///     println!("everything is ready");
+    /// });
+    ///
+    /// READY.call_once(|| println!("performing setup"));
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// If this [`Once`] has been poisoned because an initialization closure has
+    /// panicked, this method will also panic. Use [`wait_force`](Self::wait_force)
+    /// if this behavior is not desired.
+    #[stable(feature = "once_wait", since = "1.86.0")]
+    pub fn wait(&self) {
+        if !self.inner.is_completed() {
+            self.inner.wait(false);
+        }
+    }
+
+    /// Blocks the current thread until initialization has completed, ignoring
+    /// poisoning.
+    ///
+    /// If this [`Once`] has been poisoned, this function blocks until it
+    /// becomes completed, unlike [`Once::wait()`], which panics in this case.
+    #[stable(feature = "once_wait", since = "1.86.0")]
+    pub fn wait_force(&self) {
+        if !self.inner.is_completed() {
+            self.inner.wait(true);
+        }
+    }
+
     /// Returns the current state of the `Once` instance.
     ///
     /// Since this takes a mutable reference, no initialization can currently
     /// be running, so the state must be either "incomplete", "poisoned" or
     /// "complete".
     #[inline]
-    pub(crate) fn state(&mut self) -> ExclusiveState {
+    pub(crate) fn state(&mut self) -> OnceExclusiveState {
         self.inner.state()
+    }
+
+    /// Sets current state of the `Once` instance.
+    ///
+    /// Since this takes a mutable reference, no initialization can currently
+    /// be running, so the state must be either "incomplete", "poisoned" or
+    /// "complete".
+    #[inline]
+    pub(crate) fn set_state(&mut self, new_state: OnceExclusiveState) {
+        self.inner.set_state(new_state);
     }
 }
 

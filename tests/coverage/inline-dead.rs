@@ -1,5 +1,5 @@
 // Regression test for issue #98833.
-// compile-flags: -Zinline-mir -Cdebug-assertions=off
+//@ compile-flags: -Zinline-mir -Cdebug-assertions=off
 
 fn main() {
     println!("{}", live::<false>());
@@ -13,7 +13,7 @@ fn main() {
 #[inline]
 fn live<const B: bool>() -> u32 {
     if B {
-        dead()
+        dead() //
     } else {
         0
     }

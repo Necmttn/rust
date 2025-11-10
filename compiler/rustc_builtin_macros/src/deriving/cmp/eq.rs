@@ -1,16 +1,15 @@
+use rustc_ast::{self as ast, MetaItem};
+use rustc_data_structures::fx::FxHashSet;
+use rustc_expand::base::{Annotatable, ExtCtxt};
+use rustc_span::{Span, sym};
+use thin_vec::{ThinVec, thin_vec};
+
 use crate::deriving::generic::ty::*;
 use crate::deriving::generic::*;
 use crate::deriving::path_std;
 
-use rustc_ast::{self as ast, MetaItem};
-use rustc_data_structures::fx::FxHashSet;
-use rustc_expand::base::{Annotatable, ExtCtxt};
-use rustc_span::symbol::sym;
-use rustc_span::Span;
-use thin_vec::{thin_vec, ThinVec};
-
-pub fn expand_deriving_eq(
-    cx: &mut ExtCtxt<'_>,
+pub(crate) fn expand_deriving_eq(
+    cx: &ExtCtxt<'_>,
     span: Span,
     mitem: &MetaItem,
     item: &Annotatable,
@@ -18,19 +17,6 @@ pub fn expand_deriving_eq(
     is_const: bool,
 ) {
     let span = cx.with_def_site_ctxt(span);
-
-    let structural_trait_def = TraitDef {
-        span,
-        path: path_std!(marker::StructuralEq),
-        skip_path_as_bound: true, // crucial!
-        needs_copy_as_bound_if_packed: false,
-        additional_bounds: Vec::new(),
-        supports_unions: true,
-        methods: Vec::new(),
-        associated_types: Vec::new(),
-        is_const: false,
-    };
-    structural_trait_def.expand(cx, mitem, item, push);
 
     let trait_def = TraitDef {
         span,
@@ -57,12 +43,13 @@ pub fn expand_deriving_eq(
         }],
         associated_types: Vec::new(),
         is_const,
+        is_staged_api_crate: cx.ecfg.features.staged_api(),
     };
     trait_def.expand_ext(cx, mitem, item, push, true)
 }
 
 fn cs_total_eq_assert(
-    cx: &mut ExtCtxt<'_>,
+    cx: &ExtCtxt<'_>,
     trait_span: Span,
     substr: &Substructure<'_>,
 ) -> BlockOrExpr {

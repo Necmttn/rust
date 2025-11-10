@@ -71,4 +71,43 @@ impl G {
     }
 }
 
+// Check that we honor the `expect` attribute on the ADT
+#[expect(clippy::unsafe_derive_deserialize)]
+#[derive(Deserialize)]
+pub struct H;
+impl H {
+    pub fn unsafe_block(&self) {
+        unsafe {}
+    }
+}
+
 fn main() {}
+
+mod issue15120 {
+    macro_rules! uns {
+        ($e:expr) => {
+            unsafe { $e }
+        };
+    }
+
+    #[derive(serde::Deserialize)]
+    struct Foo;
+
+    impl Foo {
+        fn foo(&self) {
+            // Do not lint if `unsafe` comes from the `core::pin::pin!()` macro
+            std::pin::pin!(());
+        }
+    }
+
+    //~v unsafe_derive_deserialize
+    #[derive(serde::Deserialize)]
+    struct Bar;
+
+    impl Bar {
+        fn bar(&self) {
+            // Lint if `unsafe` comes from the another macro
+            _ = uns!(42);
+        }
+    }
+}

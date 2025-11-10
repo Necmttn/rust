@@ -1,6 +1,8 @@
 #![feature(coverage_attribute)]
-#![feature(noop_waker)]
-// edition: 2018
+//@ edition: 2018
+
+//@ aux-build: executor.rs
+extern crate executor;
 
 macro_rules! bail {
     ($msg:literal $(,)?) => {
@@ -16,7 +18,7 @@ macro_rules! bail {
 macro_rules! on_error {
     ($value:expr, $error_message:expr) => {
         $value.or_else(|e| {
-            // FIXME(85000): no coverage in closure macros
+            // This closure, which is declared in a macro, should be instrumented.
             let message = format!($error_message, e);
             if message.len() > 0 {
                 println!("{}", message);
@@ -44,22 +46,4 @@ pub async fn test() -> Result<(), String> {
 #[coverage(off)]
 fn main() {
     executor::block_on(test()).unwrap();
-}
-
-mod executor {
-    use core::future::Future;
-    use core::pin::pin;
-    use core::task::{Context, Poll, Waker};
-
-    #[coverage(off)]
-    pub fn block_on<F: Future>(mut future: F) -> F::Output {
-        let mut future = pin!(future);
-        let mut context = Context::from_waker(Waker::noop());
-
-        loop {
-            if let Poll::Ready(val) = future.as_mut().poll(&mut context) {
-                break val;
-            }
-        }
-    }
 }

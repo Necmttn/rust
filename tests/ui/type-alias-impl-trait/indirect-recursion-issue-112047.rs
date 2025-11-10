@@ -1,5 +1,4 @@
-// edition: 2021
-// build-fail
+//@ edition: 2021
 
 #![feature(impl_trait_in_assoc_type)]
 

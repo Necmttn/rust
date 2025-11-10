@@ -1,17 +1,18 @@
+use clippy_config::Conf;
 use clippy_utils::diagnostics::{span_lint, span_lint_and_then};
-use clippy_utils::macros::{find_format_args, format_arg_removal_span, root_macro_call_first_node, MacroCall};
-use clippy_utils::source::{expand_past_previous_comma, snippet_opt};
-use clippy_utils::{is_in_cfg_test, is_in_test_function};
+use clippy_utils::macros::{FormatArgsStorage, MacroCall, format_arg_removal_span, root_macro_call_first_node};
+use clippy_utils::source::{SpanRangeExt, expand_past_previous_comma};
+use clippy_utils::{is_in_test, sym};
 use rustc_ast::token::LitKind;
 use rustc_ast::{
-    FormatArgPosition, FormatArgPositionKind, FormatArgs, FormatArgsPiece, FormatOptions, FormatPlaceholder,
-    FormatTrait,
+    FormatArgPosition, FormatArgPositionKind, FormatArgs, FormatArgsPiece, FormatCount, FormatOptions,
+    FormatPlaceholder, FormatTrait,
 };
 use rustc_errors::Applicability;
-use rustc_hir::{Expr, Impl, Item, ItemKind};
+use rustc_hir::{Expr, Impl, Item, ItemKind, OwnerId};
 use rustc_lint::{LateContext, LateLintPass, LintContext};
 use rustc_session::impl_lint_pass;
-use rustc_span::{sym, BytePos, Span};
+use rustc_span::{BytePos, Span};
 
 declare_clippy_lint! {
     /// ### What it does
@@ -66,7 +67,7 @@ declare_clippy_lint! {
     /// Checks for printing on *stdout*. The purpose of this lint
     /// is to catch debugging remnants.
     ///
-    /// ### Why is this bad?
+    /// ### Why restrict this?
     /// People often print on *stdout* while debugging an
     /// application and might forget to remove those prints afterward.
     ///
@@ -88,7 +89,7 @@ declare_clippy_lint! {
     /// Checks for printing on *stderr*. The purpose of this lint
     /// is to catch debugging remnants.
     ///
-    /// ### Why is this bad?
+    /// ### Why restrict this?
     /// People often print on *stderr* while debugging an
     /// application and might forget to remove those prints afterward.
     ///
@@ -110,15 +111,18 @@ declare_clippy_lint! {
     /// Checks for usage of `Debug` formatting. The purpose of this
     /// lint is to catch debugging remnants.
     ///
-    /// ### Why is this bad?
-    /// The purpose of the `Debug` trait is to facilitate
-    /// debugging Rust code. It should not be used in user-facing output.
+    /// ### Why restrict this?
+    /// The purpose of the `Debug` trait is to facilitate debugging Rust code,
+    /// and [no guarantees are made about its output][stability].
+    /// It should not be used in user-facing output.
     ///
     /// ### Example
     /// ```no_run
     /// # let foo = "bar";
     /// println!("{:?}", foo);
     /// ```
+    ///
+    /// [stability]: https://doc.rust-lang.org/stable/std/fmt/trait.Debug.html#stability
     #[clippy::version = "pre 1.29.0"]
     pub USE_DEBUG,
     restriction,
@@ -234,18 +238,24 @@ declare_clippy_lint! {
     "writing a literal with a format string"
 }
 
-#[derive(Default)]
 pub struct Write {
-    in_debug_impl: bool,
+    format_args: FormatArgsStorage,
+    // The outermost `impl Debug` we're currently in. While we're in one, `USE_DEBUG` is deactivated
+    outermost_debug_impl: Option<OwnerId>,
     allow_print_in_tests: bool,
 }
 
 impl Write {
-    pub fn new(allow_print_in_tests: bool) -> Self {
+    pub fn new(conf: &'static Conf, format_args: FormatArgsStorage) -> Self {
         Self {
-            allow_print_in_tests,
-            ..Default::default()
+            format_args,
+            outermost_debug_impl: None,
+            allow_print_in_tests: conf.allow_print_in_tests,
         }
+    }
+
+    fn in_debug_impl(&self) -> bool {
+        self.outermost_debug_impl.is_some()
     }
 }
 
@@ -263,14 +273,16 @@ impl_lint_pass!(Write => [
 
 impl<'tcx> LateLintPass<'tcx> for Write {
     fn check_item(&mut self, cx: &LateContext<'_>, item: &Item<'_>) {
-        if is_debug_impl(cx, item) {
-            self.in_debug_impl = true;
+        // Only check for `impl Debug`s if we're not already in one
+        if self.outermost_debug_impl.is_none() && is_debug_impl(cx, item) {
+            self.outermost_debug_impl = Some(item.owner_id);
         }
     }
 
-    fn check_item_post(&mut self, cx: &LateContext<'_>, item: &Item<'_>) {
-        if is_debug_impl(cx, item) {
-            self.in_debug_impl = false;
+    fn check_item_post(&mut self, _cx: &LateContext<'_>, item: &Item<'_>) {
+        // Only clear `self.outermost_debug_impl` if we're escaping the _outermost_ debug impl
+        if self.outermost_debug_impl == Some(item.owner_id) {
+            self.outermost_debug_impl = None;
         }
     }
 
@@ -290,24 +302,23 @@ impl<'tcx> LateLintPass<'tcx> for Write {
             .opts
             .crate_name
             .as_ref()
-            .map_or(false, |crate_name| crate_name == "build_script_build");
+            .is_some_and(|crate_name| crate_name == "build_script_build");
 
-        let allowed_in_tests = self.allow_print_in_tests
-            && (is_in_test_function(cx.tcx, expr.hir_id) || is_in_cfg_test(cx.tcx, expr.hir_id));
+        let allowed_in_tests = self.allow_print_in_tests && is_in_test(cx.tcx, expr.hir_id);
         match diag_name {
             sym::print_macro | sym::println_macro if !allowed_in_tests => {
                 if !is_build_script {
-                    span_lint(cx, PRINT_STDOUT, macro_call.span, &format!("use of `{name}!`"));
+                    span_lint(cx, PRINT_STDOUT, macro_call.span, format!("use of `{name}!`"));
                 }
             },
             sym::eprint_macro | sym::eprintln_macro if !allowed_in_tests => {
-                span_lint(cx, PRINT_STDERR, macro_call.span, &format!("use of `{name}!`"));
+                span_lint(cx, PRINT_STDERR, macro_call.span, format!("use of `{name}!`"));
             },
             sym::write_macro | sym::writeln_macro => {},
             _ => return,
         }
 
-        if let Some(format_args) = find_format_args(cx, expr, macro_call.expn) {
+        if let Some(format_args) = self.format_args.get(cx, expr, macro_call.expn) {
             // ignore `writeln!(w)` and `write!(v, some_macro!())`
             if format_args.span.from_expansion() {
                 return;
@@ -315,17 +326,17 @@ impl<'tcx> LateLintPass<'tcx> for Write {
 
             match diag_name {
                 sym::print_macro | sym::eprint_macro | sym::write_macro => {
-                    check_newline(cx, &format_args, &macro_call, name);
+                    check_newline(cx, format_args, &macro_call, name);
                 },
                 sym::println_macro | sym::eprintln_macro | sym::writeln_macro => {
-                    check_empty_string(cx, &format_args, &macro_call, name);
+                    check_empty_string(cx, format_args, &macro_call, name);
                 },
                 _ => {},
             }
 
-            check_literal(cx, &format_args, name);
+            check_literal(cx, format_args, name);
 
-            if !self.in_debug_impl {
+            if !self.in_debug_impl() {
                 for piece in &format_args.template {
                     if let &FormatArgsPiece::Placeholder(FormatPlaceholder {
                         span: Some(span),
@@ -343,10 +354,10 @@ impl<'tcx> LateLintPass<'tcx> for Write {
 
 fn is_debug_impl(cx: &LateContext<'_>, item: &Item<'_>) -> bool {
     if let ItemKind::Impl(Impl {
-        of_trait: Some(trait_ref),
+        of_trait: Some(of_trait),
         ..
     }) = &item.kind
-        && let Some(trait_id) = trait_ref.trait_def_id()
+        && let Some(trait_id) = of_trait.trait_ref.trait_def_id()
     {
         cx.tcx.is_diagnostic_item(sym::Debug, trait_id)
     } else {
@@ -355,7 +366,7 @@ fn is_debug_impl(cx: &LateContext<'_>, item: &Item<'_>) -> bool {
 }
 
 fn check_newline(cx: &LateContext<'_>, format_args: &FormatArgs, macro_call: &MacroCall, name: &str) {
-    let Some(FormatArgsPiece::Literal(last)) = format_args.template.last() else {
+    let Some(&FormatArgsPiece::Literal(last)) = format_args.template.last() else {
         return;
     };
 
@@ -390,14 +401,14 @@ fn check_newline(cx: &LateContext<'_>, format_args: &FormatArgs, macro_call: &Ma
             cx,
             lint,
             macro_call.span,
-            &format!("using `{name}!()` with a format string that ends in a single newline"),
+            format!("using `{name}!()` with a format string that ends in a single newline"),
             |diag| {
                 let name_span = cx.sess().source_map().span_until_char(macro_call.span, '!');
-                let Some(format_snippet) = snippet_opt(cx, format_string_span) else {
+                let Some(format_snippet) = format_string_span.get_source_text(cx) else {
                     return;
                 };
 
-                if format_args.template.len() == 1 && last.as_str() == "\n" {
+                if format_args.template.len() == 1 && last == sym::LF {
                     // print!("\n"), write!(f, "\n")
 
                     diag.multipart_suggestion(
@@ -423,9 +434,7 @@ fn check_newline(cx: &LateContext<'_>, format_args: &FormatArgs, macro_call: &Ma
 }
 
 fn check_empty_string(cx: &LateContext<'_>, format_args: &FormatArgs, macro_call: &MacroCall, name: &str) {
-    if let [FormatArgsPiece::Literal(literal)] = &format_args.template[..]
-        && literal.as_str() == "\n"
-    {
+    if let [FormatArgsPiece::Literal(sym::LF)] = &format_args.template[..] {
         let mut span = format_args.span;
 
         let lint = if name == "writeln" {
@@ -440,7 +449,7 @@ fn check_empty_string(cx: &LateContext<'_>, format_args: &FormatArgs, macro_call
             cx,
             lint,
             macro_call.span,
-            &format!("empty string literal in `{name}!`"),
+            format!("empty string literal in `{name}!`"),
             |diag| {
                 diag.span_suggestion(
                     span,
@@ -488,7 +497,7 @@ fn check_literal(cx: &LateContext<'_>, format_args: &FormatArgs, name: &str) {
             && let Some(arg) = format_args.arguments.by_index(index)
             && let rustc_ast::ExprKind::Lit(lit) = &arg.expr.kind
             && !arg.expr.span.from_expansion()
-            && let Some(value_string) = snippet_opt(cx, arg.expr.span)
+            && let Some(value_string) = arg.expr.span.get_source_text(cx)
         {
             let (replacement, replace_raw) = match lit.kind {
                 LitKind::Str | LitKind::StrRaw(_) => match extract_str_literal(&value_string) {
@@ -496,9 +505,9 @@ fn check_literal(cx: &LateContext<'_>, format_args: &FormatArgs, name: &str) {
                     None => return,
                 },
                 LitKind::Char => (
-                    match lit.symbol.as_str() {
-                        "\"" => "\\\"",
-                        "\\'" => "'",
+                    match lit.symbol {
+                        sym::DOUBLE_QUOTE => "\\\"",
+                        sym::BACKSLASH_SINGLE_QUOTE => "'",
                         _ => match value_string.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) {
                             Some(stripped) => stripped,
                             None => return,
@@ -511,14 +520,14 @@ fn check_literal(cx: &LateContext<'_>, format_args: &FormatArgs, name: &str) {
                 _ => continue,
             };
 
-            let Some(format_string_snippet) = snippet_opt(cx, format_args.span) else {
+            let Some(format_string_snippet) = format_args.span.get_source_text(cx) else {
                 continue;
             };
             let format_string_is_raw = format_string_snippet.starts_with('r');
 
             let replacement = match (format_string_is_raw, replace_raw) {
                 (false, false) => Some(replacement),
-                (false, true) => Some(replacement.replace('"', "\\\"").replace('\\', "\\\\")),
+                (false, true) => Some(replacement.replace('\\', "\\\\").replace('"', "\\\"")),
                 (true, false) => match conservative_unescape(&replacement) {
                     Ok(unescaped) => Some(unescaped),
                     Err(UnescapeErr::Lint) => None,
@@ -535,7 +544,7 @@ fn check_literal(cx: &LateContext<'_>, format_args: &FormatArgs, name: &str) {
 
             sug_span = Some(sug_span.unwrap_or(arg.expr.span).to(arg.expr.span));
 
-            if let Some((_, index)) = positional_arg_piece_span(piece) {
+            if let Some((_, index)) = format_arg_piece_span(piece) {
                 replaced_position.push(index);
             }
 
@@ -554,12 +563,7 @@ fn check_literal(cx: &LateContext<'_>, format_args: &FormatArgs, name: &str) {
     // Decrement the index of the remaining by the number of replaced positional arguments
     if !suggestion.is_empty() {
         for piece in &format_args.template {
-            if let Some((span, index)) = positional_arg_piece_span(piece)
-                && suggestion.iter().all(|(s, _)| *s != span)
-            {
-                let decrement = replaced_position.iter().filter(|i| **i < index).count();
-                suggestion.push((span, format!("{{{}}}", index.saturating_sub(decrement))));
-            }
+            relocalize_format_args_indexes(piece, &mut suggestion, &replaced_position);
         }
     }
 
@@ -572,20 +576,66 @@ fn check_literal(cx: &LateContext<'_>, format_args: &FormatArgs, name: &str) {
     }
 }
 
-/// Extract Span and its index from the given `piece`, iff it's positional argument.
-fn positional_arg_piece_span(piece: &FormatArgsPiece) -> Option<(Span, usize)> {
+/// Extract Span and its index from the given `piece`
+fn format_arg_piece_span(piece: &FormatArgsPiece) -> Option<(Span, usize)> {
     match piece {
         FormatArgsPiece::Placeholder(FormatPlaceholder {
-            argument:
-                FormatArgPosition {
-                    index: Ok(index),
-                    kind: FormatArgPositionKind::Number,
-                    ..
-                },
+            argument: FormatArgPosition { index: Ok(index), .. },
             span: Some(span),
             ..
         }) => Some((*span, *index)),
         _ => None,
+    }
+}
+
+/// Relocalizes the indexes of positional arguments in the format string
+fn relocalize_format_args_indexes(
+    piece: &FormatArgsPiece,
+    suggestion: &mut Vec<(Span, String)>,
+    replaced_position: &[usize],
+) {
+    if let FormatArgsPiece::Placeholder(FormatPlaceholder {
+        argument:
+            FormatArgPosition {
+                index: Ok(index),
+                // Only consider positional arguments
+                kind: FormatArgPositionKind::Number,
+                span: Some(span),
+            },
+        format_options,
+        ..
+    }) = piece
+    {
+        if suggestion.iter().any(|(s, _)| s.overlaps(*span)) {
+            // If the span is already in the suggestion, we don't need to process it again
+            return;
+        }
+
+        // lambda to get the decremented index based on the replaced positions
+        let decremented_index = |index: usize| -> usize {
+            let decrement = replaced_position.iter().filter(|&&i| i < index).count();
+            index - decrement
+        };
+
+        suggestion.push((*span, decremented_index(*index).to_string()));
+
+        // If there are format options, we need to handle them as well
+        if *format_options != FormatOptions::default() {
+            // lambda to process width and precision format counts and add them to the suggestion
+            let mut process_format_count = |count: &Option<FormatCount>, formatter: &dyn Fn(usize) -> String| {
+                if let Some(FormatCount::Argument(FormatArgPosition {
+                    index: Ok(format_arg_index),
+                    kind: FormatArgPositionKind::Number,
+                    span: Some(format_arg_span),
+                })) = count
+                {
+                    suggestion.push((*format_arg_span, formatter(decremented_index(*format_arg_index))));
+                }
+            };
+
+            process_format_count(&format_options.width, &|index: usize| format!("{index}$"));
+            process_format_count(&format_options.precision, &|index: usize| format!(".{index}$"));
+        }
     }
 }
 

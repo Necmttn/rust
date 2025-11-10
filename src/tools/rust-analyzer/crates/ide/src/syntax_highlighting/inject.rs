@@ -3,89 +3,69 @@
 use std::mem;
 
 use either::Either;
-use hir::{InFile, Semantics};
+use hir::{EditionedFileId, HirFileId, InFile, Semantics, sym};
+use ide_db::range_mapper::RangeMapper;
 use ide_db::{
-    active_parameter::ActiveParameter, base_db::FileId, defs::Definition,
-    documentation::docs_with_rangemap, rust_doc::is_rust_fence, SymbolKind,
+    SymbolKind, defs::Definition, documentation::docs_with_rangemap, rust_doc::is_rust_fence,
 };
 use syntax::{
-    ast::{self, AstNode, IsString, QuoteOffsets},
     AstToken, NodeOrToken, SyntaxNode, TextRange, TextSize,
+    ast::{self, AstNode, IsString, QuoteOffsets},
 };
 
 use crate::{
-    doc_links::{doc_attributes, extract_definitions_from_docs, resolve_doc_path_for_def},
-    syntax_highlighting::{highlights::Highlights, injector::Injector, HighlightConfig},
     Analysis, HlMod, HlRange, HlTag, RootDatabase,
+    doc_links::{doc_attributes, extract_definitions_from_docs, resolve_doc_path_for_def},
+    syntax_highlighting::{HighlightConfig, highlights::Highlights},
 };
 
 pub(super) fn ra_fixture(
     hl: &mut Highlights,
     sema: &Semantics<'_, RootDatabase>,
-    config: HighlightConfig,
+    config: &HighlightConfig<'_>,
     literal: &ast::String,
     expanded: &ast::String,
 ) -> Option<()> {
-    let active_parameter = ActiveParameter::at_token(sema, expanded.syntax().clone())?;
-    if !active_parameter.ident().map_or(false, |name| name.text().starts_with("ra_fixture")) {
-        return None;
-    }
-    let value = literal.value()?;
+    let (analysis, fixture_analysis) = Analysis::from_ra_fixture_with_on_cursor(
+        sema,
+        literal.clone(),
+        expanded,
+        config.minicore,
+        &mut |range| {
+            hl.add(HlRange {
+                range,
+                highlight: HlTag::Keyword | HlMod::Injected,
+                binding_hash: None,
+            });
+        },
+    )?;
 
     if let Some(range) = literal.open_quote_text_range() {
         hl.add(HlRange { range, highlight: HlTag::StringLiteral.into(), binding_hash: None })
     }
 
-    let mut inj = Injector::default();
-
-    let mut text = &*value;
-    let mut offset: TextSize = 0.into();
-
-    while !text.is_empty() {
-        let marker = "$0";
-        let idx = text.find(marker).unwrap_or(text.len());
-        let (chunk, next) = text.split_at(idx);
-        inj.add(chunk, TextRange::at(offset, TextSize::of(chunk)));
-
-        text = next;
-        offset += TextSize::of(chunk);
-
-        if let Some(next) = text.strip_prefix(marker) {
-            if let Some(range) = literal.map_range_up(TextRange::at(offset, TextSize::of(marker))) {
-                hl.add(HlRange {
-                    range,
-                    highlight: HlTag::Keyword | HlMod::Injected,
-                    binding_hash: None,
-                });
-            }
-
-            text = next;
-
-            let marker_len = TextSize::of(marker);
-            offset += marker_len;
-        }
-    }
-
-    let (analysis, tmp_file_id) = Analysis::from_single_file(inj.take_text());
-
-    for mut hl_range in analysis
-        .highlight(
-            HighlightConfig {
-                syntactic_name_ref_highlighting: false,
-                punctuation: true,
-                operator: true,
-                strings: true,
-                specialize_punctuation: config.specialize_punctuation,
-                specialize_operator: config.operator,
-                inject_doc_comment: config.inject_doc_comment,
-                macro_bang: config.macro_bang,
-            },
-            tmp_file_id,
-        )
-        .unwrap()
-    {
-        for range in inj.map_range_up(hl_range.range) {
-            if let Some(range) = literal.map_range_up(range) {
+    for tmp_file_id in fixture_analysis.files() {
+        for mut hl_range in analysis
+            .highlight(
+                HighlightConfig {
+                    syntactic_name_ref_highlighting: false,
+                    comments: true,
+                    punctuation: true,
+                    operator: true,
+                    strings: true,
+                    specialize_punctuation: config.specialize_punctuation,
+                    specialize_operator: config.operator,
+                    inject_doc_comment: config.inject_doc_comment,
+                    macro_bang: config.macro_bang,
+                    // What if there is a fixture inside a fixture? It's fixtures all the way down.
+                    // (In fact, we have a fixture inside a fixture in our test suite!)
+                    minicore: config.minicore,
+                },
+                tmp_file_id,
+            )
+            .unwrap()
+        {
+            for range in fixture_analysis.map_range_up(tmp_file_id, hl_range.range) {
                 hl_range.range = range;
                 hl_range.highlight |= HlMod::Injected;
                 hl.add(hl_range);
@@ -107,26 +87,33 @@ const RUSTDOC_FENCES: [&str; 2] = ["```", "~~~"];
 pub(super) fn doc_comment(
     hl: &mut Highlights,
     sema: &Semantics<'_, RootDatabase>,
-    config: HighlightConfig,
-    src_file_id: FileId,
+    config: &HighlightConfig<'_>,
+    src_file_id: EditionedFileId,
     node: &SyntaxNode,
 ) {
     let (attributes, def) = match doc_attributes(sema, node) {
         Some(it) => it,
         None => return,
     };
-    let src_file_id = src_file_id.into();
+    let src_file_id: HirFileId = src_file_id.into();
 
     // Extract intra-doc links and emit highlights for them.
     if let Some((docs, doc_mapping)) = docs_with_rangemap(sema.db, &attributes) {
         extract_definitions_from_docs(&docs)
             .into_iter()
             .filter_map(|(range, link, ns)| {
-                doc_mapping.map(range).filter(|mapping| mapping.file_id == src_file_id).and_then(
-                    |InFile { value: mapped_range, .. }| {
-                        Some(mapped_range).zip(resolve_doc_path_for_def(sema.db, def, &link, ns))
-                    },
-                )
+                doc_mapping
+                    .map(range)
+                    .filter(|(mapping, _)| mapping.file_id == src_file_id)
+                    .and_then(|(InFile { value: mapped_range, .. }, attr_id)| {
+                        Some(mapped_range).zip(resolve_doc_path_for_def(
+                            sema.db,
+                            def,
+                            &link,
+                            ns,
+                            attr_id.is_inner_attr(),
+                        ))
+                    })
             })
             .for_each(|(range, def)| {
                 hl.add(HlRange {
@@ -137,12 +124,12 @@ pub(super) fn doc_comment(
                         | HlMod::IntraDocLink,
                     binding_hash: None,
                 })
-            });
+            })
     }
 
     // Extract doc-test sources from the docs and calculate highlighting for them.
 
-    let mut inj = Injector::default();
+    let mut inj = RangeMapper::default();
     inj.add_unmapped("fn doctest() {\n");
 
     let attrs_source_map = attributes.source_map(sema.db);
@@ -153,7 +140,7 @@ pub(super) fn doc_comment(
     let mut new_comments = Vec::new();
     let mut string;
 
-    for attr in attributes.by_key("doc").attrs() {
+    for attr in attributes.by_key(sym::doc).attrs() {
         let InFile { file_id, value: src } = attrs_source_map.source_of(attr);
         if file_id != src_file_id {
             continue;
@@ -231,8 +218,9 @@ pub(super) fn doc_comment(
     if let Ok(ranges) = analysis.with_db(|db| {
         super::highlight(
             db,
-            HighlightConfig {
+            &HighlightConfig {
                 syntactic_name_ref_highlighting: true,
+                comments: true,
                 punctuation: true,
                 operator: true,
                 strings: true,
@@ -240,6 +228,7 @@ pub(super) fn doc_comment(
                 specialize_operator: config.operator,
                 inject_doc_comment: config.inject_doc_comment,
                 macro_bang: config.macro_bang,
+                minicore: config.minicore,
             },
             tmp_file_id,
             None,
@@ -271,16 +260,14 @@ fn find_doc_string_in_attr(attr: &hir::Attr, it: &ast::Attr) -> Option<ast::Stri
         // #[cfg_attr(..., doc = "", ...)]
         None => {
             // We gotta hunt the string token manually here
-            let text = attr.string_value()?;
+            let text = attr.string_value()?.as_str();
             // FIXME: We just pick the first string literal that has the same text as the doc attribute
             // This means technically we might highlight the wrong one
             it.syntax()
                 .descendants_with_tokens()
                 .filter_map(NodeOrToken::into_token)
                 .filter_map(ast::String::cast)
-                .find(|string| {
-                    string.text().get(1..string.text().len() - 1).map_or(false, |it| it == text)
-                })
+                .find(|string| string.text().get(1..string.text().len() - 1) == Some(text))
         }
         _ => None,
     }
@@ -288,7 +275,9 @@ fn find_doc_string_in_attr(attr: &hir::Attr, it: &ast::Attr) -> Option<ast::Stri
 
 fn module_def_to_hl_tag(def: Definition) -> HlTag {
     let symbol = match def {
-        Definition::Module(_) | Definition::ExternCrateDecl(_) => SymbolKind::Module,
+        Definition::Module(_) | Definition::Crate(_) | Definition::ExternCrateDecl(_) => {
+            SymbolKind::Module
+        }
         Definition::Function(_) => SymbolKind::Function,
         Definition::Adt(hir::Adt::Struct(_)) => SymbolKind::Struct,
         Definition::Adt(hir::Adt::Enum(_)) => SymbolKind::Enum,
@@ -297,8 +286,8 @@ fn module_def_to_hl_tag(def: Definition) -> HlTag {
         Definition::Const(_) => SymbolKind::Const,
         Definition::Static(_) => SymbolKind::Static,
         Definition::Trait(_) => SymbolKind::Trait,
-        Definition::TraitAlias(_) => SymbolKind::TraitAlias,
         Definition::TypeAlias(_) => SymbolKind::TypeAlias,
+        Definition::BuiltinLifetime(_) => SymbolKind::LifetimeParam,
         Definition::BuiltinType(_) => return HlTag::BuiltinType,
         Definition::Macro(_) => SymbolKind::Macro,
         Definition::Field(_) | Definition::TupleField(_) => SymbolKind::Field,
@@ -313,6 +302,8 @@ fn module_def_to_hl_tag(def: Definition) -> HlTag {
         Definition::BuiltinAttr(_) => SymbolKind::BuiltinAttr,
         Definition::ToolModule(_) => SymbolKind::ToolModule,
         Definition::DeriveHelper(_) => SymbolKind::DeriveHelper,
+        Definition::InlineAsmRegOrRegClass(_) => SymbolKind::InlineAsmRegOrRegClass,
+        Definition::InlineAsmOperand(_) => SymbolKind::Local,
     };
     HlTag::Symbol(symbol)
 }

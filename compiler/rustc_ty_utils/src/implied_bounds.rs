@@ -1,11 +1,13 @@
+use std::iter;
+
 use rustc_data_structures::fx::FxHashMap;
 use rustc_hir as hir;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::LocalDefId;
 use rustc_middle::query::Providers;
-use rustc_middle::ty::{self, Ty, TyCtxt};
+use rustc_middle::ty::{self, Ty, TyCtxt, fold_regions};
+use rustc_middle::{bug, span_bug};
 use rustc_span::Span;
-use std::iter;
 
 pub(crate) fn provide(providers: &mut Providers) {
     *providers = Providers {
@@ -19,7 +21,8 @@ pub(crate) fn provide(providers: &mut Providers) {
 }
 
 fn assumed_wf_types<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> &'tcx [(Ty<'tcx>, Span)] {
-    match tcx.def_kind(def_id) {
+    let kind = tcx.def_kind(def_id);
+    match kind {
         DefKind::Fn => {
             let sig = tcx.fn_sig(def_id).instantiate_identity();
             let liberated_sig = tcx.liberate_late_bound_regions(def_id.to_def_id(), sig);
@@ -39,12 +42,14 @@ fn assumed_wf_types<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> &'tcx [(Ty<'
             ));
             tcx.arena.alloc_slice(&assumed_wf_types)
         }
-        DefKind::Impl { .. } => {
+        DefKind::Impl { of_trait } => {
             // Trait arguments and the self type for trait impls or only the self type for
             // inherent impls.
-            let tys = match tcx.impl_trait_ref(def_id) {
-                Some(trait_ref) => trait_ref.skip_binder().args.types().collect(),
-                None => vec![tcx.type_of(def_id).instantiate_identity()],
+            let tys = if of_trait {
+                let trait_ref = tcx.impl_trait_ref(def_id);
+                trait_ref.skip_binder().args.types().collect()
+            } else {
+                vec![tcx.type_of(def_id).instantiate_identity()]
             };
 
             let mut impl_spans = impl_spans(tcx, def_id);
@@ -69,25 +74,23 @@ fn assumed_wf_types<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> &'tcx [(Ty<'
                     // case, since it has been liberated), map it back to the early-bound lifetime of
                     // the GAT. Since RPITITs also have all of the fn's generics, we slice only
                     // the end of the list corresponding to the opaque's generics.
-                    for param in &generics.params[tcx.generics_of(fn_def_id).params.len()..] {
+                    for param in &generics.own_params[tcx.generics_of(fn_def_id).own_params.len()..]
+                    {
                         let orig_lt =
-                            tcx.map_rpit_lifetime_to_fn_lifetime(param.def_id.expect_local());
-                        if matches!(*orig_lt, ty::ReLateParam(..)) {
+                            tcx.map_opaque_lifetime_to_parent_lifetime(param.def_id.expect_local());
+                        if matches!(orig_lt.kind(), ty::ReLateParam(..)) {
                             mapping.insert(
                                 orig_lt,
                                 ty::Region::new_early_param(
                                     tcx,
-                                    ty::EarlyParamRegion {
-                                        def_id: param.def_id,
-                                        index: param.index,
-                                        name: param.name,
-                                    },
+                                    ty::EarlyParamRegion { index: param.index, name: param.name },
                                 ),
                             );
                         }
                     }
                     // FIXME: This could use a real folder, I guess.
-                    let remapped_wf_tys = tcx.fold_regions(
+                    let remapped_wf_tys = fold_regions(
+                        tcx,
                         tcx.assumed_wf_types(fn_def_id.expect_local()).to_vec(),
                         |region, _| {
                             // If `region` is a `ReLateParam` that is captured by the
@@ -106,11 +109,11 @@ fn assumed_wf_types<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> &'tcx [(Ty<'
                 // the assumed wf types of the trait's RPITIT GAT.
                 ty::ImplTraitInTraitData::Impl { .. } => {
                     let impl_def_id = tcx.local_parent(def_id);
-                    let rpitit_def_id = tcx.associated_item(def_id).trait_item_def_id.unwrap();
+                    let rpitit_def_id = tcx.trait_item_of(def_id).unwrap();
                     let args = ty::GenericArgs::identity_for_item(tcx, def_id).rebase_onto(
                         tcx,
                         impl_def_id.to_def_id(),
-                        tcx.impl_trait_ref(impl_def_id).unwrap().instantiate_identity().args,
+                        tcx.impl_trait_ref(impl_def_id).instantiate_identity().args,
                     );
                     tcx.arena.alloc_from_iter(
                         ty::EarlyBinder::bind(tcx.assumed_wf_types_for_rpitit(rpitit_def_id))
@@ -121,46 +124,42 @@ fn assumed_wf_types<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> &'tcx [(Ty<'
             }
         }
         DefKind::AssocConst | DefKind::AssocTy => tcx.assumed_wf_types(tcx.local_parent(def_id)),
-        DefKind::OpaqueTy => match tcx.def_kind(tcx.local_parent(def_id)) {
-            DefKind::TyAlias => ty::List::empty(),
-            DefKind::AssocTy => tcx.assumed_wf_types(tcx.local_parent(def_id)),
-            // Nested opaque types only occur in associated types:
-            // ` type Opaque<T> = impl Trait<&'static T, AssocTy = impl Nested>; `
-            // assumed_wf_types should include those of `Opaque<T>`, `Opaque<T>` itself
-            // and `&'static T`.
-            DefKind::OpaqueTy => bug!("unimplemented implied bounds for nested opaque types"),
-            def_kind => {
-                bug!("unimplemented implied bounds for opaque types with parent {def_kind:?}")
-            }
-        },
-        DefKind::Mod
+        DefKind::Static { .. }
+        | DefKind::Const
+        | DefKind::AnonConst
+        | DefKind::InlineConst
         | DefKind::Struct
         | DefKind::Union
         | DefKind::Enum
-        | DefKind::Variant
         | DefKind::Trait
-        | DefKind::TyAlias
-        | DefKind::ForeignTy
         | DefKind::TraitAlias
+        | DefKind::TyAlias => ty::List::empty(),
+        DefKind::OpaqueTy
+        | DefKind::Mod
+        | DefKind::Variant
+        | DefKind::ForeignTy
         | DefKind::TyParam
-        | DefKind::Const
         | DefKind::ConstParam
-        | DefKind::Static(_)
         | DefKind::Ctor(_, _)
         | DefKind::Macro(_)
         | DefKind::ExternCrate
         | DefKind::Use
         | DefKind::ForeignMod
-        | DefKind::AnonConst
-        | DefKind::InlineConst
         | DefKind::Field
         | DefKind::LifetimeParam
         | DefKind::GlobalAsm
-        | DefKind::Closure => ty::List::empty(),
+        | DefKind::Closure
+        | DefKind::SyntheticCoroutineBody => {
+            span_bug!(
+                tcx.def_span(def_id),
+                "`assumed_wf_types` not defined for {} `{def_id:?}`",
+                kind.descr(def_id.to_def_id())
+            );
+        }
     }
 }
 
-fn fn_sig_spans(tcx: TyCtxt<'_>, def_id: LocalDefId) -> impl Iterator<Item = Span> + '_ {
+fn fn_sig_spans(tcx: TyCtxt<'_>, def_id: LocalDefId) -> impl Iterator<Item = Span> {
     let node = tcx.hir_node_by_def_id(def_id);
     if let Some(decl) = node.fn_decl() {
         decl.inputs.iter().map(|ty| ty.span).chain(iter::once(decl.output.span()))
@@ -169,16 +168,18 @@ fn fn_sig_spans(tcx: TyCtxt<'_>, def_id: LocalDefId) -> impl Iterator<Item = Spa
     }
 }
 
-fn impl_spans(tcx: TyCtxt<'_>, def_id: LocalDefId) -> impl Iterator<Item = Span> + '_ {
-    let item = tcx.hir().expect_item(def_id);
+fn impl_spans(tcx: TyCtxt<'_>, def_id: LocalDefId) -> impl Iterator<Item = Span> {
+    let item = tcx.hir_expect_item(def_id);
     if let hir::ItemKind::Impl(impl_) = item.kind {
         let trait_args = impl_
             .of_trait
             .into_iter()
-            .flat_map(|trait_ref| trait_ref.path.segments.last().unwrap().args().args)
+            .flat_map(|of_trait| of_trait.trait_ref.path.segments.last().unwrap().args().args)
             .map(|arg| arg.span());
-        let dummy_spans_for_default_args =
-            impl_.of_trait.into_iter().flat_map(|trait_ref| iter::repeat(trait_ref.path.span));
+        let dummy_spans_for_default_args = impl_
+            .of_trait
+            .into_iter()
+            .flat_map(|of_trait| iter::repeat(of_trait.trait_ref.path.span));
         iter::once(impl_.self_ty.span).chain(trait_args).chain(dummy_spans_for_default_args)
     } else {
         bug!("unexpected item for impl {def_id:?}: {item:?}")

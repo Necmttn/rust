@@ -1,12 +1,13 @@
-// run-pass
-// compile-flags:--test -O
+//@ run-pass
+//@ compile-flags:--test -O
 
-// needs-unwind
+//@ needs-unwind
 
 #[test]
 #[should_panic(expected = "creating inhabited type")]
 fn test() {
     FontLanguageOverride::system_font(SystemFont::new());
+    //~^ WARNING unreachable expression
 }
 
 pub enum FontLanguageOverride {

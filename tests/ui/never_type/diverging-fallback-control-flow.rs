@@ -1,10 +1,12 @@
-// revisions: nofallback fallback
-// run-pass
+//@ revisions: nofallback fallback
+//@ check-pass
 
 #![allow(dead_code)]
 #![allow(unused_assignments)]
 #![allow(unused_variables)]
 #![allow(unreachable_code)]
+#![cfg_attr(nofallback, expect(dependency_on_unit_never_type_fallback))]
+
 // Test various cases where we permit an unconstrained variable
 // to fallback based on control-flow. In all of these cases,
 // the type variable winds up being the target of both a `!` coercion

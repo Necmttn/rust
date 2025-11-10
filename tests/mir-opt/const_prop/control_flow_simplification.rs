@@ -1,7 +1,6 @@
-// skip-filecheck
 // EMIT_MIR_FOR_EACH_PANIC_STRATEGY
-// unit-test: GVN
-// compile-flags: -Zmir-opt-level=1
+//@ test-mir-pass: GVN
+//@ compile-flags: -Zmir-opt-level=1
 
 trait NeedsDrop: Sized {
     const NEEDS: bool = std::mem::needs_drop::<Self>();
@@ -11,7 +10,10 @@ impl<This> NeedsDrop for This {}
 
 // EMIT_MIR control_flow_simplification.hello.GVN.diff
 // EMIT_MIR control_flow_simplification.hello.PreCodegen.before.mir
-fn hello<T>(){
+fn hello<T>() {
+    // CHECK-LABEL: fn hello(
+    // CHECK: bb0:
+    // CHECK-NEXT: return;
     if <bool>::NEEDS {
         panic!()
     }

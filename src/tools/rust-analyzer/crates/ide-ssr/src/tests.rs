@@ -1,7 +1,8 @@
-use expect_test::{expect, Expect};
+use expect_test::{Expect, expect};
+use hir::{FilePosition, FileRange};
 use ide_db::{
-    base_db::{salsa::Durability, FileId, FilePosition, FileRange, SourceDatabaseExt},
-    FxHashSet,
+    EditionedFileId, FxHashSet,
+    base_db::{SourceDatabase, salsa::Durability},
 };
 use test_utils::RangeOrOffset;
 use triomphe::Arc;
@@ -66,7 +67,7 @@ fn parser_undefined_placeholder_in_replacement() {
 /// the start of the file. If there's a second cursor marker, then we'll return a single range.
 pub(crate) fn single_file(code: &str) -> (ide_db::RootDatabase, FilePosition, Vec<FileRange>) {
     use ide_db::symbol_index::SymbolsDatabase;
-    use test_fixture::{WithFixture, WORKSPACE};
+    use test_fixture::{WORKSPACE, WithFixture};
     let (mut db, file_id, range_or_offset) = if code.contains(test_utils::CURSOR_MARKER) {
         ide_db::RootDatabase::with_range_or_offset(code)
     } else {
@@ -97,23 +98,41 @@ fn assert_ssr_transform(rule: &str, input: &str, expected: Expect) {
 
 fn assert_ssr_transforms(rules: &[&str], input: &str, expected: Expect) {
     let (db, position, selections) = single_file(input);
-    let mut match_finder = MatchFinder::in_context(&db, position, selections).unwrap();
-    for rule in rules {
-        let rule: SsrRule = rule.parse().unwrap();
-        match_finder.add_rule(rule).unwrap();
-    }
-    let edits = match_finder.edits();
-    if edits.is_empty() {
-        panic!("No edits were made");
-    }
-    // Note, db.file_text is not necessarily the same as `input`, since fixture parsing alters
-    // stuff.
-    let mut actual = db.file_text(position.file_id).to_string();
-    edits[&position.file_id].apply(&mut actual);
-    expected.assert_eq(&actual);
+    hir::attach_db(&db, || {
+        let position = ide_db::FilePosition {
+            file_id: position.file_id.file_id(&db),
+            offset: position.offset,
+        };
+        let mut match_finder = MatchFinder::in_context(
+            &db,
+            position,
+            selections
+                .into_iter()
+                .map(|selection| ide_db::FileRange {
+                    file_id: selection.file_id.file_id(&db),
+                    range: selection.range,
+                })
+                .collect(),
+        )
+        .unwrap();
+        for rule in rules {
+            let rule: SsrRule = rule.parse().unwrap();
+            match_finder.add_rule(rule).unwrap();
+        }
+        let edits = match_finder.edits();
+        if edits.is_empty() {
+            panic!("No edits were made");
+        }
+        // Note, db.file_text is not necessarily the same as `input`, since fixture parsing alters
+        // stuff.
+        let mut actual = db.file_text(position.file_id).text(&db).to_string();
+        edits[&position.file_id].apply(&mut actual);
+        expected.assert_eq(&actual);
+    })
 }
 
-fn print_match_debug_info(match_finder: &MatchFinder<'_>, file_id: FileId, snippet: &str) {
+#[allow(clippy::print_stdout)]
+fn print_match_debug_info(match_finder: &MatchFinder<'_>, file_id: EditionedFileId, snippet: &str) {
     let debug_info = match_finder.debug_where_text_equal(file_id, snippet);
     println!(
         "Match debug info: {} nodes had text exactly equal to '{}'",
@@ -127,30 +146,73 @@ fn print_match_debug_info(match_finder: &MatchFinder<'_>, file_id: FileId, snipp
 
 fn assert_matches(pattern: &str, code: &str, expected: &[&str]) {
     let (db, position, selections) = single_file(code);
-    let mut match_finder = MatchFinder::in_context(&db, position, selections).unwrap();
-    match_finder.add_search_pattern(pattern.parse().unwrap()).unwrap();
-    let matched_strings: Vec<String> =
-        match_finder.matches().flattened().matches.iter().map(|m| m.matched_text()).collect();
-    if matched_strings != expected && !expected.is_empty() {
-        print_match_debug_info(&match_finder, position.file_id, expected[0]);
-    }
-    assert_eq!(matched_strings, expected);
+    hir::attach_db(&db, || {
+        let mut match_finder = MatchFinder::in_context(
+            &db,
+            ide_db::FilePosition {
+                file_id: position.file_id.file_id(&db),
+                offset: position.offset,
+            },
+            selections
+                .into_iter()
+                .map(|selection| ide_db::FileRange {
+                    file_id: selection.file_id.file_id(&db),
+                    range: selection.range,
+                })
+                .collect(),
+        )
+        .unwrap();
+        match_finder.add_search_pattern(pattern.parse().unwrap()).unwrap();
+        let matched_strings: Vec<String> =
+            match_finder.matches().flattened().matches.iter().map(|m| m.matched_text()).collect();
+        if matched_strings != expected && !expected.is_empty() {
+            print_match_debug_info(&match_finder, position.file_id, expected[0]);
+        }
+        assert_eq!(matched_strings, expected);
+    })
 }
 
 fn assert_no_match(pattern: &str, code: &str) {
     let (db, position, selections) = single_file(code);
-    let mut match_finder = MatchFinder::in_context(&db, position, selections).unwrap();
-    match_finder.add_search_pattern(pattern.parse().unwrap()).unwrap();
-    let matches = match_finder.matches().flattened().matches;
-    if !matches.is_empty() {
-        print_match_debug_info(&match_finder, position.file_id, &matches[0].matched_text());
-        panic!("Got {} matches when we expected none: {matches:#?}", matches.len());
-    }
+    hir::attach_db(&db, || {
+        let mut match_finder = MatchFinder::in_context(
+            &db,
+            ide_db::FilePosition {
+                file_id: position.file_id.file_id(&db),
+                offset: position.offset,
+            },
+            selections
+                .into_iter()
+                .map(|selection| ide_db::FileRange {
+                    file_id: selection.file_id.file_id(&db),
+                    range: selection.range,
+                })
+                .collect(),
+        )
+        .unwrap();
+        match_finder.add_search_pattern(pattern.parse().unwrap()).unwrap();
+        let matches = match_finder.matches().flattened().matches;
+        if !matches.is_empty() {
+            print_match_debug_info(&match_finder, position.file_id, &matches[0].matched_text());
+            panic!("Got {} matches when we expected none: {matches:#?}", matches.len());
+        }
+    });
 }
 
 fn assert_match_failure_reason(pattern: &str, code: &str, snippet: &str, expected_reason: &str) {
     let (db, position, selections) = single_file(code);
-    let mut match_finder = MatchFinder::in_context(&db, position, selections).unwrap();
+    let mut match_finder = MatchFinder::in_context(
+        &db,
+        ide_db::FilePosition { file_id: position.file_id.file_id(&db), offset: position.offset },
+        selections
+            .into_iter()
+            .map(|selection| ide_db::FileRange {
+                file_id: selection.file_id.file_id(&db),
+                range: selection.range,
+            })
+            .collect(),
+    )
+    .unwrap();
     match_finder.add_search_pattern(pattern.parse().unwrap()).unwrap();
     let mut reasons = Vec::new();
     for d in match_finder.debug_where_text_equal(position.file_id, snippet) {
@@ -451,7 +513,7 @@ fn match_struct_instantiation() {
 fn match_path() {
     let code = r#"
         mod foo {
-            pub fn bar() {}
+            pub(crate) fn bar() {}
         }
         fn f() {foo::bar(42)}"#;
     assert_matches("foo::bar", code, &["foo::bar"]);
@@ -470,8 +532,8 @@ fn match_pattern() {
 fn match_fully_qualified_fn_path() {
     let code = r#"
         mod a {
-            pub mod b {
-                pub fn c(_: i32) {}
+            pub(crate) mod b {
+                pub(crate) fn c(_: i32) {}
             }
         }
         use a::b::c;
@@ -486,8 +548,8 @@ fn match_fully_qualified_fn_path() {
 fn match_resolved_type_name() {
     let code = r#"
         mod m1 {
-            pub mod m2 {
-                pub trait Foo<T> {}
+            pub(crate) mod m2 {
+                pub(crate) trait Foo<T> {}
             }
         }
         mod m3 {
@@ -507,9 +569,9 @@ fn type_arguments_within_path() {
     cov_mark::check!(type_arguments_within_path);
     let code = r#"
         mod foo {
-            pub struct Bar<T> {t: T}
+            pub(crate) struct Bar<T> {t: T}
             impl<T> Bar<T> {
-                pub fn baz() {}
+                pub(crate) fn baz() {}
             }
         }
         fn f1() {foo::Bar::<i32>::baz();}
@@ -658,9 +720,9 @@ fn replace_associated_trait_default_function_call() {
         "Bar2::foo() ==>> Bar2::foo2()",
         r#"
             trait Foo { fn foo() {} }
-            pub struct Bar {}
+            pub(crate) struct Bar {}
             impl Foo for Bar {}
-            pub struct Bar2 {}
+            pub(crate) struct Bar2 {}
             impl Foo for Bar2 {}
             impl Bar2 { fn foo2() {} }
             fn main() {
@@ -670,9 +732,9 @@ fn replace_associated_trait_default_function_call() {
         "#,
         expect![[r#"
             trait Foo { fn foo() {} }
-            pub struct Bar {}
+            pub(crate) struct Bar {}
             impl Foo for Bar {}
-            pub struct Bar2 {}
+            pub(crate) struct Bar2 {}
             impl Foo for Bar2 {}
             impl Bar2 { fn foo2() {} }
             fn main() {
@@ -690,9 +752,9 @@ fn replace_associated_trait_constant() {
         "Bar2::VALUE ==>> Bar2::VALUE_2222",
         r#"
             trait Foo { const VALUE: i32; const VALUE_2222: i32; }
-            pub struct Bar {}
+            pub(crate) struct Bar {}
             impl Foo for Bar { const VALUE: i32 = 1;  const VALUE_2222: i32 = 2; }
-            pub struct Bar2 {}
+            pub(crate) struct Bar2 {}
             impl Foo for Bar2 { const VALUE: i32 = 1;  const VALUE_2222: i32 = 2; }
             impl Bar2 { fn foo2() {} }
             fn main() {
@@ -702,9 +764,9 @@ fn replace_associated_trait_constant() {
             "#,
         expect![[r#"
             trait Foo { const VALUE: i32; const VALUE_2222: i32; }
-            pub struct Bar {}
+            pub(crate) struct Bar {}
             impl Foo for Bar { const VALUE: i32 = 1;  const VALUE_2222: i32 = 2; }
-            pub struct Bar2 {}
+            pub(crate) struct Bar2 {}
             impl Foo for Bar2 { const VALUE: i32 = 1;  const VALUE_2222: i32 = 2; }
             impl Bar2 { fn foo2() {} }
             fn main() {
@@ -725,10 +787,10 @@ fn replace_path_in_different_contexts() {
         "c::foo() ==>> c::bar()",
         r#"
             mod a {
-                pub mod b {$0
-                    pub mod c {
-                        pub fn foo() {}
-                        pub fn bar() {}
+                pub(crate) mod b {$0
+                    pub(crate) mod c {
+                        pub(crate) fn foo() {}
+                        pub(crate) fn bar() {}
                         fn f1() { foo() }
                     }
                     fn f2() { c::foo() }
@@ -740,10 +802,10 @@ fn replace_path_in_different_contexts() {
             "#,
         expect![[r#"
             mod a {
-                pub mod b {
-                    pub mod c {
-                        pub fn foo() {}
-                        pub fn bar() {}
+                pub(crate) mod b {
+                    pub(crate) mod c {
+                        pub(crate) fn foo() {}
+                        pub(crate) fn bar() {}
                         fn f1() { bar() }
                     }
                     fn f2() { c::bar() }
@@ -762,15 +824,15 @@ fn replace_associated_function_with_generics() {
         "c::Foo::<$a>::new() ==>> d::Bar::<$a>::default()",
         r#"
             mod c {
-                pub struct Foo<T> {v: T}
-                impl<T> Foo<T> { pub fn new() {} }
+                pub(crate) struct Foo<T> {v: T}
+                impl<T> Foo<T> { pub(crate) fn new() {} }
                 fn f1() {
                     Foo::<i32>::new();
                 }
             }
             mod d {
-                pub struct Bar<T> {v: T}
-                impl<T> Bar<T> { pub fn default() {} }
+                pub(crate) struct Bar<T> {v: T}
+                impl<T> Bar<T> { pub(crate) fn default() {} }
                 fn f1() {
                     super::c::Foo::<i32>::new();
                 }
@@ -778,15 +840,15 @@ fn replace_associated_function_with_generics() {
             "#,
         expect![[r#"
             mod c {
-                pub struct Foo<T> {v: T}
-                impl<T> Foo<T> { pub fn new() {} }
+                pub(crate) struct Foo<T> {v: T}
+                impl<T> Foo<T> { pub(crate) fn new() {} }
                 fn f1() {
                     crate::d::Bar::<i32>::default();
                 }
             }
             mod d {
-                pub struct Bar<T> {v: T}
-                impl<T> Bar<T> { pub fn default() {} }
+                pub(crate) struct Bar<T> {v: T}
+                impl<T> Bar<T> { pub(crate) fn default() {} }
                 fn f1() {
                     Bar::<i32>::default();
                 }
@@ -822,9 +884,9 @@ fn f1() -> DynTrait<Vec<Error>> {foo()}
 #[test]
 fn replace_macro_invocations() {
     assert_ssr_transform(
-        "try!($a) ==>> $a?",
-        "macro_rules! try {() => {}} fn f1() -> Result<(), E> {bar(try!(foo()));}",
-        expect![["macro_rules! try {() => {}} fn f1() -> Result<(), E> {bar(foo()?);}"]],
+        "try_!($a) ==>> $a?",
+        "macro_rules! try_ {() => {}} fn f1() -> Result<(), E> {bar(try_!(foo()));}",
+        expect![["macro_rules! try_ {() => {}} fn f1() -> Result<(), E> {bar(foo()?);}"]],
     );
     // FIXME: Figure out why this doesn't work anymore
     // assert_ssr_transform(
@@ -1028,14 +1090,14 @@ fn use_declaration_with_braces() {
     assert_ssr_transform(
         "foo::bar ==>> foo2::bar2",
         r#"
-        mod foo { pub fn bar() {} pub fn baz() {} }
-        mod foo2 { pub fn bar2() {} }
+        mod foo { pub(crate) fn bar() {} pub(crate) fn baz() {} }
+        mod foo2 { pub(crate) fn bar2() {} }
         use foo::{baz, bar};
         fn main() { bar() }
         "#,
         expect![["
-        mod foo { pub fn bar() {} pub fn baz() {} }
-        mod foo2 { pub fn bar2() {} }
+        mod foo { pub(crate) fn bar() {} pub(crate) fn baz() {} }
+        mod foo2 { pub(crate) fn bar2() {} }
         use foo::{baz, bar};
         fn main() { foo2::bar2() }
         "]],
@@ -1265,9 +1327,9 @@ fn match_trait_method_call() {
     // `Bar::foo` and `Bar2::foo` resolve to the same function. Make sure we only match if the type
     // matches what's in the pattern. Also checks that we handle autoderef.
     let code = r#"
-        pub struct Bar {}
-        pub struct Bar2 {}
-        pub trait Foo {
+        pub(crate) struct Bar {}
+        pub(crate) struct Bar2 {}
+        pub(crate) trait Foo {
             fn foo(&self, _: i32) {}
         }
         impl Foo for Bar {}

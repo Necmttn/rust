@@ -1,20 +1,19 @@
 use hir::InFile;
-use ide_db::{
-    base_db::{FileId, FileRange},
-    source_change::SourceChange,
-};
+use ide_db::RootDatabase;
+use ide_db::text_edit::TextEdit;
+use ide_db::{EditionedFileId, FileRange, source_change::SourceChange};
 use itertools::Itertools;
-use syntax::{ast, AstNode, SyntaxNode};
-use text_edit::TextEdit;
+use syntax::{AstNode, SyntaxNode, SyntaxNodePtr, ast};
 
-use crate::{fix, Diagnostic, DiagnosticCode};
+use crate::{Diagnostic, DiagnosticCode, fix};
 
 // Diagnostic: unnecessary-braces
 //
 // Diagnostic for unnecessary braces in `use` items.
 pub(crate) fn useless_braces(
+    db: &RootDatabase,
     acc: &mut Vec<Diagnostic>,
-    file_id: FileId,
+    file_id: EditionedFileId,
     node: &SyntaxNode,
 ) -> Option<()> {
     let use_tree_list = ast::UseTreeList::cast(node.clone())?;
@@ -40,14 +39,14 @@ pub(crate) fn useless_braces(
         acc.push(
             Diagnostic::new(
                 DiagnosticCode::RustcLint("unused_braces"),
-                "Unnecessary braces in use statement".to_string(),
-                FileRange { file_id, range: use_range },
+                "Unnecessary braces in use statement".to_owned(),
+                FileRange { file_id: file_id.file_id(db), range: use_range },
             )
-            .with_main_node(InFile::new(file_id.into(), node.clone()))
+            .with_main_node(InFile::new(file_id.into(), SyntaxNodePtr::new(node)))
             .with_fixes(Some(vec![fix(
                 "remove_braces",
                 "Remove unnecessary braces",
-                SourceChange::from_text_edit(file_id, edit),
+                SourceChange::from_text_edit(file_id.file_id(db), edit),
                 use_range,
             )])),
         );
@@ -59,8 +58,8 @@ pub(crate) fn useless_braces(
 #[cfg(test)]
 mod tests {
     use crate::{
-        tests::{check_diagnostics, check_diagnostics_with_config, check_fix},
         DiagnosticsConfig,
+        tests::{check_diagnostics, check_diagnostics_with_config, check_fix},
     };
 
     #[test]
@@ -112,7 +111,7 @@ mod a {
         );
 
         let mut config = DiagnosticsConfig::test_sample();
-        config.disabled.insert("syntax-error".to_string());
+        config.disabled.insert("syntax-error".to_owned());
         check_diagnostics_with_config(
             config,
             r#"

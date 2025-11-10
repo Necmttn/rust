@@ -1,8 +1,7 @@
-// run-pass
+//@ run-pass
 #![allow(dead_code)]
 // Extending Num and using inherited static methods
 
-// pretty-expanded FIXME #23616
 
 pub trait NumCast: Sized {
     fn from(i: i32) -> Option<Self>;

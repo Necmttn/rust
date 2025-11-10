@@ -1,9 +1,10 @@
-// run-pass
-// only-x86_64-unknown-linux-gnu
-// revisions: ssp no-ssp
-// [ssp] compile-flags: -Z stack-protector=all
-// compile-flags: -C opt-level=2
-// compile-flags: -g
+//@ run-pass
+//@ only-x86_64-unknown-linux-gnu
+//@ revisions: ssp no-ssp
+//@ [ssp] compile-flags: -Z stack-protector=all
+//@ compile-flags: -C opt-level=2
+//@ compile-flags: -g
+//@ ignore-backends: gcc
 
 use std::env;
 use std::process::{Command, ExitStatus};

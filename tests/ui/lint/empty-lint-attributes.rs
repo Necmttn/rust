@@ -1,17 +1,15 @@
-#![feature(lint_reasons)]
-
-// check-pass
+//@ check-pass
 
 // Empty (and reason-only) lint attributes are legal—although we may want to
 // lint them in the future (Issue #55112).
 
-#![allow()]
-#![warn(reason = "observationalism")]
+#![allow()] //~ WARN unused attribute
+#![warn(reason = "observationalism")] //~ WARN unused attribute
 
-#[forbid()]
+#[forbid()] //~ WARN unused attribute
 fn devoir() {}
 
-#[deny(reason = "ultion")]
+#[deny(reason = "ultion")] //~ WARN unused attribute
 fn waldgrave() {}
 
 fn main() {}

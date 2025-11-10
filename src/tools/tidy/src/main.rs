@@ -4,23 +4,23 @@
 //! etc. This is run by default on `./x.py test` and as part of the auto
 //! builders. The tidy checks can be executed with `./x.py test tidy`.
 
-use tidy::*;
-
 use std::collections::VecDeque;
-use std::env;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
-use std::process;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread::{self, scope, ScopedJoinHandle};
+use std::thread::{self, ScopedJoinHandle, scope};
+use std::{env, process};
+
+use tidy::diagnostics::{COLOR_ERROR, COLOR_SUCCESS, TidyCtx, TidyFlags, output_message};
+use tidy::*;
 
 fn main() {
-    // Running Cargo will read the libstd Cargo.toml
+    // Enable nightly, because Cargo will read the libstd Cargo.toml
     // which uses the unstable `public-dependency` feature.
-    //
-    // `setenv` might not be thread safe, so run it before using multiple threads.
-    env::set_var("RUSTC_BOOTSTRAP", "1");
+    // SAFETY: no other threads have been spawned
+    unsafe {
+        env::set_var("RUSTC_BOOTSTRAP", "1");
+    }
 
     let root_path: PathBuf = env::args_os().nth(1).expect("need path to root of repo").into();
     let cargo: PathBuf = env::args_os().nth(2).expect("need path to cargo").into();
@@ -29,12 +29,16 @@ fn main() {
     let concurrency: NonZeroUsize =
         FromStr::from_str(&env::args().nth(4).expect("need concurrency"))
             .expect("concurrency must be a number");
+    let npm: PathBuf = env::args_os().nth(5).expect("need name/path of npm command").into();
 
+    let root_manifest = root_path.join("Cargo.toml");
     let src_path = root_path.join("src");
     let tests_path = root_path.join("tests");
     let library_path = root_path.join("library");
     let compiler_path = root_path.join("compiler");
     let librustdoc_path = src_path.join("librustdoc");
+    let tools_path = src_path.join("tools");
+    let crashes_path = tests_path.join("crashes");
 
     let args: Vec<String> = env::args().skip(1).collect();
     let (cfg_args, pos_args) = match args.iter().position(|arg| arg == "--") {
@@ -42,11 +46,12 @@ fn main() {
         None => (&args[..], [].as_slice()),
     };
     let verbose = cfg_args.iter().any(|s| *s == "--verbose");
-    let bless = cfg_args.iter().any(|s| *s == "--bless");
     let extra_checks =
         cfg_args.iter().find(|s| s.starts_with("--extra-checks=")).map(String::as_str);
 
-    let bad = std::sync::Arc::new(AtomicBool::new(false));
+    let tidy_flags = TidyFlags::new(cfg_args);
+    let tidy_ctx = TidyCtx::new(&root_path, verbose, tidy_flags);
+    let ci_info = CiInfo::new(tidy_ctx.clone());
 
     let drain_handles = |handles: &mut VecDeque<ScopedJoinHandle<'_, ()>>| {
         // poll all threads for completion before awaiting the oldest one
@@ -81,12 +86,9 @@ fn main() {
             (@ $p:ident, name=$name:expr $(, $args:expr)* ) => {
                 drain_handles(&mut handles);
 
+                let tidy_ctx = tidy_ctx.clone();
                 let handle = thread::Builder::new().name($name).spawn_scoped(s, || {
-                    let mut flag = false;
-                    $p::check($($args, )* &mut flag);
-                    if (flag) {
-                        bad.store(true, Ordering::Relaxed);
-                    }
+                    $p::check($($args, )* tidy_ctx);
                 }).unwrap();
                 handles.push_back(handle);
             }
@@ -100,24 +102,32 @@ fn main() {
 
         // Checks over tests.
         check!(tests_placement, &root_path);
+        check!(tests_revision_unpaired_stdout_stderr, &tests_path);
         check!(debug_artifacts, &tests_path);
-        check!(ui_tests, &tests_path);
-        check!(mir_opt_tests, &tests_path, bless);
+        check!(ui_tests, &root_path);
+        check!(mir_opt_tests, &tests_path);
         check!(rustdoc_gui_tests, &tests_path);
         check!(rustdoc_css_themes, &librustdoc_path);
+        check!(rustdoc_templates, &librustdoc_path);
+        check!(rustdoc_json, &src_path, &ci_info);
+        check!(known_bug, &crashes_path);
+        check!(unknown_revision, &tests_path);
 
         // Checks that only make sense for the compiler.
-        check!(error_codes, &root_path, &[&compiler_path, &librustdoc_path], verbose);
-        check!(fluent_alphabetical, &compiler_path, bless);
+        check!(error_codes, &root_path, &[&compiler_path, &librustdoc_path], &ci_info);
+        check!(fluent_alphabetical, &compiler_path);
+        check!(fluent_period, &compiler_path);
+        check!(fluent_lowercase, &compiler_path);
         check!(target_policy, &root_path);
+        check!(gcc_submodule, &root_path, &compiler_path);
 
         // Checks that only make sense for the std libs.
         check!(pal, &library_path);
 
         // Checks that need to be done for both the compiler and std libraries.
-        check!(unit_tests, &src_path);
-        check!(unit_tests, &compiler_path);
-        check!(unit_tests, &library_path);
+        check!(unit_tests, &src_path, false);
+        check!(unit_tests, &compiler_path, false);
+        check!(unit_tests, &library_path, true);
 
         if bins::check_filesystem_support(&[&root_path], &output_directory) {
             check!(bins, &root_path);
@@ -132,6 +142,7 @@ fn main() {
         check!(edition, &compiler_path);
         check!(edition, &library_path);
 
+        check!(alphabetical, &root_manifest);
         check!(alphabetical, &src_path);
         check!(alphabetical, &tests_path);
         check!(alphabetical, &compiler_path);
@@ -139,30 +150,46 @@ fn main() {
 
         check!(x_version, &root_path, &cargo);
 
+        check!(triagebot, &root_path);
+        check!(filenames, &root_path);
+
         let collected = {
             drain_handles(&mut handles);
 
-            let mut flag = false;
-            let r = features::check(
-                &src_path,
-                &tests_path,
-                &compiler_path,
-                &library_path,
-                &mut flag,
-                verbose,
-            );
-            if flag {
-                bad.store(true, Ordering::Relaxed);
-            }
-            r
+            features::check(&src_path, &tests_path, &compiler_path, &library_path, tidy_ctx.clone())
         };
         check!(unstable_book, &src_path, collected);
 
-        check!(ext_tool_checks, &root_path, &output_directory, bless, extra_checks, pos_args);
+        check!(
+            extra_checks,
+            &root_path,
+            &output_directory,
+            &ci_info,
+            &librustdoc_path,
+            &tools_path,
+            &npm,
+            &cargo,
+            extra_checks,
+            pos_args
+        );
     });
 
-    if bad.load(Ordering::Relaxed) {
-        eprintln!("some tidy checks failed");
+    let failed_checks = tidy_ctx.into_failed_checks();
+    if !failed_checks.is_empty() {
+        let mut failed: Vec<String> =
+            failed_checks.into_iter().map(|c| c.id().to_string()).collect();
+        failed.sort();
+        output_message(
+            &format!(
+                "The following check{} failed: {}",
+                if failed.len() > 1 { "s" } else { "" },
+                failed.join(", ")
+            ),
+            None,
+            Some(COLOR_ERROR),
+        );
         process::exit(1);
+    } else {
+        output_message("All tidy checks succeeded", None, Some(COLOR_SUCCESS));
     }
 }

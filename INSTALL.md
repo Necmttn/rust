@@ -6,9 +6,9 @@ If you just want to install Rust, check out the [README.md](README.md) instead.*
 
 The Rust build system uses a Python script called `x.py` to build the compiler,
 which manages the bootstrapping process. It lives at the root of the project.
-It also uses a file named `config.toml` to determine various configuration
+It also uses a file named `bootstrap.toml` to determine various configuration
 settings for the build. You can see a full list of options in
-`config.example.toml`.
+`bootstrap.example.toml`.
 
 The `x.py` command can be run directly on most Unix systems in the following
 format:
@@ -48,7 +48,7 @@ If building LLVM from source, you'll need additional tools:
   [LLVM's documentation](https://llvm.org/docs/GettingStarted.html#host-c-toolchain-both-compiler-and-standard-library)
 * `ninja`, or GNU `make` 3.81 or later (Ninja is recommended, especially on
   Windows)
-* `cmake` 3.13.4 or later
+* `cmake` version listed on [LLVM's documentation](https://llvm.org/docs/GettingStarted.html#software)
 * `libstdc++-static` may be required on some Linux distributions such as Fedora
   and Ubuntu
 
@@ -75,13 +75,50 @@ See [the rustc-dev-guide for more info][sysllvm].
 
 2. Configure the build settings:
 
+   If you're unsure which build configurations to use and need a good default, you
+   can run the interactive `x.py setup` command. This will guide you through selecting
+   a config profile, setting up the LSP, configuring a Git hook, etc.
+
+   With `configure` script, you can handle multiple configurations in a single
+   command which is useful to create complex/advanced config files. For example:
+
    ```sh
-   ./configure
+   ./configure --build=aarch64-unknown-linux-gnu \
+      --enable-full-tools \
+      --enable-profiler \
+      --enable-sanitizers \
+      --enable-compiler-docs \
+      --set target.aarch64-unknown-linux-gnu.linker=clang \
+      --set target.aarch64-unknown-linux-gnu.ar=/rustroot/bin/llvm-ar \
+      --set target.aarch64-unknown-linux-gnu.ranlib=/rustroot/bin/llvm-ranlib \
+      --set llvm.link-shared=true \
+      --set llvm.thin-lto=true \
+      --set llvm.libzstd=true \
+      --set llvm.ninja=false \
+      --set rust.debug-assertions=false \
+      --set rust.jemalloc \
+      --set rust.use-lld=true \
+      --set rust.lto=thin \
+      --set rust.codegen-units=1
    ```
 
-   If you plan to use `x.py install` to create an installation, it is
-   recommended that you set the `prefix` value in the `[install]` section to a
-   directory: `./configure --set install.prefix=<path>`
+   If you plan to use `x.py install` to create an installation, you can either
+   set `DESTDIR` environment variable to your custom directory path:
+
+   ```bash
+   export DESTDIR=<path>
+   ```
+
+   or set `prefix` and `sysconfdir` in the `[install]` section to your custom
+   directory path:
+
+   ```sh
+   ./configure --set install.prefix=<path> --set install.sysconfdir=<path>
+   ```
+
+   When the `DESTDIR` environment variable is present, the `prefix` and
+   `sysconfdir` values are combined with the path from the `DESTDIR`
+   environment variable.
 
 3. Build and install:
 
@@ -101,7 +138,7 @@ See [the rustc-dev-guide for more info][sysllvm].
 
 This project provides a configure script and makefile (the latter of which just
 invokes `x.py`). `./configure` is the recommended way to programmatically
-generate a `config.toml`. `make` is not recommended (we suggest using `x.py`
+generate a `bootstrap.toml`. `make` is not recommended (we suggest using `x.py`
 directly), but it is supported and we try not to break it unnecessarily.
 
 ```sh
@@ -109,7 +146,7 @@ directly), but it is supported and we try not to break it unnecessarily.
 make && sudo make install
 ```
 
-`configure` generates a `config.toml` which can also be used with normal `x.py`
+`configure` generates a `bootstrap.toml` which can also be used with normal `x.py`
 invocations.
 
 ## Building on Windows
@@ -145,25 +182,31 @@ toolchain.
 
 1. Download the latest [MSYS2 installer][msys2] and go through the installer.
 
-2. Run `mingw32_shell.bat` or `mingw64_shell.bat` from the MSYS2 installation
-   directory (e.g. `C:\msys64`), depending on whether you want 32-bit or 64-bit
-   Rust. (As of the latest version of MSYS2 you have to run `msys2_shell.cmd
-   -mingw32` or `msys2_shell.cmd -mingw64` from the command line instead.)
+2. Download and install [Git for Windows](https://git-scm.com/download/win).
+   Make sure that it's in your Windows PATH. To enable access to it from within
+   MSYS2, edit the relevant `mingw[32|64].ini` file in your MSYS2 installation
+   directory and uncomment the line `MSYS2_PATH_TYPE=inherit`.
 
-3. From this terminal, install the required tools:
+   You could install and use MSYS2's version of git instead with `pacman`,
+   however this is not recommended as it's excruciatingly slow, and not frequently
+   tested for compatibility.
+
+3. Start a MINGW64 or MINGW32 shell (depending on whether you want 32-bit
+   or 64-bit Rust) either from your start menu, or by running `mingw64.exe`
+   or `mingw32.exe` from your MSYS2 installation directory (e.g. `C:\msys64`).
+
+4. From this terminal, install the required tools:
 
    ```sh
    # Update package mirrors (may be needed if you have a fresh install of MSYS2)
    pacman -Sy pacman-mirrors
 
    # Install build tools needed for Rust. If you're building a 32-bit compiler,
-   # then replace "x86_64" below with "i686". If you've already got Git, Python,
-   # or CMake installed and in PATH you can remove them from this list.
+   # then replace "x86_64" below with "i686". 
    # Note that it is important that you do **not** use the 'python2', 'cmake',
    # and 'ninja' packages from the 'msys2' subsystem.
    # The build has historically been known to fail with these packages.
-   pacman -S git \
-               make \
+   pacman -S make \
                diffutils \
                tar \
                mingw-w64-x86_64-python \
@@ -172,17 +215,31 @@ toolchain.
                mingw-w64-x86_64-ninja
    ```
 
-4. Navigate to Rust's source code (or clone it), then build it:
+5. Navigate to Rust's source code (or clone it), then build it:
 
    ```sh
-   python x.py setup user && python x.py build && python x.py install
+   python x.py setup dist && python x.py build && python x.py install
    ```
+
+If you want to try the native Windows versions of Python or CMake, you can remove
+them from the above pacman command and install them from another source. Follow
+the instructions in step 2 to get them on PATH.
+
+Using Windows native Python can be helpful if you get errors when building LLVM.
+You may also want to use Git for Windows, as it is often *much* faster. Turning
+off real-time protection in the Windows Virus & Threat protections settings can
+also help with long run times (although note that it will automatically turn
+itself back on after some time).
 
 ### MSVC
 
-MSVC builds of Rust additionally require an installation of Visual Studio 2017
-(or later) so `rustc` can use its linker. The simplest way is to get
-[Visual Studio], check the "C++ build tools" and "Windows 10 SDK" workload.
+MSVC builds of Rust additionally requires an installation of:
+
+- Visual Studio 2022 (or later) build tools so `rustc` can use its linker. Older
+  Visual Studio versions such as 2019 *may* work but aren't actively tested.
+- A recent Windows 10 or 11 SDK.
+
+The simplest way is to get [Visual Studio], check the "C++ build tools".
 
 [Visual Studio]: https://visualstudio.microsoft.com/downloads/
 
@@ -199,7 +256,7 @@ python x.py build
 
 Right now, building Rust only works with some known versions of Visual Studio.
 If you have a more recent version installed and the build system doesn't
-understand, you may need to force rustbuild to use an older version.
+understand, you may need to force bootstrap to use an older version.
 This can be done by manually calling the appropriate vcvars file before running
 the bootstrap.
 
@@ -221,7 +278,7 @@ Windows build triples are:
     - `x86_64-pc-windows-msvc`
 
 The build triple can be specified by either specifying `--build=<triple>` when
-invoking `x.py` commands, or by creating a `config.toml` file (as described in
+invoking `x.py` commands, or by creating a `bootstrap.toml` file (as described in
 [Building on a Unix-like system](#building-on-a-unix-like-system)), and passing
 `--set build.build=<triple>` to `./configure`.
 

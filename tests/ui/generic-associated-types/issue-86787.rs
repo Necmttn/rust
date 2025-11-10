@@ -1,4 +1,4 @@
-// check-fail
+//@ check-fail
 
 enum Either<L, R> {
     Left(L),
@@ -8,7 +8,7 @@ enum Either<L, R> {
 pub trait HasChildrenOf {
     type T;
     type TRef<'a>;
-    //~^ missing required
+    //~^ ERROR missing required
 
     fn ref_children<'a>(&'a self) -> Vec<Self::TRef<'a>>;
     fn take_children(self) -> Vec<Self::T>;

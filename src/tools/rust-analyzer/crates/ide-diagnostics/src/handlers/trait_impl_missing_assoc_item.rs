@@ -1,8 +1,8 @@
 use hir::InFile;
 use itertools::Itertools;
-use syntax::{ast, AstNode};
+use syntax::{AstNode, ast};
 
-use crate::{adjusted_display_range, Diagnostic, DiagnosticCode, DiagnosticsContext};
+use crate::{Diagnostic, DiagnosticCode, DiagnosticsContext, adjusted_display_range};
 
 // Diagnostic: trait-impl-missing-assoc_item
 //
@@ -17,7 +17,7 @@ pub(crate) fn trait_impl_missing_assoc_item(
             hir::AssocItem::Const(_) => "`const ",
             hir::AssocItem::TypeAlias(_) => "`type ",
         })?;
-        f(&name.display(ctx.sema.db))?;
+        f(&name.display(ctx.sema.db, ctx.edition))?;
         f(&"`")
     });
     Diagnostic::new(
@@ -25,10 +25,11 @@ pub(crate) fn trait_impl_missing_assoc_item(
         format!("not all trait items implemented, missing: {missing}"),
         adjusted_display_range::<ast::Impl>(
             ctx,
-            InFile { file_id: d.file_id, value: d.impl_.syntax_node_ptr() },
+            InFile { file_id: d.file_id, value: d.impl_ },
             &|impl_| impl_.trait_().map(|t| t.syntax().text_range()),
         ),
     )
+    .stable()
 }
 
 #[cfg(test)]
@@ -124,6 +125,35 @@ trait Trait {
 // Negative impls don't require any items (in fact, the forbid providing any)
 impl !Trait for () {}
 "#,
+        )
+    }
+
+    #[test]
+    fn impl_sized_for_unsized() {
+        check_diagnostics(
+            r#"
+//- minicore: sized
+trait Trait {
+    type Item
+    where
+        Self: Sized;
+
+    fn item()
+    where
+        Self: Sized;
+}
+
+trait OtherTrait {}
+
+impl Trait for () {
+    type Item = ();
+    fn item() {}
+}
+
+// Items with Self: Sized bound not required to be implemented for unsized types.
+impl Trait for str {}
+impl Trait for dyn OtherTrait {}
+ "#,
         )
     }
 }

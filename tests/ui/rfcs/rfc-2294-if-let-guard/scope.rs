@@ -1,9 +1,8 @@
 // Tests for #88015 when using if let chains in match guards
 
-//run-pass
+//@run-pass
 
 #![feature(if_let_guard)]
-#![feature(let_chains)]
 #![allow(irrefutable_let_patterns)]
 
 fn lhs_let(opt: Option<bool>) {

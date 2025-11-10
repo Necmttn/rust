@@ -1,11 +1,13 @@
+//@ revisions: normal exhaustive_patterns
+#![cfg_attr(exhaustive_patterns, feature(exhaustive_patterns))]
 #![feature(never_type)]
-#![feature(exhaustive_patterns)]
 #![deny(unreachable_patterns)]
 
 fn main() {}
 
 fn foo(nevers: &[!]) {
     match nevers {
+        //[normal]~^ ERROR non-exhaustive patterns: `&[_, ..]` not covered
         &[] => (),
     };
 
@@ -16,7 +18,8 @@ fn foo(nevers: &[!]) {
     };
 
     match nevers {
-        //~^ ERROR non-exhaustive patterns: `&[]` not covered
+        //[exhaustive_patterns]~^ ERROR non-exhaustive patterns: `&[]` not covered
+        //[normal]~^^ ERROR non-exhaustive patterns: `&[]` and `&[_, _, ..]` not covered
         &[_] => (),
     };
 }

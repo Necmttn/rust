@@ -1,12 +1,12 @@
 use either::Either;
 use hir::InFile;
-use ide_db::base_db::FileRange;
+use ide_db::FileRange;
 use syntax::{
+    AstNode, AstPtr,
     ast::{self, HasArgList},
-    AstNode, SyntaxNodePtr,
 };
 
-use crate::{adjusted_display_range, Diagnostic, DiagnosticCode, DiagnosticsContext};
+use crate::{Diagnostic, DiagnosticCode, DiagnosticsContext, adjusted_display_range};
 
 // Diagnostic: mismatched-tuple-struct-pat-arg-count
 //
@@ -24,8 +24,9 @@ pub(crate) fn mismatched_tuple_struct_pat_arg_count(
     Diagnostic::new(
         DiagnosticCode::RustcHardError("E0023"),
         message,
-        invalid_args_range(ctx, d.expr_or_pat.map(Into::into), d.expected, d.found),
+        invalid_args_range(ctx, d.expr_or_pat, d.expected, d.found),
     )
+    .stable()
 }
 
 // Diagnostic: mismatched-arg-count
@@ -40,17 +41,18 @@ pub(crate) fn mismatched_arg_count(
     Diagnostic::new(
         DiagnosticCode::RustcHardError("E0107"),
         message,
-        invalid_args_range(ctx, d.call_expr.map(Into::into), d.expected, d.found),
+        invalid_args_range(ctx, d.call_expr, d.expected, d.found),
     )
+    .stable()
 }
 
 fn invalid_args_range(
     ctx: &DiagnosticsContext<'_>,
-    source: InFile<SyntaxNodePtr>,
+    source: InFile<AstPtr<Either<ast::Expr, ast::Pat>>>,
     expected: usize,
     found: usize,
 ) -> FileRange {
-    adjusted_display_range::<Either<ast::Expr, ast::TupleStructPat>>(ctx, source, &|expr| {
+    adjusted_display_range(ctx, source, &|expr| {
         let (text_range, r_paren_token, expected_arg) = match expr {
             Either::Left(ast::Expr::CallExpr(call)) => {
                 let arg_list = call.arg_list()?;
@@ -68,7 +70,7 @@ fn invalid_args_range(
                     arg_list.args().nth(expected).map(|it| it.syntax().text_range()),
                 )
             }
-            Either::Right(pat) => {
+            Either::Right(ast::Pat::TupleStructPat(pat)) => {
                 let r_paren = pat.r_paren_token()?;
                 let l_paren = pat.l_paren_token()?;
                 (
@@ -199,7 +201,7 @@ fn f() {
         // future, but we shouldn't emit an argument count diagnostic here
         check_diagnostics(
             r#"
-trait Foo { fn method(&self, arg: usize) {} }
+trait Foo { fn method(&self, _arg: usize) {} }
 
 fn f() {
     let x;
@@ -253,6 +255,75 @@ impl Foo {
     }
 }
         "#,
+        );
+    }
+
+    #[test]
+    fn rest_pat_in_macro_expansion() {
+        check_diagnostics(
+            r#"
+// issue #17292
+#![allow(dead_code)]
+
+macro_rules! replace_with_2_dots {
+    ( $( $input:tt )* ) => {
+        ..
+    };
+}
+
+macro_rules! enum_str {
+    (
+        $(
+            $variant:ident (
+                $( $tfield:ty ),*
+            )
+        )
+        ,
+        *
+    ) => {
+        enum Foo {
+            $(
+                $variant ( $( $tfield ),* ),
+            )*
+        }
+
+        impl Foo {
+            fn variant_name_as_str(&self) -> &str {
+                match self {
+                    $(
+                        Self::$variant ( replace_with_2_dots!( $( $tfield ),* ) )
+                          => "",
+                    )*
+                }
+            }
+        }
+    };
+}
+
+enum_str! {
+    TupleVariant1(i32),
+    TupleVariant2(),
+    TupleVariant3(i8,u8,i128)
+}
+"#,
+        );
+
+        check_diagnostics(
+            r#"
+#![allow(dead_code)]
+macro_rules! two_dots1 {
+    () => { .. };
+}
+
+macro_rules! two_dots2 {
+    () => { two_dots1!() };
+}
+
+fn test() {
+    let (_, _, two_dots1!()) = ((), 42);
+    let (_, two_dots2!(), _) = (1, true, 2, false, (), (), 3);
+}
+"#,
         );
     }
 
@@ -402,5 +473,42 @@ fn f(
 ) { _ = (a, b, c, d, e, f, g); }
 "#,
         )
+    }
+
+    #[test]
+    fn no_type_mismatches_when_arg_count_mismatch() {
+        check_diagnostics(
+            r#"
+fn foo((): (), (): ()) {
+    foo(1, 2, 3);
+           // ^^ error: expected 2 arguments, found 3
+    foo(1);
+      // ^ error: expected 2 arguments, found 1
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn regression_17233() {
+        check_diagnostics(
+            r#"
+pub trait A {
+    type X: B;
+}
+pub trait B: A {
+    fn confused_name(self, _: i32);
+}
+
+pub struct Foo;
+impl Foo {
+    pub fn confused_name(&self) {}
+}
+
+pub fn repro<T: A>() {
+    Foo.confused_name();
+}
+"#,
+        );
     }
 }

@@ -2,8 +2,9 @@
 // a dependency from the local hir_crate node. We can't easily test that
 // directly anymore, so now we test that we get reuse.
 
-// revisions: rpass1 rpass2
-// compile-flags: -Z query-dep-graph
+//@ revisions: rpass1 rpass2
+//@ compile-flags: -Z query-dep-graph
+//@ ignore-backends: gcc
 
 #![allow(warnings)]
 #![feature(rustc_attrs)]

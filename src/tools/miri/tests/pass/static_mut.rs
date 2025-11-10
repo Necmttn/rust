@@ -1,8 +1,11 @@
+// FIXME(static_mut_refs): Do not allow `static_mut_refs` lint
+#![allow(static_mut_refs)]
+
+use std::ptr::addr_of;
+
 static mut FOO: i32 = 42;
 
-// FIXME: Use `SyncUnsafeCell` instead of allowing `static_mut_ref` lint
-#[allow(static_mut_ref)]
-static BAR: Foo = Foo(unsafe { &FOO as *const _ });
+static BAR: Foo = Foo(addr_of!(FOO));
 
 #[allow(dead_code)]
 struct Foo(*const i32);

@@ -6,9 +6,10 @@
 // This was fixed by improving the resolution of the `FnOnce` trait
 // selection node.
 
-// revisions:cfail1 cfail2 cfail3
-// compile-flags:-Zquery-dep-graph
-// build-pass (FIXME(62277): could be check-pass?)
+//@ revisions:cfail1 cfail2 cfail3
+//@ compile-flags:-Zquery-dep-graph
+//@ build-pass (FIXME(62277): could be check-pass?)
+//@ ignore-backends: gcc
 
 #![feature(rustc_attrs)]
 

@@ -1,4 +1,4 @@
-// revisions: with_gate no_gate
+//@ revisions: with_gate no_gate
 #![cfg_attr(with_gate, feature(inherent_associated_types))]
 #![cfg_attr(with_gate, allow(incomplete_features))]
 
@@ -13,7 +13,7 @@ impl<T> Windows { //~ ERROR: missing generics for struct `Windows`
 
 impl<T> Windows<T> {
     fn T() -> Option<Self::Item> {}
-    //~^ ERROR: ambiguous associated type
+    //[no_gate]~^ ERROR: ambiguous associated type
 }
 
 fn main() {}

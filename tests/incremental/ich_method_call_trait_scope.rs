@@ -1,8 +1,9 @@
 // Check that the hash for a method call is sensitive to the traits in
 // scope.
 
-// revisions: rpass1 rpass2
-// compile-flags: -Z query-dep-graph
+//@ revisions: rpass1 rpass2
+//@ compile-flags: -Z query-dep-graph
+//@ ignore-backends: gcc
 
 #![feature(rustc_attrs)]
 

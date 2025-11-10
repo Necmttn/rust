@@ -1,7 +1,7 @@
-use crate::rmeta::*;
-
 use rustc_hir::def::CtorOf;
 use rustc_index::Idx;
+
+use crate::rmeta::*;
 
 pub(super) trait IsDefault: Default {
     fn is_default(&self) -> bool;
@@ -66,22 +66,6 @@ pub(super) trait FixedSizeEncoding: IsDefault {
     fn write_to_bytes(self, b: &mut Self::ByteArray);
 }
 
-/// This implementation is not used generically, but for reading/writing
-/// concrete `u32` fields in `Lazy*` structures, which may be zero.
-impl FixedSizeEncoding for u32 {
-    type ByteArray = [u8; 4];
-
-    #[inline]
-    fn from_bytes(b: &[u8; 4]) -> Self {
-        Self::from_le_bytes(*b)
-    }
-
-    #[inline]
-    fn write_to_bytes(self, b: &mut [u8; 4]) {
-        *b = self.to_le_bytes();
-    }
-}
-
 impl FixedSizeEncoding for u64 {
     type ByteArray = [u8; 8];
 
@@ -97,7 +81,7 @@ impl FixedSizeEncoding for u64 {
 }
 
 macro_rules! fixed_size_enum {
-    ($ty:ty { $(($($pat:tt)*))* }) => {
+    ($ty:ty { $(($($pat:tt)*))* } $( unreachable { $(($($upat:tt)*))+ } )?) => {
         impl FixedSizeEncoding for Option<$ty> {
             type ByteArray = [u8;1];
 
@@ -119,11 +103,23 @@ macro_rules! fixed_size_enum {
                 b[0] = match self {
                     None => unreachable!(),
                     $(Some($($pat)*) => 1 + ${index()},)*
+                    $(Some($($($upat)*)|+) => unreachable!(),)?
                 }
             }
         }
     }
 }
+
+// Workaround; need const traits to construct bitflags in a const
+macro_rules! const_macro_kinds {
+    ($($name:ident),+$(,)?) => (MacroKinds::from_bits_truncate($(MacroKinds::$name.bits())|+))
+}
+const MACRO_KINDS_ATTR_BANG: MacroKinds = const_macro_kinds!(ATTR, BANG);
+const MACRO_KINDS_DERIVE_BANG: MacroKinds = const_macro_kinds!(DERIVE, BANG);
+const MACRO_KINDS_DERIVE_ATTR: MacroKinds = const_macro_kinds!(DERIVE, ATTR);
+const MACRO_KINDS_DERIVE_ATTR_BANG: MacroKinds = const_macro_kinds!(DERIVE, ATTR, BANG);
+// Ensure that we get a compilation error if MacroKinds gets extended without updating metadata.
+const _: () = assert!(MACRO_KINDS_DERIVE_ATTR_BANG.is_all());
 
 fixed_size_enum! {
     DefKind {
@@ -155,23 +151,28 @@ fixed_size_enum! {
         ( Impl { of_trait: false }                 )
         ( Impl { of_trait: true }                  )
         ( Closure                                  )
-        ( Static(ast::Mutability::Not)             )
-        ( Static(ast::Mutability::Mut)             )
+        ( Static { safety: hir::Safety::Unsafe, mutability: ast::Mutability::Not, nested: false } )
+        ( Static { safety: hir::Safety::Safe, mutability: ast::Mutability::Not, nested: false } )
+        ( Static { safety: hir::Safety::Unsafe, mutability: ast::Mutability::Mut, nested: false } )
+        ( Static { safety: hir::Safety::Safe, mutability: ast::Mutability::Mut, nested: false } )
+        ( Static { safety: hir::Safety::Unsafe, mutability: ast::Mutability::Not, nested: true } )
+        ( Static { safety: hir::Safety::Safe, mutability: ast::Mutability::Not, nested: true } )
+        ( Static { safety: hir::Safety::Unsafe, mutability: ast::Mutability::Mut, nested: true } )
+        ( Static { safety: hir::Safety::Safe, mutability: ast::Mutability::Mut, nested: true } )
         ( Ctor(CtorOf::Struct, CtorKind::Fn)       )
         ( Ctor(CtorOf::Struct, CtorKind::Const)    )
         ( Ctor(CtorOf::Variant, CtorKind::Fn)      )
         ( Ctor(CtorOf::Variant, CtorKind::Const)   )
-        ( Macro(MacroKind::Bang)                   )
-        ( Macro(MacroKind::Attr)                   )
-        ( Macro(MacroKind::Derive)                 )
-    }
-}
-
-fixed_size_enum! {
-    ty::ImplPolarity {
-        ( Positive    )
-        ( Negative    )
-        ( Reservation )
+        ( Macro(MacroKinds::BANG)                  )
+        ( Macro(MacroKinds::ATTR)                  )
+        ( Macro(MacroKinds::DERIVE)                )
+        ( Macro(MACRO_KINDS_ATTR_BANG)             )
+        ( Macro(MACRO_KINDS_DERIVE_ATTR)           )
+        ( Macro(MACRO_KINDS_DERIVE_BANG)           )
+        ( Macro(MACRO_KINDS_DERIVE_ATTR_BANG)      )
+        ( SyntheticCoroutineBody                   )
+    } unreachable {
+        ( Macro(_)                                 )
     }
 }
 
@@ -187,6 +188,13 @@ fixed_size_enum! {
         ( Final                        )
         ( Default { has_value: false } )
         ( Default { has_value: true }  )
+    }
+}
+
+fixed_size_enum! {
+    hir::Safety {
+        ( Unsafe )
+        ( Safe   )
     }
 }
 
@@ -210,13 +218,6 @@ fixed_size_enum! {
         ( Desugared(hir::CoroutineDesugaring::AsyncGen, hir::CoroutineSource::Block)   )
         ( Desugared(hir::CoroutineDesugaring::AsyncGen, hir::CoroutineSource::Fn)      )
         ( Desugared(hir::CoroutineDesugaring::AsyncGen, hir::CoroutineSource::Closure) )
-    }
-}
-
-fixed_size_enum! {
-    ty::AssocItemContainer {
-        ( TraitContainer )
-        ( ImplContainer  )
     }
 }
 
@@ -292,45 +293,6 @@ impl FixedSizeEncoding for bool {
     }
 }
 
-impl FixedSizeEncoding for Option<bool> {
-    type ByteArray = [u8; 1];
-
-    #[inline]
-    fn from_bytes(b: &[u8; 1]) -> Self {
-        match b[0] {
-            0 => Some(false),
-            1 => Some(true),
-            2 => None,
-            _ => unreachable!(),
-        }
-    }
-
-    #[inline]
-    fn write_to_bytes(self, b: &mut [u8; 1]) {
-        debug_assert!(!self.is_default());
-        b[0] = match self {
-            Some(false) => 0,
-            Some(true) => 1,
-            None => 2,
-        };
-    }
-}
-
-impl FixedSizeEncoding for UnusedGenericParams {
-    type ByteArray = [u8; 4];
-
-    #[inline]
-    fn from_bytes(b: &[u8; 4]) -> Self {
-        let x: u32 = u32::from_bytes(b);
-        UnusedGenericParams::from_bits(x)
-    }
-
-    #[inline]
-    fn write_to_bytes(self, b: &mut [u8; 4]) {
-        self.bits().write_to_bytes(b);
-    }
-}
-
 // NOTE(eddyb) there could be an impl for `usize`, which would enable a more
 // generic `LazyValue<T>` impl, but in the general case we might not need / want
 // to fit every `usize` in `u32`.
@@ -339,7 +301,7 @@ impl<T> FixedSizeEncoding for Option<LazyValue<T>> {
 
     #[inline]
     fn from_bytes(b: &[u8; 8]) -> Self {
-        let position = NonZeroUsize::new(u64::from_bytes(b) as usize)?;
+        let position = NonZero::new(u64::from_bytes(b) as usize)?;
         Some(LazyValue::from_position(position))
     }
 
@@ -366,7 +328,7 @@ impl<T> LazyArray<T> {
     }
 
     fn from_bytes_impl(position: &[u8; 8], meta: &[u8; 8]) -> Option<LazyArray<T>> {
-        let position = NonZeroUsize::new(u64::from_bytes(position) as usize)?;
+        let position = NonZero::new(u64::from_bytes(position) as usize)?;
         let len = u64::from_bytes(meta) as usize;
         Some(LazyArray::from_position_and_num_elems(position, len))
     }
@@ -497,7 +459,7 @@ impl<I: Idx, const N: usize, T: FixedSizeEncoding<ByteArray = [u8; N]>> TableBui
         }
 
         LazyTable::from_position_and_encoded_size(
-            NonZeroUsize::new(pos).unwrap(),
+            NonZero::new(pos).unwrap(),
             width,
             self.blocks.len(),
         )
@@ -515,8 +477,6 @@ where
 {
     /// Given the metadata, extract out the value at a particular index (if any).
     pub(super) fn get<'a, 'tcx, M: Metadata<'a, 'tcx>>(&self, metadata: M, i: I) -> T::Value<'tcx> {
-        trace!("LazyTable::lookup: index={:?} len={:?}", i, self.len);
-
         // Access past the end of the table returns a Default
         if i.index() >= self.len {
             return Default::default();

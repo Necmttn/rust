@@ -4,25 +4,14 @@
 //!
 //! This API is completely unstable and subject to change.
 
-#![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
-#![doc(rust_logo)]
-#![feature(rustdoc_internals)]
-#![allow(internal_features)]
+// tidy-alphabetical-start
 #![feature(assert_matches)]
 #![feature(associated_type_defaults)]
 #![feature(box_patterns)]
 #![feature(if_let_guard)]
 #![feature(iterator_try_collect)]
-#![feature(let_chains)]
 #![feature(never_type)]
-#![recursion_limit = "256"]
-#![deny(rustc::untranslatable_diagnostic)]
-#![deny(rustc::diagnostic_outside_of_impl)]
-
-#[macro_use]
-extern crate rustc_middle;
-#[macro_use]
-extern crate tracing;
+// tidy-alphabetical-end
 
 use rustc_middle::query::Providers;
 
@@ -34,11 +23,11 @@ mod errors;
 mod implied_bounds;
 mod instance;
 mod layout;
-mod layout_sanity_check;
 mod needs_drop;
+mod nested_bodies;
 mod opaque_types;
 mod representability;
-mod sig_types;
+pub mod sig_types;
 mod structural_match;
 mod ty;
 
@@ -57,4 +46,5 @@ pub fn provide(providers: &mut Providers) {
     ty::provide(providers);
     instance::provide(providers);
     structural_match::provide(providers);
+    nested_bodies::provide(providers);
 }

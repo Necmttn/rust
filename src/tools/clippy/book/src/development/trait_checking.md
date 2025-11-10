@@ -17,19 +17,18 @@ providing the `LateContext` (`cx`), our expression at hand, and
 the symbol of the trait in question:
 
 ```rust
-use clippy_utils::is_trait_method;
+use clippy_utils::sym;
+use clippy_utils::ty::implements_trait;
 use rustc_hir::Expr;
 use rustc_lint::{LateContext, LateLintPass};
-use rustc_span::symbol::sym;
 
 impl LateLintPass<'_> for CheckIteratorTraitLint {
     fn check_expr(&mut self, cx: &LateContext<'_>, expr: &Expr<'_>) {
-		let implements_iterator = cx.tcx.get_diagnostic_item(sym::Iterator).map_or(false, |id| {
-    		implements_trait(cx, cx.typeck_results().expr_ty(arg), id, &[])
-		});
-		if implements_iterator {
-			// [...]
-		}
+        let implements_iterator = (cx.tcx.get_diagnostic_item(sym::Iterator))
+            .is_some_and(|id| implements_trait(cx, cx.typeck_results().expr_ty(expr), id, &[]));
+        if implements_iterator {
+            // [...]
+        }
 
     }
 }
@@ -54,7 +53,7 @@ For instance, if we want to examine whether an expression `expr` implements
 we can check that the `Ty` of the `expr` implements the trait:
 
 ```rust
-use clippy_utils::implements_trait;
+use clippy_utils::ty::implements_trait;
 use rustc_hir::Expr;
 use rustc_lint::{LateContext, LateLintPass};
 
@@ -73,26 +72,76 @@ impl LateLintPass<'_> for CheckDropTraitLint {
 ## Using Type Path
 
 If neither diagnostic item nor a language item is available, we can use
-[`clippy_utils::paths`][paths] with the `match_trait_method` to determine trait
-implementation.
+[`clippy_utils::paths`][paths] to determine get a trait's `DefId`.
 
 > **Note**: This approach should be avoided if possible, the best thing to do would be to make a PR to [`rust-lang/rust`][rust] adding a diagnostic item.
 
-Below, we check if the given `expr` implements the `Iterator`'s trait method `cloned` :
+Below, we check if the given `expr` implements [`core::iter::Step`](https://doc.rust-lang.org/std/iter/trait.Step.html):
 
 ```rust
-use clippy_utils::{match_trait_method, paths};
+use clippy_utils::paths;
+use clippy_utils::ty::implements_trait;
 use rustc_hir::Expr;
 use rustc_lint::{LateContext, LateLintPass};
 
-impl LateLintPass<'_> for CheckTokioAsyncReadExtTrait {
+impl LateLintPass<'_> for CheckIterStep {
     fn check_expr(&mut self, cx: &LateContext<'_>, expr: &Expr<'_>) {
-        if match_trait_method(cx, expr, &paths::CORE_ITER_CLONED) {
-            println!("`expr` implements `CORE_ITER_CLONED` trait!");
+        let ty = cx.typeck_results().expr_ty(expr);
+        if let Some(trait_def_id) = paths::ITER_STEP.first(cx)
+            && implements_trait(cx, ty, trait_def_id, &[])
+        {
+            println!("`expr` implements the `core::iter::Step` trait!");
         }
     }
 }
 ```
+
+## Creating Types Programmatically
+
+Traits are often generic over a type parameter, e.g. `Borrow<T>` is generic
+over `T`. Rust allows us to implement a trait for a specific type. For example,
+we can implement `Borrow<[u8]>` for a hypothetical type `Foo`. Let's suppose
+that we would like to find whether our type actually implements `Borrow<[u8]>`.
+
+To do so, we can use the same `implements_trait` function as above, and supply
+a type parameter that represents `[u8]`. Since `[u8]` is a specialization of
+`[T]`, we can use the  [`Ty::new_slice`][new_slice] method to create a type
+that represents `[T]` and supply `u8` as a type parameter.
+To create a `ty::Ty` programmatically, we rely on `Ty::new_*` methods. These
+methods create a `TyKind` and then wrap it in a `Ty` struct. This means we
+have access to all the primitive types, such as `Ty::new_char`,
+`Ty::new_bool`, `Ty::new_int`, etc. We can also create more complex types,
+such as slices, tuples, and references out of these basic building blocks.
+
+For trait checking, it is not enough to create the types, we need to convert
+them into [GenericArg]. In rustc, a generic is an entity that the compiler
+understands and has three kinds, type, const and lifetime. By calling
+`.into()` on a constructed [Ty], we wrap the type into a generic which can
+then be used by the query system to decide whether the specialized trait
+is implemented.
+
+The following code demonstrates how to do this:
+
+```rust
+
+use rustc_middle::ty::Ty;
+use clippy_utils::sym;
+use clippy_utils::ty::implements_trait;
+
+let ty = todo!("Get the `Foo` type to check for a trait implementation");
+let borrow_id = cx.tcx.get_diagnostic_item(sym::Borrow).unwrap(); // avoid unwrap in real code
+let slice_of_bytes_t = Ty::new_slice(cx.tcx, cx.tcx.types.u8);
+let generic_param = slice_of_bytes_t.into();
+if implements_trait(cx, ty, borrow_id, &[generic_param]) {
+    todo!("Rest of lint implementation")
+}
+```
+
+In essence, the [Ty] struct allows us to create types programmatically in a
+representation that can be used by the compiler and the query engine. We then
+use the `rustc_middle::Ty` of the type we are interested in, and query the
+compiler to see if it indeed implements the trait we are interested in.
+
 
 [DefId]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_hir/def_id/struct.DefId.html
 [diagnostic_items]: https://rustc-dev-guide.rust-lang.org/diagnostics/diagnostic-items.html
@@ -102,4 +151,7 @@ impl LateLintPass<'_> for CheckTokioAsyncReadExtTrait {
 [symbol]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_span/symbol/struct.Symbol.html
 [symbol_index]: https://doc.rust-lang.org/beta/nightly-rustc/rustc_span/symbol/sym/index.html
 [TyCtxt]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_middle/ty/context/struct.TyCtxt.html
+[Ty]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_middle/ty/struct.Ty.html
 [rust]: https://github.com/rust-lang/rust
+[new_slice]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_middle/ty/struct.Ty.html#method.new_slice
+[GenericArg]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_middle/ty/struct.GenericArg.html

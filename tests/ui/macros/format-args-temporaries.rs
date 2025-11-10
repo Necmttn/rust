@@ -1,11 +1,11 @@
-// check-pass
+//@ check-pass
 
 use std::fmt::{self, Display};
 
 struct Mutex;
 
 impl Mutex {
-    fn lock(&self) -> MutexGuard {
+    fn lock(&self) -> MutexGuard<'_> {
         MutexGuard(self)
     }
 }

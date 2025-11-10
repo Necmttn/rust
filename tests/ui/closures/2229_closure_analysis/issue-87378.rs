@@ -1,6 +1,6 @@
 #![feature(rustc_attrs)]
 
-// edition:2021
+//@ edition:2021
 
 // Test that any precise capture on a union is truncated because it's unsafe to do so.
 
@@ -19,8 +19,8 @@ fn main() {
     //~^ ERROR: First Pass analysis includes:
     //~| ERROR: Min Capture analysis includes:
        unsafe { u.value }
-        //~^ NOTE: Capturing u[(0, 0)] -> ImmBorrow
-        //~| NOTE: Min Capture u[] -> ImmBorrow
+        //~^ NOTE: Capturing u[(0, 0)] -> Immutable
+        //~| NOTE: Min Capture u[] -> Immutable
     };
 
     c();

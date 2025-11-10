@@ -1,6 +1,5 @@
-// error-pattern:unwinding panics are not supported without std
-// needs-unwind
-// compile-flags: -Cpanic=unwind
+//@ needs-unwind
+//@ compile-flags: -Cpanic=unwind
 
 // Make sure that we don't emit an error message mentioning internal lang items.
 
@@ -13,3 +12,5 @@ fn handler(_info: &core::panic::PanicInfo<'_>) -> ! {
 }
 
 fn main() {}
+
+//~? ERROR unwinding panics are not supported without std

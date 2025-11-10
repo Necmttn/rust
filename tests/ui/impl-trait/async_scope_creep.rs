@@ -1,7 +1,7 @@
 #![feature(type_alias_impl_trait)]
-// edition:2021
-// check-pass
-// revisions: tait rpit
+//@ edition:2021
+//@ check-pass
+//@ revisions: tait rpit
 
 struct Pending {}
 
@@ -22,11 +22,13 @@ impl Pending {
     }
 
     #[cfg(tait)]
+    #[define_opaque(OpeningReadFuture)]
     fn read_fut(&mut self) -> OpeningReadFuture<'_> {
         self.read()
     }
 
     #[cfg(rpit)]
+    #[define_opaque(PendingReader)]
     fn read_fut(
         &mut self,
     ) -> impl std::future::Future<Output = Result<PendingReader<'_>, CantOpen>> {

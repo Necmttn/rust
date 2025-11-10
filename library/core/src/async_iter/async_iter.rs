@@ -18,7 +18,7 @@ pub trait AsyncIterator {
     /// The type of items yielded by the async iterator.
     type Item;
 
-    /// Attempt to pull out the next value of this async iterator, registering the
+    /// Attempts to pull out the next value of this async iterator, registering the
     /// current task for wakeup if the value is not yet available, and returning
     /// `None` if the async iterator is exhausted.
     ///
@@ -28,15 +28,15 @@ pub trait AsyncIterator {
     /// async iterator state:
     ///
     /// - `Poll::Pending` means that this async iterator's next value is not ready
-    /// yet. Implementations will ensure that the current task will be notified
-    /// when the next value may be ready.
+    ///   yet. Implementations will ensure that the current task will be notified
+    ///   when the next value may be ready.
     ///
     /// - `Poll::Ready(Some(val))` means that the async iterator has successfully
-    /// produced a value, `val`, and may produce further values on subsequent
-    /// `poll_next` calls.
+    ///   produced a value, `val`, and may produce further values on subsequent
+    ///   `poll_next` calls.
     ///
     /// - `Poll::Ready(None)` means that the async iterator has terminated, and
-    /// `poll_next` should not be invoked again.
+    ///   `poll_next` should not be invoked again.
     ///
     /// # Panics
     ///
@@ -47,7 +47,7 @@ pub trait AsyncIterator {
     /// Rust's usual rules apply: calls must never cause undefined behavior
     /// (memory corruption, incorrect use of `unsafe` functions, or the like),
     /// regardless of the async iterator's state.
-    #[cfg_attr(not(bootstrap), lang = "async_iterator_poll_next")]
+    #[lang = "async_iterator_poll_next"]
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>>;
 
     /// Returns the bounds on the remaining length of the async iterator.
@@ -116,6 +116,7 @@ where
 impl<T> Poll<Option<T>> {
     /// A helper function for internal desugaring -- produces `Ready(Some(t))`,
     /// which corresponds to the async iterator yielding a value.
+    #[doc(hidden)]
     #[unstable(feature = "async_gen_internals", issue = "none")]
     #[lang = "AsyncGenReady"]
     pub fn async_gen_ready(t: T) -> Self {
@@ -124,6 +125,7 @@ impl<T> Poll<Option<T>> {
 
     /// A helper constant for internal desugaring -- produces `Pending`,
     /// which corresponds to the async iterator pending on an `.await`.
+    #[doc(hidden)]
     #[unstable(feature = "async_gen_internals", issue = "none")]
     #[lang = "AsyncGenPending"]
     // FIXME(gen_blocks): This probably could be deduplicated.
@@ -131,12 +133,13 @@ impl<T> Poll<Option<T>> {
 
     /// A helper constant for internal desugaring -- produces `Ready(None)`,
     /// which corresponds to the async iterator finishing its iteration.
+    #[doc(hidden)]
     #[unstable(feature = "async_gen_internals", issue = "none")]
     #[lang = "AsyncGenFinished"]
     pub const FINISHED: Self = Poll::Ready(None);
 }
 
-/// Convert something into an async iterator
+/// Converts something into an async iterator
 #[unstable(feature = "async_iterator", issue = "79024")]
 pub trait IntoAsyncIterator {
     /// The type of the item yielded by the iterator
@@ -145,7 +148,7 @@ pub trait IntoAsyncIterator {
     type IntoAsyncIter: AsyncIterator<Item = Self::Item>;
 
     /// Converts `self` into an async iterator
-    #[cfg_attr(not(bootstrap), lang = "into_async_iter_into_iter")]
+    #[lang = "into_async_iter_into_iter"]
     fn into_async_iter(self) -> Self::IntoAsyncIter;
 }
 

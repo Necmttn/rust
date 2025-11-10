@@ -5,19 +5,15 @@
 #[cfg(test)]
 mod tests;
 
-use crate::os::windows::prelude::*;
-
-use crate::error::Error as StdError;
+use super::api;
+#[cfg(not(target_vendor = "uwp"))]
+use super::api::WinError;
 use crate::ffi::{OsStr, OsString};
-use crate::fmt;
-use crate::io;
 use crate::os::windows::ffi::EncodeWide;
+use crate::os::windows::prelude::*;
 use crate::path::{self, PathBuf};
-use crate::ptr;
-use crate::slice;
-use crate::sys::{c, cvt};
-
-use super::{api, to_u16s};
+use crate::sys::pal::{c, cvt};
+use crate::{fmt, io, ptr};
 
 pub fn errno() -> i32 {
     api::get_last_error().code as i32
@@ -51,10 +47,10 @@ pub fn error_string(mut errnum: i32) -> String {
         let res = c::FormatMessageW(
             flags | c::FORMAT_MESSAGE_FROM_SYSTEM | c::FORMAT_MESSAGE_IGNORE_INSERTS,
             module,
-            errnum as c::DWORD,
+            errnum as u32,
             0,
             buf.as_mut_ptr(),
-            buf.len() as c::DWORD,
+            buf.len() as u32,
             ptr::null(),
         ) as usize;
         if res == 0 {
@@ -76,108 +72,6 @@ pub fn error_string(mut errnum: i32) -> String {
                 errnum
             ),
         }
-    }
-}
-
-pub struct Env {
-    base: c::LPWCH,
-    iter: EnvIterator,
-}
-
-// FIXME(https://github.com/rust-lang/rust/issues/114583): Remove this when <OsStr as Debug>::fmt matches <str as Debug>::fmt.
-pub struct EnvStrDebug<'a> {
-    iter: &'a EnvIterator,
-}
-
-impl fmt::Debug for EnvStrDebug<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Self { iter } = self;
-        let iter: EnvIterator = (*iter).clone();
-        let mut list = f.debug_list();
-        for (a, b) in iter {
-            list.entry(&(a.to_str().unwrap(), b.to_str().unwrap()));
-        }
-        list.finish()
-    }
-}
-
-impl Env {
-    pub fn str_debug(&self) -> impl fmt::Debug + '_ {
-        let Self { base: _, iter } = self;
-        EnvStrDebug { iter }
-    }
-}
-
-impl fmt::Debug for Env {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Self { base: _, iter } = self;
-        f.debug_list().entries(iter.clone()).finish()
-    }
-}
-
-impl Iterator for Env {
-    type Item = (OsString, OsString);
-
-    fn next(&mut self) -> Option<(OsString, OsString)> {
-        let Self { base: _, iter } = self;
-        iter.next()
-    }
-}
-
-#[derive(Clone)]
-struct EnvIterator(c::LPWCH);
-
-impl Iterator for EnvIterator {
-    type Item = (OsString, OsString);
-
-    fn next(&mut self) -> Option<(OsString, OsString)> {
-        let Self(cur) = self;
-        loop {
-            unsafe {
-                if **cur == 0 {
-                    return None;
-                }
-                let p = *cur as *const u16;
-                let mut len = 0;
-                while *p.add(len) != 0 {
-                    len += 1;
-                }
-                let s = slice::from_raw_parts(p, len);
-                *cur = cur.add(len + 1);
-
-                // Windows allows environment variables to start with an equals
-                // symbol (in any other position, this is the separator between
-                // variable name and value). Since`s` has at least length 1 at
-                // this point (because the empty string terminates the array of
-                // environment variables), we can safely slice.
-                let pos = match s[1..].iter().position(|&u| u == b'=' as u16).map(|p| p + 1) {
-                    Some(p) => p,
-                    None => continue,
-                };
-                return Some((
-                    OsStringExt::from_wide(&s[..pos]),
-                    OsStringExt::from_wide(&s[pos + 1..]),
-                ));
-            }
-        }
-    }
-}
-
-impl Drop for Env {
-    fn drop(&mut self) {
-        unsafe {
-            c::FreeEnvironmentStringsW(self.base);
-        }
-    }
-}
-
-pub fn env() -> Env {
-    unsafe {
-        let ch = c::GetEnvironmentStringsW();
-        if ch.is_null() {
-            panic!("failure getting env string from OS: {}", io::Error::last_os_error());
-        }
-        Env { base: ch, iter: EnvIterator(ch) }
     }
 }
 
@@ -267,12 +161,7 @@ impl fmt::Display for JoinPathsError {
     }
 }
 
-impl StdError for JoinPathsError {
-    #[allow(deprecated)]
-    fn description(&self) -> &str {
-        "failed to join paths"
-    }
-}
+impl crate::error::Error for JoinPathsError {}
 
 pub fn current_exe() -> io::Result<PathBuf> {
     super::fill_utf16_buf(
@@ -293,38 +182,39 @@ pub fn chdir(p: &path::Path) -> io::Result<()> {
     cvt(unsafe { c::SetCurrentDirectoryW(p.as_ptr()) }).map(drop)
 }
 
-pub fn getenv(k: &OsStr) -> Option<OsString> {
-    let k = to_u16s(k).ok()?;
-    super::fill_utf16_buf(
-        |buf, sz| unsafe { c::GetEnvironmentVariableW(k.as_ptr(), buf, sz) },
-        OsStringExt::from_wide,
-    )
-    .ok()
-}
-
-pub fn setenv(k: &OsStr, v: &OsStr) -> io::Result<()> {
-    let k = to_u16s(k)?;
-    let v = to_u16s(v)?;
-
-    cvt(unsafe { c::SetEnvironmentVariableW(k.as_ptr(), v.as_ptr()) }).map(drop)
-}
-
-pub fn unsetenv(n: &OsStr) -> io::Result<()> {
-    let v = to_u16s(n)?;
-    cvt(unsafe { c::SetEnvironmentVariableW(v.as_ptr(), ptr::null()) }).map(drop)
-}
-
 pub fn temp_dir() -> PathBuf {
     super::fill_utf16_buf(|buf, sz| unsafe { c::GetTempPath2W(sz, buf) }, super::os2path).unwrap()
 }
 
-#[cfg(not(target_vendor = "uwp"))]
+#[cfg(all(not(target_vendor = "uwp"), not(target_vendor = "win7")))]
 fn home_dir_crt() -> Option<PathBuf> {
     unsafe {
-        // The magic constant -4 can be used as the token passed to GetUserProfileDirectoryW below
-        // instead of us having to go through these multiple steps to get a token. However this is
-        // not implemented on Windows 7, only Windows 8 and up. When we drop support for Windows 7
-        // we can simplify this code. See #90144 for details.
+        // Defined in processthreadsapi.h.
+        const CURRENT_PROCESS_TOKEN: usize = -4_isize as usize;
+
+        super::fill_utf16_buf(
+            |buf, mut sz| {
+                // GetUserProfileDirectoryW does not quite use the usual protocol for
+                // negotiating the buffer size, so we have to translate.
+                match c::GetUserProfileDirectoryW(
+                    ptr::without_provenance_mut(CURRENT_PROCESS_TOKEN),
+                    buf,
+                    &mut sz,
+                ) {
+                    0 if api::get_last_error() != WinError::INSUFFICIENT_BUFFER => 0,
+                    0 => sz,
+                    _ => sz - 1, // sz includes the null terminator
+                }
+            },
+            super::os2path,
+        )
+        .ok()
+    }
+}
+
+#[cfg(target_vendor = "win7")]
+fn home_dir_crt() -> Option<PathBuf> {
+    unsafe {
         use crate::sys::handle::Handle;
 
         let me = c::GetCurrentProcess();
@@ -336,7 +226,7 @@ fn home_dir_crt() -> Option<PathBuf> {
         super::fill_utf16_buf(
             |buf, mut sz| {
                 match c::GetUserProfileDirectoryW(token, buf, &mut sz) {
-                    0 if api::get_last_error().code != c::ERROR_INSUFFICIENT_BUFFER => 0,
+                    0 if api::get_last_error() != WinError::INSUFFICIENT_BUFFER => 0,
                     0 => sz,
                     _ => sz - 1, // sz includes the null terminator
                 }
@@ -353,14 +243,14 @@ fn home_dir_crt() -> Option<PathBuf> {
 }
 
 pub fn home_dir() -> Option<PathBuf> {
-    crate::env::var_os("HOME")
-        .or_else(|| crate::env::var_os("USERPROFILE"))
+    crate::env::var_os("USERPROFILE")
+        .filter(|s| !s.is_empty())
         .map(PathBuf::from)
         .or_else(home_dir_crt)
 }
 
 pub fn exit(code: i32) -> ! {
-    unsafe { c::ExitProcess(code as c::UINT) }
+    unsafe { c::ExitProcess(code as u32) }
 }
 
 pub fn getpid() -> u32 {

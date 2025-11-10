@@ -1,4 +1,5 @@
-// check-pass
+//@ check-pass
+#![expect(dependency_on_unit_never_type_fallback)]
 
 fn main() {}
 

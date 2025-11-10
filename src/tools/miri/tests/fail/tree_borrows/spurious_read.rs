@@ -1,8 +1,8 @@
 // We ensure a deterministic execution.
 // Note that we are *also* using barriers: the barriers enforce the
-// specific interleaving of operations that we want, but only the preemption
-// rate guarantees that the error message is also deterministic.
-//@compile-flags: -Zmiri-preemption-rate=0
+// specific interleaving of operations that we want, but we need to disable
+// preemption to ensure that the error message is also deterministic.
+//@compile-flags: -Zmiri-deterministic-concurrency
 //@compile-flags: -Zmiri-tree-borrows
 
 use std::sync::{Arc, Barrier};
@@ -89,7 +89,7 @@ fn retagx_retagy_retx_writey_rety() {
     // - retag `y` protected
     // - (wait for the other thread to return so that there is no foreign protector when we write)
     // - attempt a write through `y`.
-    // - (UB should have occured by now, but the next step would be to
+    // - (UB should have occurred by now, but the next step would be to
     //    remove `y`'s protector)
     let thread_y = thread::spawn(move || {
         let b = (2, by);

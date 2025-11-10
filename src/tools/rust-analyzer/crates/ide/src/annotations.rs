@@ -1,19 +1,18 @@
 use hir::{HasSource, InFile, InRealFile, Semantics};
 use ide_db::{
-    base_db::{FileId, FilePosition, FileRange},
-    defs::Definition,
+    FileId, FilePosition, FileRange, FxIndexSet, MiniCore, RootDatabase, defs::Definition,
     helpers::visit_file_defs,
-    FxHashSet, RootDatabase,
 };
 use itertools::Itertools;
-use syntax::{ast::HasName, AstNode, TextRange};
+use syntax::{AstNode, TextRange, ast::HasName};
 
 use crate::{
-    annotations::fn_references::find_all_methods,
-    goto_implementation::goto_implementation,
-    references::find_all_refs,
-    runnables::{runnables, Runnable},
     NavigationTarget, RunnableKind,
+    annotations::fn_references::find_all_methods,
+    goto_implementation::{GotoImplementationConfig, goto_implementation},
+    navigation_target,
+    references::{FindAllRefsConfig, find_all_refs},
+    runnables::{Runnable, runnables},
 };
 
 mod fn_references;
@@ -23,7 +22,7 @@ mod fn_references;
 // Provides user with annotations above items for looking up references or impl blocks
 // and running/debugging binaries.
 //
-// image::https://user-images.githubusercontent.com/48062697/113020672-b7c34f00-917a-11eb-8f6e-858735660a0e.png[]
+// ![Annotations](https://user-images.githubusercontent.com/48062697/113020672-b7c34f00-917a-11eb-8f6e-858735660a0e.png)
 #[derive(Debug, Hash, PartialEq, Eq)]
 pub struct Annotation {
     pub range: TextRange,
@@ -37,7 +36,7 @@ pub enum AnnotationKind {
     HasReferences { pos: FilePosition, data: Option<Vec<FileRange>> },
 }
 
-pub struct AnnotationConfig {
+pub struct AnnotationConfig<'a> {
     pub binary_target: bool,
     pub annotate_runnables: bool,
     pub annotate_impls: bool,
@@ -45,6 +44,8 @@ pub struct AnnotationConfig {
     pub annotate_method_references: bool,
     pub annotate_enum_variant_references: bool,
     pub location: AnnotationLocation,
+    pub filter_adjacent_derive_implementations: bool,
+    pub minicore: MiniCore<'a>,
 }
 
 pub enum AnnotationLocation {
@@ -54,10 +55,10 @@ pub enum AnnotationLocation {
 
 pub(crate) fn annotations(
     db: &RootDatabase,
-    config: &AnnotationConfig,
+    config: &AnnotationConfig<'_>,
     file_id: FileId,
 ) -> Vec<Annotation> {
-    let mut annotations = FxHashSet::default();
+    let mut annotations = FxIndexSet::default();
 
     if config.annotate_runnables {
         for runnable in runnables(db, file_id) {
@@ -150,15 +151,32 @@ pub(crate) fn annotations(
             node: InFile<T>,
             source_file_id: FileId,
         ) -> Option<(TextRange, Option<TextRange>)> {
-            if let Some(InRealFile { file_id, value }) = node.original_ast_node_rooted(db) {
-                if file_id == source_file_id {
-                    return Some((
-                        value.syntax().text_range(),
-                        value.name().map(|name| name.syntax().text_range()),
-                    ));
+            if let Some(name) = node.value.name().map(|name| name.syntax().text_range()) {
+                // if we have a name, try mapping that out of the macro expansion as we can put the
+                // annotation on that name token
+                // See `test_no_annotations_macro_struct_def` vs `test_annotations_macro_struct_def_call_site`
+                let res = navigation_target::orig_range_with_focus_r(
+                    db,
+                    node.file_id,
+                    node.value.syntax().text_range(),
+                    Some(name),
+                );
+                if res.call_site.0.file_id == source_file_id
+                    && let Some(name_range) = res.call_site.1
+                {
+                    return Some((res.call_site.0.range, Some(name_range)));
                 }
+            };
+            // otherwise try upmapping the entire node out of attributes
+            let InRealFile { file_id, value } = node.original_ast_node_rooted(db)?;
+            if file_id.file_id(db) == source_file_id {
+                Some((
+                    value.syntax().text_range(),
+                    value.name().map(|name| name.syntax().text_range()),
+                ))
+            } else {
+                None
             }
-            None
         }
     });
 
@@ -172,16 +190,35 @@ pub(crate) fn annotations(
         }));
     }
 
-    annotations.into_iter().sorted_by_key(|a| (a.range.start(), a.range.end())).collect()
+    annotations
+        .into_iter()
+        .sorted_by_key(|a| {
+            (a.range.start(), a.range.end(), matches!(a.kind, AnnotationKind::Runnable(..)))
+        })
+        .collect()
 }
 
-pub(crate) fn resolve_annotation(db: &RootDatabase, mut annotation: Annotation) -> Annotation {
+pub(crate) fn resolve_annotation(
+    db: &RootDatabase,
+    config: &AnnotationConfig<'_>,
+    mut annotation: Annotation,
+) -> Annotation {
     match annotation.kind {
         AnnotationKind::HasImpls { pos, ref mut data } => {
-            *data = goto_implementation(db, pos).map(|range| range.info);
+            let goto_implementation_config = GotoImplementationConfig {
+                filter_adjacent_derive_implementations: config
+                    .filter_adjacent_derive_implementations,
+            };
+            *data =
+                goto_implementation(db, &goto_implementation_config, pos).map(|range| range.info);
         }
         AnnotationKind::HasReferences { pos, ref mut data } => {
-            *data = find_all_refs(&Semantics::new(db), pos, None).map(|result| {
+            *data = find_all_refs(
+                &Semantics::new(db),
+                pos,
+                &FindAllRefsConfig { search_scope: None, minicore: config.minicore },
+            )
+            .map(|result| {
                 result
                     .into_iter()
                     .flat_map(|res| res.references)
@@ -206,13 +243,14 @@ fn should_skip_runnable(kind: &RunnableKind, binary_target: bool) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use expect_test::{expect, Expect};
+    use expect_test::{Expect, expect};
+    use ide_db::MiniCore;
 
-    use crate::{fixture, Annotation, AnnotationConfig};
+    use crate::{Annotation, AnnotationConfig, fixture};
 
     use super::AnnotationLocation;
 
-    const DEFAULT_CONFIG: AnnotationConfig = AnnotationConfig {
+    const DEFAULT_CONFIG: AnnotationConfig<'_> = AnnotationConfig {
         binary_target: true,
         annotate_runnables: true,
         annotate_impls: true,
@@ -220,22 +258,28 @@ mod tests {
         annotate_method_references: true,
         annotate_enum_variant_references: true,
         location: AnnotationLocation::AboveName,
+        minicore: MiniCore::default(),
+        filter_adjacent_derive_implementations: false,
     };
 
-    fn check_with_config(ra_fixture: &str, expect: Expect, config: &AnnotationConfig) {
+    fn check_with_config(
+        #[rust_analyzer::rust_fixture] ra_fixture: &str,
+        expect: Expect,
+        config: &AnnotationConfig<'_>,
+    ) {
         let (analysis, file_id) = fixture::file(ra_fixture);
 
         let annotations: Vec<Annotation> = analysis
             .annotations(config, file_id)
             .unwrap()
             .into_iter()
-            .map(|annotation| analysis.resolve_annotation(annotation).unwrap())
+            .map(|annotation| analysis.resolve_annotation(&DEFAULT_CONFIG, annotation).unwrap())
             .collect();
 
         expect.assert_debug_eq(&annotations);
     }
 
-    fn check(ra_fixture: &str, expect: Expect) {
+    fn check(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect) {
         check_with_config(ra_fixture, expect, &DEFAULT_CONFIG);
     }
 
@@ -256,7 +300,7 @@ fn main() {
                     Annotation {
                         range: 6..10,
                         kind: HasReferences {
-                            pos: FilePosition {
+                            pos: FilePositionWrapper {
                                 file_id: FileId(
                                     0,
                                 ),
@@ -264,7 +308,7 @@ fn main() {
                             },
                             data: Some(
                                 [
-                                    FileRange {
+                                    FileRangeWrapper {
                                         file_id: FileId(
                                             0,
                                         ),
@@ -277,11 +321,25 @@ fn main() {
                     Annotation {
                         range: 30..36,
                         kind: HasReferences {
-                            pos: FilePosition {
+                            pos: FilePositionWrapper {
                                 file_id: FileId(
                                     0,
                                 ),
                                 offset: 30,
+                            },
+                            data: Some(
+                                [],
+                            ),
+                        },
+                    },
+                    Annotation {
+                        range: 53..57,
+                        kind: HasReferences {
+                            pos: FilePositionWrapper {
+                                file_id: FileId(
+                                    0,
+                                ),
+                                offset: 53,
                             },
                             data: Some(
                                 [],
@@ -304,22 +362,13 @@ fn main() {
                                 },
                                 kind: Bin,
                                 cfg: None,
+                                update_test: UpdateTest {
+                                    expect_test: false,
+                                    insta: false,
+                                    snapbox: false,
+                                },
                             },
                         ),
-                    },
-                    Annotation {
-                        range: 53..57,
-                        kind: HasReferences {
-                            pos: FilePosition {
-                                file_id: FileId(
-                                    0,
-                                ),
-                                offset: 53,
-                            },
-                            data: Some(
-                                [],
-                            ),
-                        },
                     },
                 ]
             "#]],
@@ -340,8 +389,22 @@ fn main() {
                 [
                     Annotation {
                         range: 7..11,
+                        kind: HasImpls {
+                            pos: FilePositionWrapper {
+                                file_id: FileId(
+                                    0,
+                                ),
+                                offset: 7,
+                            },
+                            data: Some(
+                                [],
+                            ),
+                        },
+                    },
+                    Annotation {
+                        range: 7..11,
                         kind: HasReferences {
-                            pos: FilePosition {
+                            pos: FilePositionWrapper {
                                 file_id: FileId(
                                     0,
                                 ),
@@ -349,7 +412,7 @@ fn main() {
                             },
                             data: Some(
                                 [
-                                    FileRange {
+                                    FileRangeWrapper {
                                         file_id: FileId(
                                             0,
                                         ),
@@ -360,13 +423,13 @@ fn main() {
                         },
                     },
                     Annotation {
-                        range: 7..11,
-                        kind: HasImpls {
-                            pos: FilePosition {
+                        range: 17..21,
+                        kind: HasReferences {
+                            pos: FilePositionWrapper {
                                 file_id: FileId(
                                     0,
                                 ),
-                                offset: 7,
+                                offset: 17,
                             },
                             data: Some(
                                 [],
@@ -389,22 +452,13 @@ fn main() {
                                 },
                                 kind: Bin,
                                 cfg: None,
+                                update_test: UpdateTest {
+                                    expect_test: false,
+                                    insta: false,
+                                    snapbox: false,
+                                },
                             },
                         ),
-                    },
-                    Annotation {
-                        range: 17..21,
-                        kind: HasReferences {
-                            pos: FilePosition {
-                                file_id: FileId(
-                                    0,
-                                ),
-                                offset: 17,
-                            },
-                            data: Some(
-                                [],
-                            ),
-                        },
                     },
                 ]
             "#]],
@@ -429,8 +483,8 @@ fn main() {
                 [
                     Annotation {
                         range: 7..11,
-                        kind: HasReferences {
-                            pos: FilePosition {
+                        kind: HasImpls {
+                            pos: FilePositionWrapper {
                                 file_id: FileId(
                                     0,
                                 ),
@@ -438,13 +492,37 @@ fn main() {
                             },
                             data: Some(
                                 [
-                                    FileRange {
+                                    NavigationTarget {
+                                        file_id: FileId(
+                                            0,
+                                        ),
+                                        full_range: 36..64,
+                                        focus_range: 57..61,
+                                        name: "impl",
+                                        kind: Impl,
+                                    },
+                                ],
+                            ),
+                        },
+                    },
+                    Annotation {
+                        range: 7..11,
+                        kind: HasReferences {
+                            pos: FilePositionWrapper {
+                                file_id: FileId(
+                                    0,
+                                ),
+                                offset: 7,
+                            },
+                            data: Some(
+                                [
+                                    FileRangeWrapper {
                                         file_id: FileId(
                                             0,
                                         ),
                                         range: 57..61,
                                     },
-                                    FileRange {
+                                    FileRangeWrapper {
                                         file_id: FileId(
                                             0,
                                         ),
@@ -455,33 +533,9 @@ fn main() {
                         },
                     },
                     Annotation {
-                        range: 7..11,
-                        kind: HasImpls {
-                            pos: FilePosition {
-                                file_id: FileId(
-                                    0,
-                                ),
-                                offset: 7,
-                            },
-                            data: Some(
-                                [
-                                    NavigationTarget {
-                                        file_id: FileId(
-                                            0,
-                                        ),
-                                        full_range: 36..64,
-                                        focus_range: 57..61,
-                                        name: "impl",
-                                        kind: Impl,
-                                    },
-                                ],
-                            ),
-                        },
-                    },
-                    Annotation {
                         range: 20..31,
                         kind: HasImpls {
-                            pos: FilePosition {
+                            pos: FilePositionWrapper {
                                 file_id: FileId(
                                     0,
                                 ),
@@ -505,7 +559,7 @@ fn main() {
                     Annotation {
                         range: 20..31,
                         kind: HasReferences {
-                            pos: FilePosition {
+                            pos: FilePositionWrapper {
                                 file_id: FileId(
                                     0,
                                 ),
@@ -513,7 +567,7 @@ fn main() {
                             },
                             data: Some(
                                 [
-                                    FileRange {
+                                    FileRangeWrapper {
                                         file_id: FileId(
                                             0,
                                         ),
@@ -526,7 +580,7 @@ fn main() {
                     Annotation {
                         range: 69..73,
                         kind: HasReferences {
-                            pos: FilePosition {
+                            pos: FilePositionWrapper {
                                 file_id: FileId(
                                     0,
                                 ),
@@ -553,6 +607,11 @@ fn main() {
                                 },
                                 kind: Bin,
                                 cfg: None,
+                                update_test: UpdateTest {
+                                    expect_test: false,
+                                    insta: false,
+                                    snapbox: false,
+                                },
                             },
                         ),
                     },
@@ -571,6 +630,20 @@ fn main() {}
                 [
                     Annotation {
                         range: 3..7,
+                        kind: HasReferences {
+                            pos: FilePositionWrapper {
+                                file_id: FileId(
+                                    0,
+                                ),
+                                offset: 3,
+                            },
+                            data: Some(
+                                [],
+                            ),
+                        },
+                    },
+                    Annotation {
+                        range: 3..7,
                         kind: Runnable(
                             Runnable {
                                 use_name_in_title: false,
@@ -585,22 +658,13 @@ fn main() {}
                                 },
                                 kind: Bin,
                                 cfg: None,
+                                update_test: UpdateTest {
+                                    expect_test: false,
+                                    insta: false,
+                                    snapbox: false,
+                                },
                             },
                         ),
-                    },
-                    Annotation {
-                        range: 3..7,
-                        kind: HasReferences {
-                            pos: FilePosition {
-                                file_id: FileId(
-                                    0,
-                                ),
-                                offset: 3,
-                            },
-                            data: Some(
-                                [],
-                            ),
-                        },
                     },
                 ]
             "#]],
@@ -625,35 +689,8 @@ fn main() {
                 [
                     Annotation {
                         range: 7..11,
-                        kind: HasReferences {
-                            pos: FilePosition {
-                                file_id: FileId(
-                                    0,
-                                ),
-                                offset: 7,
-                            },
-                            data: Some(
-                                [
-                                    FileRange {
-                                        file_id: FileId(
-                                            0,
-                                        ),
-                                        range: 19..23,
-                                    },
-                                    FileRange {
-                                        file_id: FileId(
-                                            0,
-                                        ),
-                                        range: 74..78,
-                                    },
-                                ],
-                            ),
-                        },
-                    },
-                    Annotation {
-                        range: 7..11,
                         kind: HasImpls {
-                            pos: FilePosition {
+                            pos: FilePositionWrapper {
                                 file_id: FileId(
                                     0,
                                 ),
@@ -675,9 +712,36 @@ fn main() {
                         },
                     },
                     Annotation {
+                        range: 7..11,
+                        kind: HasReferences {
+                            pos: FilePositionWrapper {
+                                file_id: FileId(
+                                    0,
+                                ),
+                                offset: 7,
+                            },
+                            data: Some(
+                                [
+                                    FileRangeWrapper {
+                                        file_id: FileId(
+                                            0,
+                                        ),
+                                        range: 19..23,
+                                    },
+                                    FileRangeWrapper {
+                                        file_id: FileId(
+                                            0,
+                                        ),
+                                        range: 74..78,
+                                    },
+                                ],
+                            ),
+                        },
+                    },
+                    Annotation {
                         range: 33..44,
                         kind: HasReferences {
-                            pos: FilePosition {
+                            pos: FilePositionWrapper {
                                 file_id: FileId(
                                     0,
                                 ),
@@ -685,7 +749,7 @@ fn main() {
                             },
                             data: Some(
                                 [
-                                    FileRange {
+                                    FileRangeWrapper {
                                         file_id: FileId(
                                             0,
                                         ),
@@ -698,7 +762,7 @@ fn main() {
                     Annotation {
                         range: 61..65,
                         kind: HasReferences {
-                            pos: FilePosition {
+                            pos: FilePositionWrapper {
                                 file_id: FileId(
                                     0,
                                 ),
@@ -725,6 +789,11 @@ fn main() {
                                 },
                                 kind: Bin,
                                 cfg: None,
+                                update_test: UpdateTest {
+                                    expect_test: false,
+                                    insta: false,
+                                    snapbox: false,
+                                },
                             },
                         ),
                     },
@@ -749,7 +818,7 @@ mod tests {
                     Annotation {
                         range: 3..7,
                         kind: HasReferences {
-                            pos: FilePosition {
+                            pos: FilePositionWrapper {
                                 file_id: FileId(
                                     0,
                                 ),
@@ -776,6 +845,11 @@ mod tests {
                                 },
                                 kind: Bin,
                                 cfg: None,
+                                update_test: UpdateTest {
+                                    expect_test: false,
+                                    insta: false,
+                                    snapbox: false,
+                                },
                             },
                         ),
                     },
@@ -798,6 +872,11 @@ mod tests {
                                     path: "tests",
                                 },
                                 cfg: None,
+                                update_test: UpdateTest {
+                                    expect_test: false,
+                                    insta: false,
+                                    snapbox: false,
+                                },
                             },
                         ),
                     },
@@ -824,6 +903,11 @@ mod tests {
                                     },
                                 },
                                 cfg: None,
+                                update_test: UpdateTest {
+                                    expect_test: false,
+                                    insta: false,
+                                    snapbox: false,
+                                },
                             },
                         ),
                     },
@@ -867,6 +951,56 @@ m!();
     }
 
     #[test]
+    fn test_annotations_macro_struct_def_call_site() {
+        check(
+            r#"
+//- /lib.rs
+macro_rules! m {
+    ($name:ident) => {
+        struct $name {}
+    };
+}
+
+m! {
+    Name
+};
+"#,
+            expect![[r#"
+                [
+                    Annotation {
+                        range: 83..87,
+                        kind: HasImpls {
+                            pos: FilePositionWrapper {
+                                file_id: FileId(
+                                    0,
+                                ),
+                                offset: 83,
+                            },
+                            data: Some(
+                                [],
+                            ),
+                        },
+                    },
+                    Annotation {
+                        range: 83..87,
+                        kind: HasReferences {
+                            pos: FilePositionWrapper {
+                                file_id: FileId(
+                                    0,
+                                ),
+                                offset: 83,
+                            },
+                            data: Some(
+                                [],
+                            ),
+                        },
+                    },
+                ]
+            "#]],
+        );
+    }
+
+    #[test]
     fn test_annotations_appear_above_whole_item_when_configured_to_do_so() {
         check_with_config(
             r#"
@@ -878,8 +1012,8 @@ struct Foo;
                 [
                     Annotation {
                         range: 0..71,
-                        kind: HasReferences {
-                            pos: FilePosition {
+                        kind: HasImpls {
+                            pos: FilePositionWrapper {
                                 file_id: FileId(
                                     0,
                                 ),
@@ -892,8 +1026,8 @@ struct Foo;
                     },
                     Annotation {
                         range: 0..71,
-                        kind: HasImpls {
-                            pos: FilePosition {
+                        kind: HasReferences {
+                            pos: FilePositionWrapper {
                                 file_id: FileId(
                                     0,
                                 ),

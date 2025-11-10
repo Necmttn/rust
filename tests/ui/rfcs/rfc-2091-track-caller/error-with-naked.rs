@@ -1,23 +1,26 @@
-// needs-asm-support
-#![feature(naked_functions)]
+//@ needs-asm-support
 
-use std::arch::asm;
+use std::arch::naked_asm;
 
-#[track_caller] //~ ERROR cannot use `#[track_caller]` with `#[naked]`
+#[track_caller] //~ ERROR [E0736]
 //~^ ERROR `#[track_caller]` requires Rust ABI
-#[naked]
+#[unsafe(naked)]
 extern "C" fn f() {
-    asm!("", options(noreturn));
+    unsafe {
+        naked_asm!("");
+    }
 }
 
 struct S;
 
 impl S {
-    #[track_caller] //~ ERROR cannot use `#[track_caller]` with `#[naked]`
+    #[track_caller] //~ ERROR [E0736]
     //~^ ERROR `#[track_caller]` requires Rust ABI
-    #[naked]
+    #[unsafe(naked)]
     extern "C" fn g() {
-        asm!("", options(noreturn));
+        unsafe {
+            naked_asm!("");
+        }
     }
 }
 

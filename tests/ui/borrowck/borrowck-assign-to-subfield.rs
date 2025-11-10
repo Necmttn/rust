@@ -1,6 +1,6 @@
-// run-pass
-// pretty-expanded FIXME #23616
+//@ run-pass
 
+#[allow(unused)]
 pub fn main() {
     struct A {
         a: isize,

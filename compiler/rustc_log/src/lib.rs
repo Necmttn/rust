@@ -9,17 +9,12 @@
 //! [dependencies]
 //! rustc_ast = { path = "../rust/compiler/rustc_ast" }
 //! rustc_log = { path = "../rust/compiler/rustc_log" }
-//! rustc_span = { path = "../rust/compiler/rustc_span" }
 //! ```
 //!
 //! ```
 //! fn main() {
 //!     rustc_log::init_logger(rustc_log::LoggerConfig::from_env("LOG")).unwrap();
-//!
-//!     let edition = rustc_span::edition::Edition::Edition2021;
-//!     rustc_span::create_session_globals_then(edition, || {
-//!         /* ... */
-//!     });
+//!     /* ... */
 //! }
 //! ```
 //!
@@ -38,19 +33,19 @@
 //! debugging, you can make changes inside those crates and quickly run main.rs
 //! to read the debug logs.
 
-#![deny(rustc::untranslatable_diagnostic)]
-#![deny(rustc::diagnostic_outside_of_impl)]
-
 use std::env::{self, VarError};
 use std::fmt::{self, Display};
 use std::io::{self, IsTerminal};
-use tracing_core::{Event, Subscriber};
+
+use tracing::dispatcher::SetGlobalDefaultError;
+use tracing::{Event, Subscriber};
+use tracing_subscriber::Registry;
 use tracing_subscriber::filter::{Directive, EnvFilter, LevelFilter};
-use tracing_subscriber::fmt::{
-    format::{self, FormatEvent, FormatFields},
-    FmtContext,
-};
+use tracing_subscriber::fmt::FmtContext;
+use tracing_subscriber::fmt::format::{self, FormatEvent, FormatFields};
 use tracing_subscriber::layer::SubscriberExt;
+// Re-export tracing
+pub use {tracing, tracing_core, tracing_subscriber};
 
 /// The values of all the environment variables that matter for configuring a logger.
 /// Errors are explicitly preserved so that we can share error handling.
@@ -60,6 +55,8 @@ pub struct LoggerConfig {
     pub verbose_entry_exit: Result<String, VarError>,
     pub verbose_thread_ids: Result<String, VarError>,
     pub backtrace: Result<String, VarError>,
+    pub wraptree: Result<String, VarError>,
+    pub lines: Result<String, VarError>,
 }
 
 impl LoggerConfig {
@@ -70,12 +67,44 @@ impl LoggerConfig {
             verbose_entry_exit: env::var(format!("{env}_ENTRY_EXIT")),
             verbose_thread_ids: env::var(format!("{env}_THREAD_IDS")),
             backtrace: env::var(format!("{env}_BACKTRACE")),
+            wraptree: env::var(format!("{env}_WRAPTREE")),
+            lines: env::var(format!("{env}_LINES")),
         }
     }
 }
 
 /// Initialize the logger with the given values for the filter, coloring, and other options env variables.
 pub fn init_logger(cfg: LoggerConfig) -> Result<(), Error> {
+    init_logger_with_additional_layer(cfg, Registry::default)
+}
+
+/// Trait alias for the complex return type of `build_subscriber` in
+/// [init_logger_with_additional_layer]. A [Registry] with any composition of [tracing::Subscriber]s
+/// (e.g. `Registry::default().with(custom_layer)`) should be compatible with this type.
+/// Having an alias is also useful so rustc_driver_impl does not need to explicitly depend on
+/// `tracing_subscriber`.
+pub trait BuildSubscriberRet:
+    tracing::Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span> + Send + Sync
+{
+}
+
+impl<
+    T: tracing::Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span> + Send + Sync,
+> BuildSubscriberRet for T
+{
+}
+
+/// Initialize the logger with the given values for the filter, coloring, and other options env variables.
+/// Additionally add a custom layer to collect logging and tracing events via `build_subscriber`,
+/// for example: `|| Registry::default().with(custom_layer)`.
+pub fn init_logger_with_additional_layer<F, T>(
+    cfg: LoggerConfig,
+    build_subscriber: F,
+) -> Result<(), Error>
+where
+    F: FnOnce() -> T,
+    T: BuildSubscriberRet,
+{
     let filter = match cfg.filter {
         Ok(env) => EnvFilter::new(env),
         _ => EnvFilter::default().add_directive(Directive::from(LevelFilter::WARN)),
@@ -102,29 +131,42 @@ pub fn init_logger(cfg: LoggerConfig) -> Result<(), Error> {
         Err(_) => false,
     };
 
-    let layer = tracing_tree::HierarchicalLayer::default()
+    let lines = match cfg.lines {
+        Ok(v) => &v == "1",
+        Err(_) => false,
+    };
+
+    let mut layer = tracing_tree::HierarchicalLayer::default()
         .with_writer(io::stderr)
-        .with_indent_lines(true)
         .with_ansi(color_logs)
         .with_targets(true)
         .with_verbose_exit(verbose_entry_exit)
         .with_verbose_entry(verbose_entry_exit)
         .with_indent_amount(2)
+        .with_indent_lines(lines)
         .with_thread_ids(verbose_thread_ids)
         .with_thread_names(verbose_thread_ids);
 
-    let subscriber = tracing_subscriber::Registry::default().with(filter).with(layer);
+    if let Ok(v) = cfg.wraptree {
+        match v.parse::<usize>() {
+            Ok(v) => layer = layer.with_wraparound(v),
+            Err(_) => return Err(Error::InvalidWraptree(v)),
+        }
+    }
+
+    let subscriber = build_subscriber();
+    // NOTE: It is important to make sure that the filter is applied on the last layer
     match cfg.backtrace {
-        Ok(str) => {
+        Ok(backtrace_target) => {
             let fmt_layer = tracing_subscriber::fmt::layer()
                 .with_writer(io::stderr)
                 .without_time()
-                .event_format(BacktraceFormatter { backtrace_target: str });
-            let subscriber = subscriber.with(fmt_layer);
-            tracing::subscriber::set_global_default(subscriber).unwrap();
+                .event_format(BacktraceFormatter { backtrace_target });
+            let subscriber = subscriber.with(layer).with(fmt_layer).with(filter);
+            tracing::subscriber::set_global_default(subscriber)?;
         }
         Err(_) => {
-            tracing::subscriber::set_global_default(subscriber).unwrap();
+            tracing::subscriber::set_global_default(subscriber.with(layer).with(filter))?;
         }
     };
 
@@ -150,7 +192,9 @@ where
         if !target.contains(&self.backtrace_target) {
             return Ok(());
         }
-        let backtrace = std::backtrace::Backtrace::capture();
+        // Use Backtrace::force_capture because we don't want to depend on the
+        // RUST_BACKTRACE environment variable being set.
+        let backtrace = std::backtrace::Backtrace::force_capture();
         writeln!(writer, "stack backtrace: \n{backtrace:?}")
     }
 }
@@ -167,6 +211,8 @@ pub fn stderr_isatty() -> bool {
 pub enum Error {
     InvalidColorValue(String),
     NonUnicodeColorValue,
+    InvalidWraptree(String),
+    AlreadyInit(SetGlobalDefaultError),
 }
 
 impl std::error::Error for Error {}
@@ -182,6 +228,17 @@ impl Display for Error {
                 formatter,
                 "non-Unicode log color value: expected one of always, never, or auto",
             ),
+            Error::InvalidWraptree(value) => write!(
+                formatter,
+                "invalid log WRAPTREE value '{value}': expected a non-negative integer",
+            ),
+            Error::AlreadyInit(tracing_error) => Display::fmt(tracing_error, formatter),
         }
+    }
+}
+
+impl From<SetGlobalDefaultError> for Error {
+    fn from(tracing_error: SetGlobalDefaultError) -> Self {
+        Error::AlreadyInit(tracing_error)
     }
 }

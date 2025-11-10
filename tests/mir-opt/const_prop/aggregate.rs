@@ -1,6 +1,6 @@
 // EMIT_MIR_FOR_EACH_PANIC_STRATEGY
-// unit-test: GVN
-// compile-flags: -O
+//@ test-mir-pass: GVN
+//@ compile-flags: -O
 
 // EMIT_MIR aggregate.main.GVN.diff
 fn main() {

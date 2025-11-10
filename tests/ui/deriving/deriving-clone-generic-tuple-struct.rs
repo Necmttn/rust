@@ -1,5 +1,4 @@
-// run-pass
-// pretty-expanded FIXME #23616
+//@ run-pass
 
 #[derive(Clone)]
 #[allow(dead_code)]

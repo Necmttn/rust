@@ -1,12 +1,7 @@
 // Make sure "highlighted" code is colored purple
 
-// compile-flags: --error-format=human --color=always
-// error-pattern:[35mfor<'a> [0m
-// edition:2018
-
-// revisions: windows not-windows
-// [windows]only-windows
-// [not-windows]ignore-windows
+//@ compile-flags: --error-format=human --color=always
+//@ edition:2018
 
 use core::pin::Pin;
 use core::future::Future;
@@ -25,3 +20,5 @@ fn wrapped_fn<'a>(_: Box<(dyn Any + Send)>) -> Pin<Box<(
 fn main() {
     query(wrapped_fn);
 }
+
+//~? RAW [35mfor<'a> [0m

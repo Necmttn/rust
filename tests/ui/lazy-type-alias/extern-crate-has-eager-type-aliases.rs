@@ -1,17 +1,17 @@
 // This test serves as a regression test for issue #114468 and it also ensures that we consider
 // type aliases from external crates that don't have `lazy_type_alias` enabled to be eager.
 
-// aux-crate:eager=eager.rs
-// edition: 2021
-// check-pass
+//@ aux-crate:eager=eager.rs
+//@ edition: 2021
+//@ check-pass
 
 #![feature(lazy_type_alias)]
 #![allow(incomplete_features)]
 
 // This used to crash when we were computing the variances of `Struct` since we would convert
-// `eager::Alias<T>` to a weak projection due to the presence of `#![feature(lazy_type_alias)]` in
+// `eager::Alias<T>` to a weak alias due to the presence of `#![feature(lazy_type_alias)]` in
 // this (!) crate and subsequently attempt to obtain the variances of the type alias associated with
-// the weak projection which would panic because we don't compute this information for eager type
+// the weak alias which would panic because we don't compute this information for eager type
 // aliases at all.
 struct Struct<T>(eager::Alias<T>);
 

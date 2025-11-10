@@ -1,62 +1,144 @@
-use crate::errors;
-use info;
-use libloading::Library;
-use rustc_ast as ast;
-use rustc_codegen_ssa::traits::CodegenBackend;
-#[cfg(parallel_compiler)]
-use rustc_data_structures::sync;
-use rustc_parse::validate_attr;
-use rustc_session as session;
-use rustc_session::config::{self, Cfg, CrateType, OutFileName, OutputFilenames, OutputTypes};
-use rustc_session::filesearch::sysroot_candidates;
-use rustc_session::lint::{self, BuiltinLintDiagnostics, LintBuffer};
-use rustc_session::{filesearch, output, Session};
-use rustc_span::edit_distance::find_best_match_for_name;
-use rustc_span::edition::Edition;
-use rustc_span::symbol::{sym, Symbol};
-use session::EarlyDiagCtxt;
-use std::env;
+use std::any::Any;
 use std::env::consts::{DLL_PREFIX, DLL_SUFFIX};
-use std::mem;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::OnceLock;
-use std::thread;
+use std::sync::{Arc, OnceLock};
+use std::{env, thread};
+
+use rustc_ast as ast;
+use rustc_attr_parsing::{ShouldEmit, validate_attr};
+use rustc_codegen_ssa::back::archive::{ArArchiveBuilderBuilder, ArchiveBuilderBuilder};
+use rustc_codegen_ssa::back::link::link_binary;
+use rustc_codegen_ssa::target_features::cfg_target_feature;
+use rustc_codegen_ssa::traits::CodegenBackend;
+use rustc_codegen_ssa::{CodegenResults, CrateInfo, TargetConfig};
+use rustc_data_structures::fx::FxIndexMap;
+use rustc_data_structures::jobserver::Proxy;
+use rustc_data_structures::sync;
+use rustc_errors::LintBuffer;
+use rustc_metadata::{DylibError, EncodedMetadata, load_symbol_from_dylib};
+use rustc_middle::dep_graph::{WorkProduct, WorkProductId};
+use rustc_middle::ty::{CurrentGcx, TyCtxt};
+use rustc_session::config::{
+    Cfg, CrateType, OutFileName, OutputFilenames, OutputTypes, Sysroot, host_tuple,
+};
+use rustc_session::output::{CRATE_TYPES, categorize_crate_type};
+use rustc_session::{EarlyDiagCtxt, Session, filesearch, lint};
+use rustc_span::edit_distance::find_best_match_for_name;
+use rustc_span::edition::Edition;
+use rustc_span::source_map::SourceMapInputs;
+use rustc_span::{SessionGlobals, Symbol, sym};
+use rustc_target::spec::Target;
+use tracing::info;
+
+use crate::errors;
+use crate::passes::parse_crate_name;
 
 /// Function pointer type that constructs a new CodegenBackend.
-pub type MakeBackendFn = fn() -> Box<dyn CodegenBackend>;
+type MakeBackendFn = fn() -> Box<dyn CodegenBackend>;
 
 /// Adds `target_feature = "..."` cfgs for a variety of platform
 /// specific features (SSE, NEON etc.).
 ///
 /// This is performed by checking whether a set of permitted features
 /// is available on the target machine, by querying the codegen backend.
-pub fn add_configuration(cfg: &mut Cfg, sess: &mut Session, codegen_backend: &dyn CodegenBackend) {
+pub(crate) fn add_configuration(
+    cfg: &mut Cfg,
+    sess: &mut Session,
+    codegen_backend: &dyn CodegenBackend,
+) {
     let tf = sym::target_feature;
+    let tf_cfg = codegen_backend.target_config(sess);
 
-    let unstable_target_features = codegen_backend.target_features(sess, true);
-    sess.unstable_target_features.extend(unstable_target_features.iter().cloned());
+    sess.unstable_target_features.extend(tf_cfg.unstable_target_features.iter().copied());
+    sess.target_features.extend(tf_cfg.target_features.iter().copied());
 
-    let target_features = codegen_backend.target_features(sess, false);
-    sess.target_features.extend(target_features.iter().cloned());
+    cfg.extend(tf_cfg.target_features.into_iter().map(|feat| (tf, Some(feat))));
 
-    cfg.extend(target_features.into_iter().map(|feat| (tf, Some(feat))));
+    if tf_cfg.has_reliable_f16 {
+        cfg.insert((sym::target_has_reliable_f16, None));
+    }
+    if tf_cfg.has_reliable_f16_math {
+        cfg.insert((sym::target_has_reliable_f16_math, None));
+    }
+    if tf_cfg.has_reliable_f128 {
+        cfg.insert((sym::target_has_reliable_f128, None));
+    }
+    if tf_cfg.has_reliable_f128_math {
+        cfg.insert((sym::target_has_reliable_f128_math, None));
+    }
 
     if sess.crt_static(None) {
         cfg.insert((tf, Some(sym::crt_dash_static)));
     }
 }
 
-const STACK_SIZE: usize = 8 * 1024 * 1024;
+/// Ensures that all target features required by the ABI are present.
+/// Must be called after `unstable_target_features` has been populated!
+pub(crate) fn check_abi_required_features(sess: &Session) {
+    let abi_feature_constraints = sess.target.abi_required_features();
+    // We check this against `unstable_target_features` as that is conveniently already
+    // back-translated to rustc feature names, taking into account `-Ctarget-cpu` and `-Ctarget-feature`.
+    // Just double-check that the features we care about are actually on our list.
+    for feature in
+        abi_feature_constraints.required.iter().chain(abi_feature_constraints.incompatible.iter())
+    {
+        assert!(
+            sess.target.rust_target_features().iter().any(|(name, ..)| feature == name),
+            "target feature {feature} is required/incompatible for the current ABI but not a recognized feature for this target"
+        );
+    }
 
-fn get_stack_size() -> Option<usize> {
-    // FIXME: Hacks on hacks. If the env is trying to override the stack size
-    // then *don't* set it explicitly.
-    env::var_os("RUST_MIN_STACK").is_none().then_some(STACK_SIZE)
+    for feature in abi_feature_constraints.required {
+        if !sess.unstable_target_features.contains(&Symbol::intern(feature)) {
+            sess.dcx().emit_warn(errors::AbiRequiredTargetFeature { feature, enabled: "enabled" });
+        }
+    }
+    for feature in abi_feature_constraints.incompatible {
+        if sess.unstable_target_features.contains(&Symbol::intern(feature)) {
+            sess.dcx().emit_warn(errors::AbiRequiredTargetFeature { feature, enabled: "disabled" });
+        }
+    }
 }
 
-pub(crate) fn run_in_thread_with_globals<F: FnOnce() -> R + Send, R: Send>(
+pub static STACK_SIZE: OnceLock<usize> = OnceLock::new();
+pub const DEFAULT_STACK_SIZE: usize = 8 * 1024 * 1024;
+
+fn init_stack_size(early_dcx: &EarlyDiagCtxt) -> usize {
+    // Obey the environment setting or default
+    *STACK_SIZE.get_or_init(|| {
+        env::var_os("RUST_MIN_STACK")
+            .as_ref()
+            .map(|os_str| os_str.to_string_lossy())
+            // if someone finds out `export RUST_MIN_STACK=640000` isn't enough stack
+            // they might try to "unset" it by running `RUST_MIN_STACK=  rustc code.rs`
+            // this is wrong, but std would nonetheless "do what they mean", so let's do likewise
+            .filter(|s| !s.trim().is_empty())
+            // rustc is a batch program, so error early on inputs which are unlikely to be intended
+            // so no one thinks we parsed them setting `RUST_MIN_STACK="64 megabytes"`
+            // FIXME: we could accept `RUST_MIN_STACK=64MB`, perhaps?
+            .map(|s| {
+                let s = s.trim();
+                // FIXME(workingjubilee): add proper diagnostics when we factor out "pre-run" setup
+                #[allow(rustc::untranslatable_diagnostic, rustc::diagnostic_outside_of_impl)]
+                s.parse::<usize>().unwrap_or_else(|_| {
+                    let mut err = early_dcx.early_struct_fatal(format!(
+                        r#"`RUST_MIN_STACK` should be a number of bytes, but was "{s}""#,
+                    ));
+                    err.note("you can also unset `RUST_MIN_STACK` to use the default stack size");
+                    err.emit()
+                })
+            })
+            // otherwise pick a consistent default
+            .unwrap_or(DEFAULT_STACK_SIZE)
+    })
+}
+
+fn run_in_thread_with_globals<F: FnOnce(CurrentGcx, Arc<Proxy>) -> R + Send, R: Send>(
+    thread_stack_size: usize,
     edition: Edition,
+    sm_inputs: SourceMapInputs,
+    extra_symbols: &[&'static str],
     f: F,
 ) -> R {
     // The "thread pool" is a single spawned thread in the non-parallel
@@ -65,10 +147,7 @@ pub(crate) fn run_in_thread_with_globals<F: FnOnce() -> R + Send, R: Send>(
     // the parallel compiler, in particular to ensure there is no accidental
     // sharing of data between the main thread and the compilation thread
     // (which might cause problems for the parallel compiler).
-    let mut builder = thread::Builder::new().name("rustc".to_string());
-    if let Some(size) = get_stack_size() {
-        builder = builder.stack_size(size);
-    }
+    let builder = thread::Builder::new().name("rustc".to_string()).stack_size(thread_stack_size);
 
     // We build the session globals and run `f` on the spawned thread, because
     // `SessionGlobals` does not impl `Send` in the non-parallel compiler.
@@ -76,7 +155,14 @@ pub(crate) fn run_in_thread_with_globals<F: FnOnce() -> R + Send, R: Send>(
         // `unwrap` is ok here because `spawn_scoped` only panics if the thread
         // name contains null bytes.
         let r = builder
-            .spawn_scoped(s, move || rustc_span::create_session_globals_then(edition, f))
+            .spawn_scoped(s, move || {
+                rustc_span::create_session_globals_then(
+                    edition,
+                    extra_symbols,
+                    Some(sm_inputs),
+                    || f(CurrentGcx::new(), Proxy::new()),
+                )
+            })
             .unwrap()
             .join();
 
@@ -87,65 +173,109 @@ pub(crate) fn run_in_thread_with_globals<F: FnOnce() -> R + Send, R: Send>(
     })
 }
 
-#[cfg(not(parallel_compiler))]
-pub(crate) fn run_in_thread_pool_with_globals<F: FnOnce() -> R + Send, R: Send>(
-    edition: Edition,
-    _threads: usize,
-    f: F,
-) -> R {
-    run_in_thread_with_globals(edition, f)
-}
-
-#[cfg(parallel_compiler)]
-pub(crate) fn run_in_thread_pool_with_globals<F: FnOnce() -> R + Send, R: Send>(
+pub(crate) fn run_in_thread_pool_with_globals<
+    F: FnOnce(CurrentGcx, Arc<Proxy>) -> R + Send,
+    R: Send,
+>(
+    thread_builder_diag: &EarlyDiagCtxt,
     edition: Edition,
     threads: usize,
+    extra_symbols: &[&'static str],
+    sm_inputs: SourceMapInputs,
     f: F,
 ) -> R {
-    use rustc_data_structures::{jobserver, sync::FromDyn};
+    use std::process;
+
+    use rustc_data_structures::defer;
+    use rustc_data_structures::sync::FromDyn;
     use rustc_middle::ty::tls;
     use rustc_query_impl::QueryCtxt;
-    use rustc_query_system::query::{deadlock, QueryContext};
+    use rustc_query_system::query::{QueryContext, break_query_cycles};
 
-    let registry = sync::Registry::new(std::num::NonZeroUsize::new(threads).unwrap());
+    let thread_stack_size = init_stack_size(thread_builder_diag);
+
+    let registry = sync::Registry::new(std::num::NonZero::new(threads).unwrap());
 
     if !sync::is_dyn_thread_safe() {
-        return run_in_thread_with_globals(edition, || {
-            // Register the thread for use with the `WorkerLocal` type.
-            registry.register();
+        return run_in_thread_with_globals(
+            thread_stack_size,
+            edition,
+            sm_inputs,
+            extra_symbols,
+            |current_gcx, jobserver_proxy| {
+                // Register the thread for use with the `WorkerLocal` type.
+                registry.register();
 
-            f()
-        });
+                f(current_gcx, jobserver_proxy)
+            },
+        );
     }
 
-    let mut builder = rayon::ThreadPoolBuilder::new()
+    let current_gcx = FromDyn::from(CurrentGcx::new());
+    let current_gcx2 = current_gcx.clone();
+
+    let proxy = Proxy::new();
+
+    let proxy_ = Arc::clone(&proxy);
+    let proxy__ = Arc::clone(&proxy);
+    let builder = rustc_thread_pool::ThreadPoolBuilder::new()
         .thread_name(|_| "rustc".to_string())
-        .acquire_thread_handler(jobserver::acquire_thread)
-        .release_thread_handler(jobserver::release_thread)
+        .acquire_thread_handler(move || proxy_.acquire_thread())
+        .release_thread_handler(move || proxy__.release_thread())
         .num_threads(threads)
-        .deadlock_handler(|| {
+        .deadlock_handler(move || {
             // On deadlock, creates a new thread and forwards information in thread
             // locals to it. The new thread runs the deadlock handler.
-            let query_map =
-                FromDyn::from(tls::with(|tcx| QueryCtxt::new(tcx).collect_active_jobs()));
-            let registry = rayon_core::Registry::current();
-            thread::spawn(move || deadlock(query_map.into_inner(), &registry));
-        });
-    if let Some(size) = get_stack_size() {
-        builder = builder.stack_size(size);
-    }
+
+            let current_gcx2 = current_gcx2.clone();
+            let registry = rustc_thread_pool::Registry::current();
+            let session_globals = rustc_span::with_session_globals(|session_globals| {
+                session_globals as *const SessionGlobals as usize
+            });
+            thread::Builder::new()
+                .name("rustc query cycle handler".to_string())
+                .spawn(move || {
+                    let on_panic = defer(|| {
+                        eprintln!("internal compiler error: query cycle handler thread panicked, aborting process");
+                        // We need to abort here as we failed to resolve the deadlock,
+                        // otherwise the compiler could just hang,
+                        process::abort();
+                    });
+
+                    // Get a `GlobalCtxt` reference from `CurrentGcx` as we cannot rely on having a
+                    // `TyCtxt` TLS reference here.
+                    current_gcx2.access(|gcx| {
+                        tls::enter_context(&tls::ImplicitCtxt::new(gcx), || {
+                            tls::with(|tcx| {
+                                // Accessing session globals is sound as they outlive `GlobalCtxt`.
+                                // They are needed to hash query keys containing spans or symbols.
+                                let query_map = rustc_span::set_session_globals_then(unsafe { &*(session_globals as *const SessionGlobals) }, || {
+                                    // Ensure there was no errors collecting all active jobs.
+                                    // We need the complete map to ensure we find a cycle to break.
+                                    QueryCtxt::new(tcx).collect_active_jobs().expect("failed to collect active queries in deadlock handler")
+                                });
+                                break_query_cycles(query_map, &registry);
+                            })
+                        })
+                    });
+
+                    on_panic.disable();
+                })
+                .unwrap();
+        })
+        .stack_size(thread_stack_size);
 
     // We create the session globals on the main thread, then create the thread
     // pool. Upon creation, each worker thread created gets a copy of the
     // session globals in TLS. This is possible because `SessionGlobals` impls
     // `Send` in the parallel compiler.
-    rustc_span::create_session_globals_then(edition, || {
+    rustc_span::create_session_globals_then(edition, extra_symbols, Some(sm_inputs), || {
         rustc_span::with_session_globals(|session_globals| {
             let session_globals = FromDyn::from(session_globals);
             builder
                 .build_scoped(
                     // Initialize each new worker thread when created.
-                    move |thread: rayon::ThreadBuilder| {
+                    move |thread: rustc_thread_pool::ThreadBuilder| {
                         // Register the thread for use with the `WorkerLocal` type.
                         registry.register();
 
@@ -154,37 +284,38 @@ pub(crate) fn run_in_thread_pool_with_globals<F: FnOnce() -> R + Send, R: Send>(
                         })
                     },
                     // Run `f` on the first thread in the thread pool.
-                    move |pool: &rayon::ThreadPool| pool.install(f),
+                    move |pool: &rustc_thread_pool::ThreadPool| {
+                        pool.install(|| f(current_gcx.into_inner(), proxy))
+                    },
                 )
-                .unwrap()
+                .unwrap_or_else(|err| {
+                    let mut diag = thread_builder_diag.early_struct_fatal(format!(
+                        "failed to spawn compiler thread pool: could not create {threads} threads ({err})",
+                    ));
+                    diag.help(
+                        "try lowering `-Z threads` or checking the operating system's resource limits",
+                    );
+                    diag.emit();
+                })
         })
     })
 }
 
+#[allow(rustc::untranslatable_diagnostic)] // FIXME: make this translatable
 fn load_backend_from_dylib(early_dcx: &EarlyDiagCtxt, path: &Path) -> MakeBackendFn {
-    fn format_err(e: &(dyn std::error::Error + 'static)) -> String {
-        e.sources().map(|e| format!(": {e}")).collect()
-    }
-    let lib = unsafe { Library::new(path) }.unwrap_or_else(|err| {
-        let err = format!("couldn't load codegen backend {path:?}{}", format_err(&err));
-        early_dcx.early_fatal(err);
-    });
-
-    let backend_sym = unsafe { lib.get::<MakeBackendFn>(b"__rustc_codegen_backend") }
-        .unwrap_or_else(|e| {
+    match unsafe { load_symbol_from_dylib::<MakeBackendFn>(path, "__rustc_codegen_backend") } {
+        Ok(backend_sym) => backend_sym,
+        Err(DylibError::DlOpen(path, err)) => {
+            let err = format!("couldn't load codegen backend {path}{err}");
+            early_dcx.early_fatal(err);
+        }
+        Err(DylibError::DlSym(_path, err)) => {
             let e = format!(
-                "`__rustc_codegen_backend` symbol lookup in the codegen backend failed{}",
-                format_err(&e)
+                "`__rustc_codegen_backend` symbol lookup in the codegen backend failed{err}",
             );
             early_dcx.early_fatal(e);
-        });
-
-    // Intentionally leak the dynamic library. We can't ever unload it
-    // since the library can make things that will live arbitrarily long.
-    let backend_sym = unsafe { backend_sym.into_raw() };
-    mem::forget(lib);
-
-    *backend_sym
+        }
+    }
 }
 
 /// Get the codegen backend based on the name and specified sysroot.
@@ -192,21 +323,26 @@ fn load_backend_from_dylib(early_dcx: &EarlyDiagCtxt, path: &Path) -> MakeBacken
 /// A name of `None` indicates that the default backend should be used.
 pub fn get_codegen_backend(
     early_dcx: &EarlyDiagCtxt,
-    maybe_sysroot: &Option<PathBuf>,
+    sysroot: &Sysroot,
     backend_name: Option<&str>,
+    target: &Target,
 ) -> Box<dyn CodegenBackend> {
     static LOAD: OnceLock<unsafe fn() -> Box<dyn CodegenBackend>> = OnceLock::new();
 
     let load = LOAD.get_or_init(|| {
-        let default_codegen_backend = option_env!("CFG_DEFAULT_CODEGEN_BACKEND").unwrap_or("llvm");
+        let backend = backend_name
+            .or(target.default_codegen_backend.as_deref())
+            .or(option_env!("CFG_DEFAULT_CODEGEN_BACKEND"))
+            .unwrap_or("dummy");
 
-        match backend_name.unwrap_or(default_codegen_backend) {
+        match backend {
             filename if filename.contains('.') => {
                 load_backend_from_dylib(early_dcx, filename.as_ref())
             }
+            "dummy" => || Box::new(DummyCodegenBackend),
             #[cfg(feature = "llvm")]
             "llvm" => rustc_codegen_llvm::LlvmCodegenBackend::new,
-            backend_name => get_codegen_sysroot(early_dcx, maybe_sysroot, backend_name),
+            backend_name => get_codegen_sysroot(early_dcx, sysroot, backend_name),
         }
     });
 
@@ -216,31 +352,142 @@ pub fn get_codegen_backend(
     unsafe { load() }
 }
 
+struct DummyCodegenBackend;
+
+impl CodegenBackend for DummyCodegenBackend {
+    fn locale_resource(&self) -> &'static str {
+        ""
+    }
+
+    fn name(&self) -> &'static str {
+        "dummy"
+    }
+
+    fn target_config(&self, sess: &Session) -> TargetConfig {
+        let (target_features, unstable_target_features) = cfg_target_feature::<0>(
+            sess,
+            |_feature| Default::default(),
+            |feature| {
+                // This is a standin for the list of features a backend is expected to enable.
+                // It would be better to parse target.features instead and handle implied features,
+                // but target.features is a list of LLVM target features, not Rust target features.
+                // The dummy backend doesn't know the mapping between LLVM and Rust target features.
+                sess.target.abi_required_features().required.contains(&feature)
+            },
+        );
+
+        TargetConfig {
+            target_features,
+            unstable_target_features,
+            has_reliable_f16: true,
+            has_reliable_f16_math: true,
+            has_reliable_f128: true,
+            has_reliable_f128_math: true,
+        }
+    }
+
+    fn supported_crate_types(&self, _sess: &Session) -> Vec<CrateType> {
+        // This includes bin despite failing on the link step to ensure that you
+        // can still get the frontend handling for binaries. For all library
+        // like crate types cargo will fallback to rlib unless you specifically
+        // say that only a different crate type must be used.
+        vec![CrateType::Rlib, CrateType::Executable]
+    }
+
+    fn codegen_crate<'tcx>(&self, tcx: TyCtxt<'tcx>) -> Box<dyn Any> {
+        Box::new(CodegenResults {
+            modules: vec![],
+            allocator_module: None,
+            crate_info: CrateInfo::new(tcx, String::new()),
+        })
+    }
+
+    fn join_codegen(
+        &self,
+        ongoing_codegen: Box<dyn Any>,
+        _sess: &Session,
+        _outputs: &OutputFilenames,
+    ) -> (CodegenResults, FxIndexMap<WorkProductId, WorkProduct>) {
+        (*ongoing_codegen.downcast().unwrap(), FxIndexMap::default())
+    }
+
+    fn link(
+        &self,
+        sess: &Session,
+        codegen_results: CodegenResults,
+        metadata: EncodedMetadata,
+        outputs: &OutputFilenames,
+    ) {
+        // JUSTIFICATION: TyCtxt no longer available here
+        #[allow(rustc::bad_opt_access)]
+        if let Some(&crate_type) = codegen_results
+            .crate_info
+            .crate_types
+            .iter()
+            .find(|&&crate_type| crate_type != CrateType::Rlib)
+            && outputs.outputs.should_link()
+        {
+            #[allow(rustc::untranslatable_diagnostic)]
+            #[allow(rustc::diagnostic_outside_of_impl)]
+            sess.dcx().fatal(format!(
+                "crate type {crate_type} not supported by the dummy codegen backend"
+            ));
+        }
+
+        link_binary(
+            sess,
+            &DummyArchiveBuilderBuilder,
+            codegen_results,
+            metadata,
+            outputs,
+            self.name(),
+        );
+    }
+}
+
+struct DummyArchiveBuilderBuilder;
+
+impl ArchiveBuilderBuilder for DummyArchiveBuilderBuilder {
+    fn new_archive_builder<'a>(
+        &self,
+        sess: &'a Session,
+    ) -> Box<dyn rustc_codegen_ssa::back::archive::ArchiveBuilder + 'a> {
+        ArArchiveBuilderBuilder.new_archive_builder(sess)
+    }
+
+    fn create_dll_import_lib(
+        &self,
+        sess: &Session,
+        _lib_name: &str,
+        _items: Vec<rustc_codegen_ssa::back::archive::ImportLibraryItem>,
+        output_path: &Path,
+    ) {
+        // Build an empty static library to avoid calling an external dlltool on mingw
+        ArArchiveBuilderBuilder.new_archive_builder(sess).build(output_path);
+    }
+}
+
 // This is used for rustdoc, but it uses similar machinery to codegen backend
 // loading, so we leave the code here. It is potentially useful for other tools
 // that want to invoke the rustc binary while linking to rustc as well.
-pub fn rustc_path<'a>() -> Option<&'a Path> {
+pub fn rustc_path<'a>(sysroot: &Sysroot) -> Option<&'a Path> {
     static RUSTC_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
 
-    const BIN_PATH: &str = env!("RUSTC_INSTALL_BINDIR");
-
-    RUSTC_PATH.get_or_init(|| get_rustc_path_inner(BIN_PATH)).as_deref()
+    RUSTC_PATH
+        .get_or_init(|| {
+            let candidate = sysroot
+                .default
+                .join(env!("RUSTC_INSTALL_BINDIR"))
+                .join(if cfg!(target_os = "windows") { "rustc.exe" } else { "rustc" });
+            candidate.exists().then_some(candidate)
+        })
+        .as_deref()
 }
 
-fn get_rustc_path_inner(bin_path: &str) -> Option<PathBuf> {
-    sysroot_candidates().iter().find_map(|sysroot| {
-        let candidate = sysroot.join(bin_path).join(if cfg!(target_os = "windows") {
-            "rustc.exe"
-        } else {
-            "rustc"
-        });
-        candidate.exists().then_some(candidate)
-    })
-}
-
+#[allow(rustc::untranslatable_diagnostic)] // FIXME: make this translatable
 fn get_codegen_sysroot(
     early_dcx: &EarlyDiagCtxt,
-    maybe_sysroot: &Option<PathBuf>,
+    sysroot: &Sysroot,
     backend_name: &str,
 ) -> MakeBackendFn {
     // For now we only allow this function to be called once as it'll dlopen a
@@ -254,39 +501,36 @@ fn get_codegen_sysroot(
         "cannot load the default codegen backend twice"
     );
 
-    let target = session::config::host_triple();
-    let sysroot_candidates = sysroot_candidates();
+    let target = host_tuple();
 
-    let sysroot = maybe_sysroot
-        .iter()
-        .chain(sysroot_candidates.iter())
+    let sysroot = sysroot
+        .all_paths()
         .map(|sysroot| {
             filesearch::make_target_lib_path(sysroot, target).with_file_name("codegen-backends")
         })
         .find(|f| {
             info!("codegen backend candidate: {}", f.display());
             f.exists()
+        })
+        .unwrap_or_else(|| {
+            let candidates = sysroot
+                .all_paths()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join("\n* ");
+            let err = format!(
+                "failed to find a `codegen-backends` folder in the sysroot candidates:\n\
+                 * {candidates}"
+            );
+            early_dcx.early_fatal(err);
         });
-    let sysroot = sysroot.unwrap_or_else(|| {
-        let candidates = sysroot_candidates
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>()
-            .join("\n* ");
-        let err = format!(
-            "failed to find a `codegen-backends` folder \
-                           in the sysroot candidates:\n* {candidates}"
-        );
-        early_dcx.early_fatal(err);
-    });
+
     info!("probing {} for a codegen backend", sysroot.display());
 
     let d = sysroot.read_dir().unwrap_or_else(|e| {
         let err = format!(
-            "failed to load default codegen backend, couldn't \
-                           read `{}`: {}",
+            "failed to load default codegen backend, couldn't read `{}`: {e}",
             sysroot.display(),
-            e
         );
         early_dcx.early_fatal(err);
     });
@@ -345,109 +589,37 @@ pub(crate) fn check_attr_crate_type(
 
                 if let ast::MetaItemKind::NameValue(spanned) = a.meta_kind().unwrap() {
                     let span = spanned.span;
-                    let lev_candidate = find_best_match_for_name(
+                    let candidate = find_best_match_for_name(
                         &CRATE_TYPES.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
                         n,
                         None,
                     );
-                    if let Some(candidate) = lev_candidate {
-                        lint_buffer.buffer_lint_with_diagnostic(
-                            lint::builtin::UNKNOWN_CRATE_TYPES,
-                            ast::CRATE_NODE_ID,
-                            span,
-                            "invalid `crate_type` value",
-                            BuiltinLintDiagnostics::UnknownCrateTypes(
-                                span,
-                                "did you mean".to_string(),
-                                format!("\"{candidate}\""),
-                            ),
-                        );
-                    } else {
-                        lint_buffer.buffer_lint(
-                            lint::builtin::UNKNOWN_CRATE_TYPES,
-                            ast::CRATE_NODE_ID,
-                            span,
-                            "invalid `crate_type` value",
-                        );
-                    }
+                    lint_buffer.buffer_lint(
+                        lint::builtin::UNKNOWN_CRATE_TYPES,
+                        ast::CRATE_NODE_ID,
+                        span,
+                        errors::UnknownCrateTypes {
+                            sugg: candidate
+                                .map(|cand| errors::UnknownCrateTypesSub { span, snippet: cand }),
+                        },
+                    );
                 }
             } else {
                 // This is here mainly to check for using a macro, such as
-                // #![crate_type = foo!()]. That is not supported since the
+                // `#![crate_type = foo!()]`. That is not supported since the
                 // crate type needs to be known very early in compilation long
                 // before expansion. Otherwise, validation would normally be
-                // caught in AstValidator (via `check_builtin_attribute`), but
-                // by the time that runs the macro is expanded, and it doesn't
+                // caught during semantic analysis via `TyCtxt::check_mod_attrs`,
+                // but by the time that runs the macro is expanded, and it doesn't
                 // give an error.
                 validate_attr::emit_fatal_malformed_builtin_attribute(
-                    &sess.parse_sess,
+                    &sess.psess,
                     a,
                     sym::crate_type,
                 );
             }
         }
     }
-}
-
-const CRATE_TYPES: &[(Symbol, CrateType)] = &[
-    (sym::rlib, CrateType::Rlib),
-    (sym::dylib, CrateType::Dylib),
-    (sym::cdylib, CrateType::Cdylib),
-    (sym::lib, config::default_lib_output()),
-    (sym::staticlib, CrateType::Staticlib),
-    (sym::proc_dash_macro, CrateType::ProcMacro),
-    (sym::bin, CrateType::Executable),
-];
-
-fn categorize_crate_type(s: Symbol) -> Option<CrateType> {
-    Some(CRATE_TYPES.iter().find(|(key, _)| *key == s)?.1)
-}
-
-pub fn collect_crate_types(session: &Session, attrs: &[ast::Attribute]) -> Vec<CrateType> {
-    // If we're generating a test executable, then ignore all other output
-    // styles at all other locations
-    if session.opts.test {
-        return vec![CrateType::Executable];
-    }
-
-    // Only check command line flags if present. If no types are specified by
-    // command line, then reuse the empty `base` Vec to hold the types that
-    // will be found in crate attributes.
-    // JUSTIFICATION: before wrapper fn is available
-    #[allow(rustc::bad_opt_access)]
-    let mut base = session.opts.crate_types.clone();
-    if base.is_empty() {
-        let attr_types = attrs.iter().filter_map(|a| {
-            if a.has_name(sym::crate_type)
-                && let Some(s) = a.value_str()
-            {
-                categorize_crate_type(s)
-            } else {
-                None
-            }
-        });
-        base.extend(attr_types);
-        if base.is_empty() {
-            base.push(output::default_output_for_target(session));
-        } else {
-            base.sort();
-            base.dedup();
-        }
-    }
-
-    base.retain(|crate_type| {
-        if output::invalid_output_for_target(session, *crate_type) {
-            session.dcx().emit_warn(errors::UnsupportedCrateTypeForTarget {
-                crate_type: *crate_type,
-                target_triple: &session.opts.target_triple,
-            });
-            false
-        } else {
-            true
-        }
-    });
-
-    base
 }
 
 fn multiple_output_types_to_stdout(
@@ -482,11 +654,10 @@ pub fn build_output_filenames(attrs: &[ast::Attribute], sess: &Session) -> Outpu
         sess.dcx().emit_fatal(errors::MultipleOutputTypesToStdout);
     }
 
-    let crate_name = sess
-        .opts
-        .crate_name
-        .clone()
-        .or_else(|| rustc_attr::find_crate_name(attrs).map(|n| n.to_string()));
+    let crate_name =
+        sess.opts.crate_name.clone().or_else(|| {
+            parse_crate_name(sess, attrs, ShouldEmit::Nothing).map(|i| i.0.to_string())
+        });
 
     match sess.io.output_file {
         None => {
@@ -504,6 +675,7 @@ pub fn build_output_filenames(attrs: &[ast::Attribute], sess: &Session) -> Outpu
                 stem,
                 None,
                 sess.io.temps_dir.clone(),
+                sess.opts.unstable_opts.split_dwarf_out_dir.clone(),
                 sess.opts.cg.extra_filename.clone(),
                 sess.opts.output_types.clone(),
             )
@@ -521,7 +693,7 @@ pub fn build_output_filenames(attrs: &[ast::Attribute], sess: &Session) -> Outpu
                 }
                 Some(out_file.clone())
             };
-            if sess.io.output_dir != None {
+            if sess.io.output_dir.is_some() {
                 sess.dcx().emit_warn(errors::IgnoringOutDir);
             }
 
@@ -533,6 +705,7 @@ pub fn build_output_filenames(attrs: &[ast::Attribute], sess: &Session) -> Outpu
                 out_filestem,
                 ofile,
                 sess.io.temps_dir.clone(),
+                sess.opts.unstable_opts.split_dwarf_out_dir.clone(),
                 sess.opts.cg.extra_filename.clone(),
                 sess.opts.output_types.clone(),
             )

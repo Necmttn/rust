@@ -1,8 +1,9 @@
 // Test incremental compilation tracking where we change nothing
 // in between revisions (hashing should be stable).
 
-// revisions:rpass1 rpass2
-// compile-flags: -Z query-dep-graph
+//@ revisions:rpass1 rpass2
+//@ compile-flags: -Z query-dep-graph
+//@ ignore-backends: gcc
 
 #![feature(rustc_attrs)]
 

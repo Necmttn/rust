@@ -1,4 +1,4 @@
-// edition:2021
+//@ edition:2021
 #![feature(rustc_attrs)]
 
 // Ensure that capture analysis results in arrays being completely captured.
@@ -13,10 +13,10 @@ fn main() {
     //~^ ERROR: First Pass analysis includes:
     //~| ERROR: Min Capture analysis includes:
         m[0] += 10;
-        //~^ NOTE: Capturing m[] -> MutBorrow
-        //~| NOTE: Min Capture m[] -> MutBorrow
+        //~^ NOTE: Capturing m[] -> Mutable
+        //~| NOTE: Min Capture m[] -> Mutable
         m[1] += 40;
-        //~^ NOTE: Capturing m[] -> MutBorrow
+        //~^ NOTE: Capturing m[] -> Mutable
     };
 
     c();

@@ -28,9 +28,11 @@ fn main() {
         panic!("qaqaq{:?}", a);
     }
     if !a.is_empty() {
+        //~^ manual_assert
         panic!("qaqaq{:?}", a);
     }
     if !a.is_empty() {
+        //~^ manual_assert
         panic!("qwqwq");
     }
     if a.len() == 3 {
@@ -48,21 +50,27 @@ fn main() {
     }
     let b = vec![1, 2, 3];
     if b.is_empty() {
+        //~^ manual_assert
         panic!("panic1");
     }
     if b.is_empty() && a.is_empty() {
+        //~^ manual_assert
         panic!("panic2");
     }
     if a.is_empty() && !b.is_empty() {
+        //~^ manual_assert
         panic!("panic3");
     }
     if b.is_empty() || a.is_empty() {
+        //~^ manual_assert
         panic!("panic4");
     }
     if a.is_empty() || !b.is_empty() {
+        //~^ manual_assert
         panic!("panic5");
     }
     if a.is_empty() {
+        //~^ manual_assert
         panic!("with expansion {}", one!())
     }
     if a.is_empty() {
@@ -75,6 +83,7 @@ fn main() {
 fn issue7730(a: u8) {
     // Suggestion should preserve comment
     if a > 2 {
+        //~^ manual_assert
         // comment
         /* this is a
         multiline
@@ -82,4 +91,29 @@ fn issue7730(a: u8) {
         /// Doc comment
         panic!("panic with comment") // comment after `panic!`
     }
+}
+
+fn issue12505() {
+    struct Foo<T, const N: usize>(T);
+
+    impl<T, const N: usize> Foo<T, N> {
+        const BAR: () = if N == 0 {
+            //~^ manual_assert
+            panic!()
+        };
+    }
+}
+
+fn issue15227(left: u64, right: u64) -> u64 {
+    macro_rules! is_x86_feature_detected {
+        ($feature:literal) => {
+            $feature.len() > 0 && $feature.starts_with("ss")
+        };
+    }
+
+    if !is_x86_feature_detected!("ssse3") {
+        //~^ manual_assert
+        panic!("SSSE3 is not supported");
+    }
+    unsafe { todo!() }
 }

@@ -1,8 +1,7 @@
-// run-pass
+//@ run-pass
 // check raw fat pointer ops in mir
 // FIXME: please improve this when we get monomorphization support
 
-#![feature(raw_ref_op)]
 #![allow(ambiguous_wide_pointer_comparisons)]
 
 use std::mem;
@@ -98,7 +97,7 @@ fn assert_inorder<T: Copy>(a: &[T],
     }
 }
 
-trait Foo { fn foo(&self) -> usize; }
+trait Foo { fn foo(&self) -> usize; } //~ WARN method `foo` is never used
 impl<T> Foo for T {
     fn foo(&self) -> usize {
         mem::size_of::<T>()

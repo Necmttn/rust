@@ -1,5 +1,4 @@
-// compile-flags: -Znext-solver
-
+//@ compile-flags: -Znext-solver
 #![feature(specialization)]
 //~^ WARN the feature `specialization` is incomplete
 
@@ -10,10 +9,9 @@ trait Default {
 }
 
 impl<T> Default for T {
-    default type Id = T; //~ ERROR type annotations needed
-    // This will be fixed by #111994
+    default type Id = T;
     fn intu(&self) -> &Self::Id {
-        self
+        self //~ ERROR mismatched types
     }
 }
 
@@ -21,8 +19,10 @@ fn transmute<T: Default<Id = U>, U: Copy>(t: T) -> U {
     *t.intu()
 }
 
-use std::num::NonZeroU8;
+use std::num::NonZero;
+
 fn main() {
-    let s = transmute::<u8, Option<NonZeroU8>>(0); // this call should then error
+    let s = transmute::<u8, Option<NonZero<u8>>>(0);
+    //~^ ERROR type mismatch resolving `<u8 as Default>::Id == Option<NonZero<u8>>`
     assert_eq!(s, None);
 }

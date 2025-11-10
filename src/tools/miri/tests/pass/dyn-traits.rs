@@ -1,3 +1,7 @@
+#[path = "../utils/mod.rs"]
+mod utils;
+use utils::check_nondet;
+
 fn ref_box_dyn() {
     struct Struct(i32);
 
@@ -141,7 +145,17 @@ fn unsized_dyn_autoderef() {
 }
 */
 
+fn vtable_ptr_eq() {
+    use std::{fmt, ptr};
+
+    // We don't always get the same vtable when casting this to a wide pointer.
+    let x = &2;
+    let x_wide = x as &dyn fmt::Display;
+    check_nondet(|| ptr::eq(x as &dyn fmt::Display, x_wide));
+}
+
 fn main() {
     ref_box_dyn();
     box_box_trait();
+    vtable_ptr_eq();
 }

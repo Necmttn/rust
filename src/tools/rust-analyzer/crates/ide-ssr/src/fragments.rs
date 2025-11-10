@@ -6,7 +6,7 @@
 //! needs to determine it somehow. We do this in a stupid way -- by pasting SSR
 //! rule into different contexts and checking what works.
 
-use syntax::{ast, AstNode, SyntaxNode};
+use syntax::{AstNode, SyntaxNode, ast};
 
 pub(crate) fn ty(s: &str) -> Result<SyntaxNode, ()> {
     fragment::<ast::Type>("type T = {};", s)
@@ -27,7 +27,7 @@ pub(crate) fn expr(s: &str) -> Result<SyntaxNode, ()> {
 pub(crate) fn stmt(s: &str) -> Result<SyntaxNode, ()> {
     let template = "const _: () = { {}; };";
     let input = template.replace("{}", s);
-    let parse = syntax::SourceFile::parse(&input);
+    let parse = syntax::SourceFile::parse(&input, syntax::Edition::CURRENT);
     if !parse.errors().is_empty() {
         return Err(());
     }
@@ -48,7 +48,7 @@ pub(crate) fn stmt(s: &str) -> Result<SyntaxNode, ()> {
 fn fragment<T: AstNode>(template: &str, s: &str) -> Result<SyntaxNode, ()> {
     let s = s.trim();
     let input = template.replace("{}", s);
-    let parse = syntax::SourceFile::parse(&input);
+    let parse = syntax::SourceFile::parse(&input, syntax::Edition::CURRENT);
     if !parse.errors().is_empty() {
         return Err(());
     }

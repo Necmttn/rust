@@ -1,39 +1,40 @@
-use std::iter;
+use std::{iter, ops::RangeInclusive};
 
 use ast::make;
 use either::Either;
 use hir::{
-    DescendPreference, HasSource, HirDisplay, InFile, Local, LocalSource, ModuleDef,
-    PathResolution, Semantics, TypeInfo, TypeParam,
+    HasSource, HirDisplay, InFile, Local, LocalSource, ModuleDef, PathResolution, Semantics,
+    TypeInfo, TypeParam,
 };
 use ide_db::{
+    FxIndexSet, RootDatabase,
+    assists::GroupLabel,
     defs::{Definition, NameRefClass},
     famous_defs::FamousDefs,
     helpers::mod_path_to_ast,
-    imports::insert_use::{insert_use, ImportScope},
+    imports::insert_use::{ImportScope, insert_use},
     search::{FileReference, ReferenceCategory, SearchScope},
+    source_change::SourceChangeBuilder,
     syntax_helpers::node_ext::{
         for_each_tail_expr, preorder_expr, walk_expr, walk_pat, walk_patterns_in_expr,
     },
-    FxIndexSet, RootDatabase,
 };
 use itertools::Itertools;
-use stdx::format_to;
 use syntax::{
-    ast::{
-        self,
-        edit::{AstNodeEdit, IndentLevel},
-        AstNode, HasGenericParams,
-    },
-    match_ast, ted, AstToken, SyntaxElement,
+    Edition, SyntaxElement,
     SyntaxKind::{self, COMMENT},
-    SyntaxNode, SyntaxToken, TextRange, TextSize, TokenAtOffset, WalkEvent, T,
+    SyntaxNode, SyntaxToken, T, TextRange, TextSize, TokenAtOffset, WalkEvent,
+    ast::{
+        self, AstNode, AstToken, HasGenericParams, HasName, edit::IndentLevel,
+        edit_in_place::Indent,
+    },
+    match_ast, ted,
 };
 
 use crate::{
-    assist_context::{AssistContext, Assists, TreeMutator},
-    utils::generate_impl_text,
     AssistId,
+    assist_context::{AssistContext, Assists, TreeMutator},
+    utils::generate_impl,
 };
 
 // Assist: extract_function
@@ -86,7 +87,6 @@ pub(crate) fn extract_function(acc: &mut Assists, ctx: &AssistContext<'_>) -> Op
     };
 
     let body = extraction_target(&node, range)?;
-    let (container_info, contains_tail_expr) = body.analyze_container(&ctx.sema)?;
 
     let (locals_used, self_param) = body.analyze(&ctx.sema);
 
@@ -94,6 +94,9 @@ pub(crate) fn extract_function(acc: &mut Assists, ctx: &AssistContext<'_>) -> Op
     let insert_after = node_to_insert_after(&body, anchor)?;
     let semantics_scope = ctx.sema.scope(&insert_after)?;
     let module = semantics_scope.module();
+    let edition = semantics_scope.krate().edition(ctx.db());
+
+    let (container_info, contains_tail_expr) = body.analyze_container(&ctx.sema, edition)?;
 
     let ret_ty = body.return_ty(ctx)?;
     let control_flow = body.external_control_flow(ctx, &container_info)?;
@@ -103,8 +106,9 @@ pub(crate) fn extract_function(acc: &mut Assists, ctx: &AssistContext<'_>) -> Op
 
     let scope = ImportScope::find_insert_use_container(&node, &ctx.sema)?;
 
-    acc.add(
-        AssistId("extract_function", crate::AssistKind::RefactorExtract),
+    acc.add_group(
+        &GroupLabel("Extract into...".to_owned()),
+        AssistId::refactor_extract("extract_function"),
         "Extract into function",
         target_range,
         move |builder| {
@@ -114,8 +118,7 @@ pub(crate) fn extract_function(acc: &mut Assists, ctx: &AssistContext<'_>) -> Op
                 return;
             }
 
-            let params =
-                body.extracted_function_params(ctx, &container_info, locals_used.iter().copied());
+            let params = body.extracted_function_params(ctx, &container_info, locals_used);
 
             let name = make_function_name(&semantics_scope);
 
@@ -134,17 +137,65 @@ pub(crate) fn extract_function(acc: &mut Assists, ctx: &AssistContext<'_>) -> Op
             let new_indent = IndentLevel::from_node(&insert_after);
             let old_indent = fun.body.indent_level();
 
-            builder.replace(target_range, make_call(ctx, &fun, old_indent));
+            let insert_after = builder.make_syntax_mut(insert_after);
+
+            let call_expr = make_call(ctx, &fun, old_indent);
+
+            // Map the element range to replace into the mutable version
+            let elements = match &fun.body {
+                FunctionBody::Expr(expr) => {
+                    // expr itself becomes the replacement target
+                    let expr = &builder.make_mut(expr.clone());
+                    let node = SyntaxElement::Node(expr.syntax().clone());
+
+                    node.clone()..=node
+                }
+                FunctionBody::Span { parent, elements, .. } => {
+                    // Map the element range into the mutable versions
+                    let parent = builder.make_mut(parent.clone());
+
+                    let start = parent
+                        .syntax()
+                        .children_with_tokens()
+                        .nth(elements.start().index())
+                        .expect("should be able to find mutable start element");
+
+                    let end = parent
+                        .syntax()
+                        .children_with_tokens()
+                        .nth(elements.end().index())
+                        .expect("should be able to find mutable end element");
+
+                    start..=end
+                }
+            };
 
             let has_impl_wrapper =
                 insert_after.ancestors().any(|a| a.kind() == SyntaxKind::IMPL && a != insert_after);
 
+            let fn_def = format_function(ctx, module, &fun, old_indent).clone_for_update();
+
+            if let Some(cap) = ctx.config.snippet_cap
+                && let Some(name) = fn_def.name()
+            {
+                builder.add_tabstop_before(cap, name);
+            }
+
             let fn_def = match fun.self_param_adt(ctx) {
                 Some(adt) if anchor == Anchor::Method && !has_impl_wrapper => {
-                    let fn_def = format_function(ctx, module, &fun, old_indent, new_indent + 1);
-                    generate_impl_text(&adt, &fn_def).replace("{\n\n", "{")
+                    fn_def.indent(1.into());
+
+                    let impl_ = generate_impl(&adt);
+                    impl_.indent(new_indent);
+                    impl_.get_or_create_assoc_item_list().add_item(fn_def.into());
+
+                    impl_.syntax().clone()
                 }
-                _ => format_function(ctx, module, &fun, old_indent, new_indent),
+                _ => {
+                    fn_def.indent(new_indent);
+
+                    fn_def.syntax().clone()
+                }
             };
 
             // There are external control flows
@@ -153,36 +204,38 @@ pub(crate) fn extract_function(acc: &mut Assists, ctx: &AssistContext<'_>) -> Op
                 .kind
                 .is_some_and(|kind| matches!(kind, FlowKind::Break(_, _) | FlowKind::Continue(_)))
             {
-                let scope = match scope {
-                    ImportScope::File(it) => ImportScope::File(builder.make_mut(it)),
-                    ImportScope::Module(it) => ImportScope::Module(builder.make_mut(it)),
-                    ImportScope::Block(it) => ImportScope::Block(builder.make_mut(it)),
-                };
-
+                let scope = builder.make_import_scope_mut(scope);
                 let control_flow_enum =
                     FamousDefs(&ctx.sema, module.krate()).core_ops_ControlFlow();
 
                 if let Some(control_flow_enum) = control_flow_enum {
-                    let mod_path = module.find_use_path_prefixed(
+                    let cfg = ctx.config.find_path_config(ctx.sema.is_nightly(module.krate()));
+                    let mod_path = module.find_use_path(
                         ctx.sema.db,
                         ModuleDef::from(control_flow_enum),
                         ctx.config.insert_use.prefix_kind,
-                        ctx.config.prefer_no_std,
-                        ctx.config.prefer_prelude,
+                        cfg,
                     );
 
                     if let Some(mod_path) = mod_path {
-                        insert_use(&scope, mod_path_to_ast(&mod_path), &ctx.config.insert_use);
+                        insert_use(
+                            &scope,
+                            mod_path_to_ast(&mod_path, edition),
+                            &ctx.config.insert_use,
+                        );
                     }
                 }
             }
 
-            let insert_offset = insert_after.text_range().end();
+            // Replace the call site with the call to the new function
+            fixup_call_site(builder, &fun.body);
+            ted::replace_all(elements, vec![call_expr.into()]);
 
-            match ctx.config.snippet_cap {
-                Some(cap) => builder.insert_snippet(cap, insert_offset, fn_def),
-                None => builder.insert(insert_offset, fn_def),
-            };
+            // Insert the newly extracted function (or impl)
+            ted::insert_all_raw(
+                ted::Position::after(insert_after),
+                vec![make::tokens::whitespace(&format!("\n\n{new_indent}")).into(), fn_def.into()],
+            );
         },
     )
 }
@@ -190,12 +243,15 @@ pub(crate) fn extract_function(acc: &mut Assists, ctx: &AssistContext<'_>) -> Op
 fn make_function_name(semantics_scope: &hir::SemanticsScope<'_>) -> ast::NameRef {
     let mut names_in_scope = vec![];
     semantics_scope.process_all_names(&mut |name, _| {
-        names_in_scope.push(name.display(semantics_scope.db.upcast()).to_string())
+        names_in_scope.push(
+            name.display(semantics_scope.db, semantics_scope.krate().edition(semantics_scope.db))
+                .to_string(),
+        )
     });
 
     let default_name = "fun_name";
 
-    let mut name = default_name.to_string();
+    let mut name = default_name.to_owned();
     let mut counter = 0;
     while names_in_scope.contains(&name) {
         counter += 1;
@@ -210,7 +266,7 @@ fn make_function_name(semantics_scope: &hir::SemanticsScope<'_>) -> ast::NameRef
 /// * We want whole node, like `loop {}`, `2 + 2`, `{ let n = 1; }` exprs.
 ///   Then we can use `ast::Expr`
 /// * We want a few statements for a block. E.g.
-///   ```rust,no_run
+///   ```ignore
 ///   fn foo() -> i32 {
 ///     let m = 1;
 ///     $0
@@ -225,23 +281,23 @@ fn extraction_target(node: &SyntaxNode, selection_range: TextRange) -> Option<Fu
     if let Some(stmt) = ast::Stmt::cast(node.clone()) {
         return match stmt {
             ast::Stmt::Item(_) => None,
-            ast::Stmt::ExprStmt(_) | ast::Stmt::LetStmt(_) => Some(FunctionBody::from_range(
+            ast::Stmt::ExprStmt(_) | ast::Stmt::LetStmt(_) => FunctionBody::from_range(
                 node.parent().and_then(ast::StmtList::cast)?,
                 node.text_range(),
-            )),
+            ),
         };
     }
 
     // Covering element returned the parent block of one or multiple statements that have been selected
     if let Some(stmt_list) = ast::StmtList::cast(node.clone()) {
-        if let Some(block_expr) = stmt_list.syntax().parent().and_then(ast::BlockExpr::cast) {
-            if block_expr.syntax().text_range() == selection_range {
-                return FunctionBody::from_expr(block_expr.into());
-            }
+        if let Some(block_expr) = stmt_list.syntax().parent().and_then(ast::BlockExpr::cast)
+            && block_expr.syntax().text_range() == selection_range
+        {
+            return FunctionBody::from_expr(block_expr.into());
         }
 
         // Extract the full statements.
-        return Some(FunctionBody::from_range(stmt_list, selection_range));
+        return FunctionBody::from_range(stmt_list, selection_range);
     }
 
     let expr = ast::Expr::cast(node.clone())?;
@@ -254,23 +310,23 @@ fn extraction_target(node: &SyntaxNode, selection_range: TextRange) -> Option<Fu
 }
 
 #[derive(Debug)]
-struct Function {
+struct Function<'db> {
     name: ast::NameRef,
     self_param: Option<ast::SelfParam>,
-    params: Vec<Param>,
-    control_flow: ControlFlow,
-    ret_ty: RetType,
+    params: Vec<Param<'db>>,
+    control_flow: ControlFlow<'db>,
+    ret_ty: RetType<'db>,
     body: FunctionBody,
     outliving_locals: Vec<OutlivedLocal>,
     /// Whether at least one of the container's tail expr is contained in the range we're extracting.
     contains_tail_expr: bool,
-    mods: ContainerInfo,
+    mods: ContainerInfo<'db>,
 }
 
 #[derive(Debug)]
-struct Param {
+struct Param<'db> {
     var: Local,
-    ty: hir::Type,
+    ty: hir::Type<'db>,
     move_local: bool,
     requires_mut: bool,
     is_copy: bool,
@@ -285,10 +341,10 @@ enum ParamKind {
 }
 
 #[derive(Debug)]
-enum FunType {
+enum FunType<'db> {
     Unit,
-    Single(hir::Type),
-    Tuple(Vec<hir::Type>),
+    Single(hir::Type<'db>),
+    Tuple(Vec<hir::Type<'db>>),
 }
 
 /// Where to put extracted function definition
@@ -303,27 +359,28 @@ enum Anchor {
 // FIXME: ControlFlow and ContainerInfo both track some function modifiers, feels like these two should
 // probably be merged somehow.
 #[derive(Debug)]
-struct ControlFlow {
-    kind: Option<FlowKind>,
+struct ControlFlow<'db> {
+    kind: Option<FlowKind<'db>>,
     is_async: bool,
     is_unsafe: bool,
 }
 
 /// The thing whose expression we are extracting from. Can be a function, const, static, const arg, ...
 #[derive(Clone, Debug)]
-struct ContainerInfo {
+struct ContainerInfo<'db> {
     is_const: bool,
     parent_loop: Option<SyntaxNode>,
     /// The function's return type, const's type etc.
-    ret_type: Option<hir::Type>,
+    ret_type: Option<hir::Type<'db>>,
     generic_param_lists: Vec<ast::GenericParamList>,
     where_clauses: Vec<ast::WhereClause>,
+    edition: Edition,
 }
 
 /// Control flow that is exported from extracted function
 ///
 /// E.g.:
-/// ```rust,no_run
+/// ```ignore
 /// loop {
 ///     $0
 ///     if 42 == 42 {
@@ -333,11 +390,11 @@ struct ContainerInfo {
 /// }
 /// ```
 #[derive(Debug, Clone)]
-enum FlowKind {
+enum FlowKind<'db> {
     /// Return with value (`return $expr;`)
     Return(Option<ast::Expr>),
     Try {
-        kind: TryKind,
+        kind: TryKind<'db>,
     },
     /// Break with label and value (`break 'label $expr;`)
     Break(Option<ast::Lifetime>, Option<ast::Expr>),
@@ -346,18 +403,18 @@ enum FlowKind {
 }
 
 #[derive(Debug, Clone)]
-enum TryKind {
+enum TryKind<'db> {
     Option,
-    Result { ty: hir::Type },
+    Result { ty: hir::Type<'db> },
 }
 
 #[derive(Debug)]
-enum RetType {
-    Expr(hir::Type),
+enum RetType<'db> {
+    Expr(hir::Type<'db>),
     Stmt,
 }
 
-impl RetType {
+impl RetType<'_> {
     fn is_unit(&self) -> bool {
         match self {
             RetType::Expr(ty) => ty.is_unit(),
@@ -371,7 +428,7 @@ impl RetType {
 #[derive(Debug)]
 enum FunctionBody {
     Expr(ast::Expr),
-    Span { parent: ast::StmtList, text_range: TextRange },
+    Span { parent: ast::StmtList, elements: RangeInclusive<SyntaxElement>, text_range: TextRange },
 }
 
 #[derive(Debug)]
@@ -400,8 +457,8 @@ impl LocalUsages {
     }
 }
 
-impl Function {
-    fn return_type(&self, ctx: &AssistContext<'_>) -> FunType {
+impl<'db> Function<'db> {
+    fn return_type(&self, ctx: &AssistContext<'db>) -> FunType<'db> {
         match &self.ret_ty {
             RetType::Expr(ty) if ty.is_unit() => FunType::Unit,
             RetType::Expr(ty) => FunType::Single(ty.clone()),
@@ -431,7 +488,7 @@ impl ParamKind {
     }
 }
 
-impl Param {
+impl<'db> Param<'db> {
     fn kind(&self) -> ParamKind {
         match (self.move_local, self.requires_mut, self.is_copy) {
             (false, true, _) => ParamKind::MutRef,
@@ -441,8 +498,8 @@ impl Param {
         }
     }
 
-    fn to_arg(&self, ctx: &AssistContext<'_>) -> ast::Expr {
-        let var = path_expr_from_local(ctx, self.var);
+    fn to_arg(&self, ctx: &AssistContext<'db>, edition: Edition) -> ast::Expr {
+        let var = path_expr_from_local(ctx, self.var, edition);
         match self.kind() {
             ParamKind::Value | ParamKind::MutValue => var,
             ParamKind::SharedRef => make::expr_ref(var, false),
@@ -450,8 +507,13 @@ impl Param {
         }
     }
 
-    fn to_param(&self, ctx: &AssistContext<'_>, module: hir::Module) -> ast::Param {
-        let var = self.var.name(ctx.db()).display(ctx.db()).to_string();
+    fn to_param(
+        &self,
+        ctx: &AssistContext<'_>,
+        module: hir::Module,
+        edition: Edition,
+    ) -> ast::Param {
+        let var = self.var.name(ctx.db()).display(ctx.db(), edition).to_string();
         let var_name = make::name(&var);
         let pat = match self.kind() {
             ParamKind::MutValue => make::ident_pat(false, true, var_name),
@@ -471,8 +533,12 @@ impl Param {
     }
 }
 
-impl TryKind {
-    fn of_ty(ty: hir::Type, ctx: &AssistContext<'_>) -> Option<TryKind> {
+impl<'db> TryKind<'db> {
+    fn of_ty(
+        ty: hir::Type<'db>,
+        ctx: &AssistContext<'db>,
+        edition: Edition,
+    ) -> Option<TryKind<'db>> {
         if ty.is_unknown() {
             // We favour Result for `expr?`
             return Some(TryKind::Result { ty });
@@ -481,7 +547,7 @@ impl TryKind {
         let name = adt.name(ctx.db());
         // FIXME: use lang items to determine if it is std type or user defined
         //        E.g. if user happens to define type named `Option`, we would have false positive
-        let name = &name.display(ctx.db()).to_string();
+        let name = &name.display(ctx.db(), edition).to_string();
         match name.as_str() {
             "Option" => Some(TryKind::Option),
             "Result" => Some(TryKind::Result { ty }),
@@ -490,7 +556,7 @@ impl TryKind {
     }
 }
 
-impl FlowKind {
+impl<'db> FlowKind<'db> {
     fn make_result_handler(&self, expr: Option<ast::Expr>) -> ast::Expr {
         match self {
             FlowKind::Return(_) => make::expr_return(expr),
@@ -506,7 +572,7 @@ impl FlowKind {
         }
     }
 
-    fn expr_ty(&self, ctx: &AssistContext<'_>) -> Option<hir::Type> {
+    fn expr_ty(&self, ctx: &AssistContext<'db>) -> Option<hir::Type<'db>> {
         match self {
             FlowKind::Return(Some(expr)) | FlowKind::Break(_, Some(expr)) => {
                 ctx.sema.type_of_expr(expr).map(TypeInfo::adjusted)
@@ -569,26 +635,38 @@ impl FunctionBody {
         }
     }
 
-    fn from_range(parent: ast::StmtList, selected: TextRange) -> FunctionBody {
+    fn from_range(parent: ast::StmtList, selected: TextRange) -> Option<FunctionBody> {
         let full_body = parent.syntax().children_with_tokens();
 
-        let mut text_range = full_body
+        // Get all of the elements intersecting with the selection
+        let mut stmts_in_selection = full_body
             .filter(|it| ast::Stmt::can_cast(it.kind()) || it.kind() == COMMENT)
-            .map(|element| element.text_range())
-            .filter(|&range| selected.intersect(range).filter(|it| !it.is_empty()).is_some())
-            .reduce(|acc, stmt| acc.cover(stmt));
+            .filter(|it| selected.intersect(it.text_range()).filter(|it| !it.is_empty()).is_some());
 
-        if let Some(tail_range) = parent
-            .tail_expr()
-            .map(|it| it.syntax().text_range())
-            .filter(|&it| selected.intersect(it).is_some())
+        let first_element = stmts_in_selection.next();
+
+        // If the tail expr is part of the selection too, make that the last element
+        // Otherwise use the last stmt
+        let last_element = if let Some(tail_expr) =
+            parent.tail_expr().filter(|it| selected.intersect(it.syntax().text_range()).is_some())
         {
-            text_range = Some(match text_range {
-                Some(text_range) => text_range.cover(tail_range),
-                None => tail_range,
-            });
-        }
-        Self::Span { parent, text_range: text_range.unwrap_or(selected) }
+            Some(tail_expr.syntax().clone().into())
+        } else {
+            stmts_in_selection.last()
+        };
+
+        let elements = match (first_element, last_element) {
+            (None, _) => {
+                cov_mark::hit!(extract_function_empty_selection_is_not_applicable);
+                return None;
+            }
+            (Some(first), None) => first.clone()..=first,
+            (Some(first), Some(last)) => first..=last,
+        };
+
+        let text_range = elements.start().text_range().cover(elements.end().text_range());
+
+        Some(Self::Span { parent, elements, text_range })
     }
 
     fn indent_level(&self) -> IndentLevel {
@@ -601,7 +679,7 @@ impl FunctionBody {
     fn tail_expr(&self) -> Option<ast::Expr> {
         match &self {
             FunctionBody::Expr(expr) => Some(expr.clone()),
-            FunctionBody::Span { parent, text_range } => {
+            FunctionBody::Span { parent, text_range, .. } => {
                 let tail_expr = parent.tail_expr()?;
                 text_range.contains_range(tail_expr.syntax().text_range()).then_some(tail_expr)
             }
@@ -611,7 +689,7 @@ impl FunctionBody {
     fn walk_expr(&self, cb: &mut dyn FnMut(ast::Expr)) {
         match self {
             FunctionBody::Expr(expr) => walk_expr(expr, cb),
-            FunctionBody::Span { parent, text_range } => {
+            FunctionBody::Span { parent, text_range, .. } => {
                 parent
                     .statements()
                     .filter(|stmt| text_range.contains_range(stmt.syntax().text_range()))
@@ -634,7 +712,7 @@ impl FunctionBody {
     fn preorder_expr(&self, cb: &mut dyn FnMut(WalkEvent<ast::Expr>) -> bool) {
         match self {
             FunctionBody::Expr(expr) => preorder_expr(expr, cb),
-            FunctionBody::Span { parent, text_range } => {
+            FunctionBody::Span { parent, text_range, .. } => {
                 parent
                     .statements()
                     .filter(|stmt| text_range.contains_range(stmt.syntax().text_range()))
@@ -657,7 +735,7 @@ impl FunctionBody {
     fn walk_pat(&self, cb: &mut dyn FnMut(ast::Pat)) {
         match self {
             FunctionBody::Expr(expr) => walk_patterns_in_expr(expr, cb),
-            FunctionBody::Span { parent, text_range } => {
+            FunctionBody::Span { parent, text_range, .. } => {
                 parent
                     .statements()
                     .filter(|stmt| text_range.contains_range(stmt.syntax().text_range()))
@@ -670,7 +748,10 @@ impl FunctionBody {
                         ast::Stmt::Item(_) => (),
                         ast::Stmt::LetStmt(stmt) => {
                             if let Some(pat) = stmt.pat() {
-                                walk_pat(&pat, cb);
+                                _ = walk_pat(&pat, &mut |pat| {
+                                    cb(pat);
+                                    std::ops::ControlFlow::<(), ()>::Continue(())
+                                });
                             }
                             if let Some(expr) = stmt.initializer() {
                                 walk_patterns_in_expr(&expr, cb);
@@ -716,15 +797,21 @@ impl FunctionBody {
     ) -> (FxIndexSet<Local>, Option<ast::SelfParam>) {
         let mut self_param = None;
         let mut res = FxIndexSet::default();
-        let mut add_name_if_local = |name_ref: Option<_>| {
-            let local_ref =
-                match name_ref.and_then(|name_ref| NameRefClass::classify(sema, &name_ref)) {
-                    Some(
-                        NameRefClass::Definition(Definition::Local(local_ref))
-                        | NameRefClass::FieldShorthand { local_ref, field_ref: _ },
-                    ) => local_ref,
-                    _ => return,
-                };
+
+        fn local_from_name_ref(
+            sema: &Semantics<'_, RootDatabase>,
+            name_ref: ast::NameRef,
+        ) -> Option<hir::Local> {
+            match NameRefClass::classify(sema, &name_ref) {
+                Some(
+                    NameRefClass::Definition(Definition::Local(local_ref), _)
+                    | NameRefClass::FieldShorthand { local_ref, field_ref: _, adt_subst: _ },
+                ) => Some(local_ref),
+                _ => None,
+            }
+        }
+
+        let mut add_name_if_local = |local_ref: Local| {
             let InFile { file_id, value } = local_ref.primary_source(sema.db).source;
             // locals defined inside macros are not relevant to us
             if !file_id.is_macro() {
@@ -740,13 +827,20 @@ impl FunctionBody {
         };
         self.walk_expr(&mut |expr| match expr {
             ast::Expr::PathExpr(path_expr) => {
-                add_name_if_local(path_expr.path().and_then(|it| it.as_single_name_ref()))
+                if let Some(local) = path_expr
+                    .path()
+                    .and_then(|it| it.as_single_name_ref())
+                    .and_then(|name_ref| local_from_name_ref(sema, name_ref))
+                {
+                    add_name_if_local(local);
+                }
             }
             ast::Expr::ClosureExpr(closure_expr) => {
                 if let Some(body) = closure_expr.body() {
                     body.syntax()
                         .descendants()
-                        .map(ast::NameRef::cast)
+                        .filter_map(ast::NameRef::cast)
+                        .filter_map(|name_ref| local_from_name_ref(sema, name_ref))
                         .for_each(&mut add_name_if_local);
                 }
             }
@@ -755,9 +849,31 @@ impl FunctionBody {
                     tt.syntax()
                         .descendants_with_tokens()
                         .filter_map(SyntaxElement::into_token)
-                        .filter(|it| matches!(it.kind(), SyntaxKind::IDENT | T![self]))
-                        .flat_map(|t| sema.descend_into_macros(DescendPreference::None, t))
-                        .for_each(|t| add_name_if_local(t.parent().and_then(ast::NameRef::cast)));
+                        .filter(|it| {
+                            matches!(it.kind(), SyntaxKind::STRING | SyntaxKind::IDENT | T![self])
+                        })
+                        .for_each(|t| {
+                            if ast::String::can_cast(t.kind()) {
+                                if let Some(parts) =
+                                    ast::String::cast(t).and_then(|s| sema.as_format_args_parts(&s))
+                                {
+                                    parts
+                                        .into_iter()
+                                        .filter_map(|(_, value)| value.and_then(|it| it.left()))
+                                        .filter_map(|path| match path {
+                                            PathResolution::Local(local) => Some(local),
+                                            _ => None,
+                                        })
+                                        .for_each(&mut add_name_if_local);
+                                }
+                            } else {
+                                sema.descend_into_macros_exact(t)
+                                    .into_iter()
+                                    .filter_map(|t| t.parent().and_then(ast::NameRef::cast))
+                                    .filter_map(|name_ref| local_from_name_ref(sema, name_ref))
+                                    .for_each(&mut add_name_if_local);
+                            }
+                        });
                 }
             }
             _ => (),
@@ -765,17 +881,18 @@ impl FunctionBody {
         (res, self_param)
     }
 
-    fn analyze_container(
+    fn analyze_container<'db>(
         &self,
-        sema: &Semantics<'_, RootDatabase>,
-    ) -> Option<(ContainerInfo, bool)> {
+        sema: &Semantics<'db, RootDatabase>,
+        edition: Edition,
+    ) -> Option<(ContainerInfo<'db>, bool)> {
         let mut ancestors = self.parent()?.ancestors();
         let infer_expr_opt = |expr| sema.type_of_expr(&expr?).map(TypeInfo::adjusted);
         let mut parent_loop = None;
         let mut set_parent_loop = |loop_: &dyn ast::HasLoopBody| {
             if loop_
                 .loop_body()
-                .map_or(false, |it| it.syntax().text_range().contains_range(self.text_range()))
+                .is_some_and(|it| it.syntax().text_range().contains_range(self.text_range()))
             {
                 parent_loop.get_or_insert(loop_.syntax().clone());
             }
@@ -799,11 +916,10 @@ impl FunctionBody {
                     ast::Fn(fn_) => {
                         let func = sema.to_def(&fn_)?;
                         let mut ret_ty = func.ret_type(sema.db);
-                        if func.is_async(sema.db) {
-                            if let Some(async_ret) = func.async_ret_type(sema.db) {
+                        if func.is_async(sema.db)
+                            && let Some(async_ret) = func.async_ret_type(sema.db) {
                                 ret_ty = async_ret;
                             }
-                        }
                         (fn_.const_token().is_some(), fn_.body().map(ast::Expr::BlockExpr), Some(ret_ty))
                     },
                     ast::Static(statik) => {
@@ -867,12 +983,13 @@ impl FunctionBody {
                 ret_type: ty,
                 generic_param_lists,
                 where_clauses,
+                edition,
             },
             contains_tail_expr,
         ))
     }
 
-    fn return_ty(&self, ctx: &AssistContext<'_>) -> Option<RetType> {
+    fn return_ty<'db>(&self, ctx: &AssistContext<'db>) -> Option<RetType<'db>> {
         match self.tail_expr() {
             Some(expr) => ctx.sema.type_of_expr(&expr).map(TypeInfo::original).map(RetType::Expr),
             None => Some(RetType::Stmt),
@@ -893,11 +1010,11 @@ impl FunctionBody {
     }
 
     /// Analyses the function body for external control flow.
-    fn external_control_flow(
+    fn external_control_flow<'db>(
         &self,
-        ctx: &AssistContext<'_>,
-        container_info: &ContainerInfo,
-    ) -> Option<ControlFlow> {
+        ctx: &AssistContext<'db>,
+        container_info: &ContainerInfo<'db>,
+    ) -> Option<ControlFlow<'db>> {
         let mut ret_expr = None;
         let mut try_expr = None;
         let mut break_expr = None;
@@ -955,7 +1072,7 @@ impl FunctionBody {
         let kind = match (try_expr, ret_expr, break_expr, continue_expr) {
             (Some(_), _, None, None) => {
                 let ret_ty = container_info.ret_type.clone()?;
-                let kind = TryKind::of_ty(ret_ty, ctx)?;
+                let kind = TryKind::of_ty(ret_ty, ctx, container_info.edition)?;
 
                 Some(FlowKind::Try { kind })
             }
@@ -983,13 +1100,15 @@ impl FunctionBody {
     /// find variables that should be extracted as params
     ///
     /// Computes additional info that affects param type and mutability
-    fn extracted_function_params(
+    fn extracted_function_params<'db>(
         &self,
-        ctx: &AssistContext<'_>,
-        container_info: &ContainerInfo,
-        locals: impl Iterator<Item = Local>,
-    ) -> Vec<Param> {
+        ctx: &AssistContext<'db>,
+        container_info: &ContainerInfo<'db>,
+        locals: FxIndexSet<Local>,
+    ) -> Vec<Param<'db>> {
         locals
+            .into_iter()
+            .sorted()
             .map(|local| (local, local.primary_source(ctx.db())))
             .filter(|(_, src)| is_defined_outside_of_body(ctx, self, src))
             .filter_map(|(local, src)| match src.into_ident_pat() {
@@ -1006,7 +1125,7 @@ impl FunctionBody {
                 let defined_outside_parent_loop = container_info
                     .parent_loop
                     .as_ref()
-                    .map_or(true, |it| it.text_range().contains_range(src.syntax().text_range()));
+                    .is_none_or(|it| it.text_range().contains_range(src.syntax().text_range()));
 
                 let is_copy = ty.is_copy(ctx.db());
                 let has_usages = self.has_usages_after_body(&usages);
@@ -1053,19 +1172,19 @@ impl GenericParent {
 /// Search `parent`'s ancestors for items with potentially applicable generic parameters
 fn generic_parents(parent: &SyntaxNode) -> Vec<GenericParent> {
     let mut list = Vec::new();
-    if let Some(parent_item) = parent.ancestors().find_map(ast::Item::cast) {
-        if let ast::Item::Fn(ref fn_) = parent_item {
-            if let Some(parent_parent) =
-                parent_item.syntax().parent().and_then(|it| it.parent()).and_then(ast::Item::cast)
-            {
-                match parent_parent {
-                    ast::Item::Impl(impl_) => list.push(GenericParent::Impl(impl_)),
-                    ast::Item::Trait(trait_) => list.push(GenericParent::Trait(trait_)),
-                    _ => (),
-                }
+    if let Some(parent_item) = parent.ancestors().find_map(ast::Item::cast)
+        && let ast::Item::Fn(ref fn_) = parent_item
+    {
+        if let Some(parent_parent) =
+            parent_item.syntax().parent().and_then(|it| it.parent()).and_then(ast::Item::cast)
+        {
+            match parent_parent {
+                ast::Item::Impl(impl_) => list.push(GenericParent::Impl(impl_)),
+                ast::Item::Trait(trait_) => list.push(GenericParent::Trait(trait_)),
+                _ => (),
             }
-            list.push(GenericParent::Fn(fn_.clone()));
         }
+        list.push(GenericParent::Fn(fn_.clone()));
     }
     list
 }
@@ -1088,8 +1207,14 @@ fn reference_is_exclusive(
     node: &dyn HasTokenAtOffset,
     ctx: &AssistContext<'_>,
 ) -> bool {
+    // FIXME: this quite an incorrect way to go about doing this :-)
+    // `FileReference` is an IDE-type --- it encapsulates data communicated to the human,
+    // but doesn't necessary fully reflect all the intricacies of the underlying language semantics
+    // The correct approach here would be to expose this entire analysis as a method on some hir
+    // type. Something like `body.free_variables(statement_range)`.
+
     // we directly modify variable with set: `n = 0`, `n += 1`
-    if reference.category == Some(ReferenceCategory::Write) {
+    if reference.category.contains(ReferenceCategory::WRITE) {
         return true;
     }
 
@@ -1151,7 +1276,7 @@ impl HasTokenAtOffset for FunctionBody {
     fn token_at_offset(&self, offset: TextSize) -> TokenAtOffset<SyntaxToken> {
         match self {
             FunctionBody::Expr(expr) => expr.syntax().token_at_offset(offset),
-            FunctionBody::Span { parent, text_range } => {
+            FunctionBody::Span { parent, text_range, .. } => {
                 match parent.syntax().token_at_offset(offset) {
                     TokenAtOffset::None => TokenAtOffset::None,
                     TokenAtOffset::Single(t) => {
@@ -1212,10 +1337,10 @@ fn locals_defined_in_body(
     //        see https://github.com/rust-lang/rust-analyzer/pull/7535#discussion_r570048550
     let mut res = FxIndexSet::default();
     body.walk_pat(&mut |pat| {
-        if let ast::Pat::IdentPat(pat) = pat {
-            if let Some(local) = sema.to_def(&pat) {
-                res.insert(local);
-            }
+        if let ast::Pat::IdentPat(pat) = pat
+            && let Some(local) = sema.to_def(&pat)
+        {
+            res.insert(local);
         }
     });
     res
@@ -1316,17 +1441,29 @@ fn impl_type_name(impl_node: &ast::Impl) -> Option<String> {
     Some(impl_node.self_ty()?.to_string())
 }
 
-fn make_call(ctx: &AssistContext<'_>, fun: &Function, indent: IndentLevel) -> String {
+/// Fixes up the call site before the target expressions are replaced with the call expression
+fn fixup_call_site(builder: &mut SourceChangeBuilder, body: &FunctionBody) {
+    let parent_match_arm = body.parent().and_then(ast::MatchArm::cast);
+
+    if let Some(parent_match_arm) = parent_match_arm
+        && parent_match_arm.comma_token().is_none()
+    {
+        let parent_match_arm = builder.make_mut(parent_match_arm);
+        ted::append_child_raw(parent_match_arm.syntax(), make::token(T![,]));
+    }
+}
+
+fn make_call(ctx: &AssistContext<'_>, fun: &Function<'_>, indent: IndentLevel) -> SyntaxNode {
     let ret_ty = fun.return_type(ctx);
 
-    let args = make::arg_list(fun.params.iter().map(|param| param.to_arg(ctx)));
+    let args = make::arg_list(fun.params.iter().map(|param| param.to_arg(ctx, fun.mods.edition)));
     let name = fun.name.clone();
     let mut call_expr = if fun.self_param.is_some() {
         let self_arg = make::expr_path(make::ext::ident_path("self"));
-        make::expr_method_call(self_arg, name, args)
+        make::expr_method_call(self_arg, name, args).into()
     } else {
         let func = make::expr_path(make::path_unqualified(make::path_segment(name)));
-        make::expr_call(func, args)
+        make::expr_call(func, args).into()
     };
 
     let handler = FlowHandler::from_ret_ty(fun, &ret_ty);
@@ -1334,57 +1471,58 @@ fn make_call(ctx: &AssistContext<'_>, fun: &Function, indent: IndentLevel) -> St
     if fun.control_flow.is_async {
         call_expr = make::expr_await(call_expr);
     }
-    let expr = handler.make_call_expr(call_expr).indent(indent);
 
-    let mut_modifier = |var: &OutlivedLocal| if var.mut_usage_outside_body { "mut " } else { "" };
+    let expr = handler.make_call_expr(call_expr).clone_for_update();
+    expr.indent(indent);
 
-    let mut buf = String::new();
-    match fun.outliving_locals.as_slice() {
-        [] => {}
+    let outliving_bindings = match fun.outliving_locals.as_slice() {
+        [] => None,
         [var] => {
-            let modifier = mut_modifier(var);
             let name = var.local.name(ctx.db());
-            format_to!(buf, "let {modifier}{} = ", name.display(ctx.db()))
+            let name = make::name(&name.display(ctx.db(), fun.mods.edition).to_string());
+            Some(ast::Pat::IdentPat(make::ident_pat(false, var.mut_usage_outside_body, name)))
         }
         vars => {
-            buf.push_str("let (");
-            let bindings = vars.iter().format_with(", ", |local, f| {
-                let modifier = mut_modifier(local);
-                let name = local.local.name(ctx.db());
-                f(&format_args!("{modifier}{}", name.display(ctx.db())))?;
-                Ok(())
+            let binding_pats = vars.iter().map(|var| {
+                let name = var.local.name(ctx.db());
+                let name = make::name(&name.display(ctx.db(), fun.mods.edition).to_string());
+                make::ident_pat(false, var.mut_usage_outside_body, name).into()
             });
-            format_to!(buf, "{bindings}");
-            buf.push_str(") = ");
+            Some(ast::Pat::TuplePat(make::tuple_pat(binding_pats)))
         }
-    }
+    };
 
-    format_to!(buf, "{expr}");
     let parent_match_arm = fun.body.parent().and_then(ast::MatchArm::cast);
-    let insert_comma = parent_match_arm.as_ref().is_some_and(|it| it.comma_token().is_none());
 
-    if insert_comma {
-        buf.push(',');
-    } else if parent_match_arm.is_none()
+    if let Some(bindings) = outliving_bindings {
+        // with bindings that outlive it
+        make::let_stmt(bindings, None, Some(expr)).syntax().clone_for_update()
+    } else if parent_match_arm.as_ref().is_some() {
+        // as a tail expr for a match arm
+        expr.syntax().clone()
+    } else if parent_match_arm.as_ref().is_none()
         && fun.ret_ty.is_unit()
         && (!fun.outliving_locals.is_empty() || !expr.is_block_like())
     {
-        buf.push(';');
+        // as an expr stmt
+        make::expr_stmt(expr).syntax().clone_for_update()
+    } else {
+        // as a tail expr, or a block
+        expr.syntax().clone()
     }
-    buf
 }
 
-enum FlowHandler {
+enum FlowHandler<'db> {
     None,
-    Try { kind: TryKind },
-    If { action: FlowKind },
-    IfOption { action: FlowKind },
-    MatchOption { none: FlowKind },
-    MatchResult { err: FlowKind },
+    Try { kind: TryKind<'db> },
+    If { action: FlowKind<'db> },
+    IfOption { action: FlowKind<'db> },
+    MatchOption { none: FlowKind<'db> },
+    MatchResult { err: FlowKind<'db> },
 }
 
-impl FlowHandler {
-    fn from_ret_ty(fun: &Function, ret_ty: &FunType) -> FlowHandler {
+impl<'db> FlowHandler<'db> {
+    fn from_ret_ty(fun: &Function<'db>, ret_ty: &FunType<'db>) -> FlowHandler<'db> {
         if fun.contains_tail_expr {
             return FlowHandler::None;
         }
@@ -1430,7 +1568,7 @@ impl FlowHandler {
                     .into(),
                     call_expr,
                 );
-                make::expr_if(condition.into(), block, None)
+                make::expr_if(condition.into(), block, None).into()
             }
             FlowHandler::IfOption { action } => {
                 let path = make::ext::ident_path("Some");
@@ -1441,7 +1579,7 @@ impl FlowHandler {
                 let action_expr = action.make_result_handler(Some(value));
                 let action_stmt = make::expr_stmt(action_expr);
                 let then = make::block_expr(iter::once(action_stmt.into()), None);
-                make::expr_if(cond.into(), then, None)
+                make::expr_if(cond.into(), then, None).into()
             }
             FlowHandler::MatchOption { none } => {
                 let some_name = "value";
@@ -1451,15 +1589,15 @@ impl FlowHandler {
                     let value_pat = make::ext::simple_ident_pat(make::name(some_name));
                     let pat = make::tuple_struct_pat(path, iter::once(value_pat.into()));
                     let value = make::expr_path(make::ext::ident_path(some_name));
-                    make::match_arm(iter::once(pat.into()), None, value)
+                    make::match_arm(pat.into(), None, value)
                 };
                 let none_arm = {
                     let path = make::ext::ident_path("None");
                     let pat = make::path_pat(path);
-                    make::match_arm(iter::once(pat), None, none.make_result_handler(None))
+                    make::match_arm(pat, None, none.make_result_handler(None))
                 };
                 let arms = make::match_arm_list(vec![some_arm, none_arm]);
-                make::expr_match(call_expr, arms)
+                make::expr_match(call_expr, arms).into()
             }
             FlowHandler::MatchResult { err } => {
                 let ok_name = "value";
@@ -1470,77 +1608,58 @@ impl FlowHandler {
                     let value_pat = make::ext::simple_ident_pat(make::name(ok_name));
                     let pat = make::tuple_struct_pat(path, iter::once(value_pat.into()));
                     let value = make::expr_path(make::ext::ident_path(ok_name));
-                    make::match_arm(iter::once(pat.into()), None, value)
+                    make::match_arm(pat.into(), None, value)
                 };
                 let err_arm = {
                     let path = make::ext::ident_path("Err");
                     let value_pat = make::ext::simple_ident_pat(make::name(err_name));
                     let pat = make::tuple_struct_pat(path, iter::once(value_pat.into()));
                     let value = make::expr_path(make::ext::ident_path(err_name));
-                    make::match_arm(
-                        iter::once(pat.into()),
-                        None,
-                        err.make_result_handler(Some(value)),
-                    )
+                    make::match_arm(pat.into(), None, err.make_result_handler(Some(value)))
                 };
                 let arms = make::match_arm_list(vec![ok_arm, err_arm]);
-                make::expr_match(call_expr, arms)
+                make::expr_match(call_expr, arms).into()
             }
         }
     }
 }
 
-fn path_expr_from_local(ctx: &AssistContext<'_>, var: Local) -> ast::Expr {
-    let name = var.name(ctx.db()).display(ctx.db()).to_string();
+fn path_expr_from_local(ctx: &AssistContext<'_>, var: Local, edition: Edition) -> ast::Expr {
+    let name = var.name(ctx.db()).display(ctx.db(), edition).to_string();
     make::expr_path(make::ext::ident_path(&name))
 }
 
 fn format_function(
     ctx: &AssistContext<'_>,
     module: hir::Module,
-    fun: &Function,
+    fun: &Function<'_>,
     old_indent: IndentLevel,
-    new_indent: IndentLevel,
-) -> String {
-    let mut fn_def = String::new();
-
-    let fun_name = &fun.name;
-    let params = fun.make_param_list(ctx, module);
+) -> ast::Fn {
+    let fun_name = make::name(&fun.name.text());
+    let params = fun.make_param_list(ctx, module, fun.mods.edition);
     let ret_ty = fun.make_ret_ty(ctx, module);
-    let body = make_body(ctx, old_indent, new_indent, fun);
-    let const_kw = if fun.mods.is_const { "const " } else { "" };
-    let async_kw = if fun.control_flow.is_async { "async " } else { "" };
-    let unsafe_kw = if fun.control_flow.is_unsafe { "unsafe " } else { "" };
+    let body = make_body(ctx, old_indent, fun);
     let (generic_params, where_clause) = make_generic_params_and_where_clause(ctx, fun);
 
-    format_to!(fn_def, "\n\n{new_indent}{const_kw}{async_kw}{unsafe_kw}");
-    match ctx.config.snippet_cap {
-        Some(_) => format_to!(fn_def, "fn $0{fun_name}"),
-        None => format_to!(fn_def, "fn {fun_name}"),
-    }
-
-    if let Some(generic_params) = generic_params {
-        format_to!(fn_def, "{generic_params}");
-    }
-
-    format_to!(fn_def, "{params}");
-
-    if let Some(ret_ty) = ret_ty {
-        format_to!(fn_def, " {ret_ty}");
-    }
-
-    if let Some(where_clause) = where_clause {
-        format_to!(fn_def, " {where_clause}");
-    }
-
-    format_to!(fn_def, " {body}");
-
-    fn_def
+    make::fn_(
+        None,
+        None,
+        fun_name,
+        generic_params,
+        where_clause,
+        params,
+        body,
+        ret_ty,
+        fun.control_flow.is_async,
+        fun.mods.is_const,
+        fun.control_flow.is_unsafe,
+        false,
+    )
 }
 
 fn make_generic_params_and_where_clause(
     ctx: &AssistContext<'_>,
-    fun: &Function,
+    fun: &Function<'_>,
 ) -> (Option<ast::GenericParamList>, Option<ast::WhereClause>) {
     let used_type_params = fun.type_params(ctx);
 
@@ -1552,7 +1671,7 @@ fn make_generic_params_and_where_clause(
 
 fn make_generic_param_list(
     ctx: &AssistContext<'_>,
-    fun: &Function,
+    fun: &Function<'_>,
     used_type_params: &[TypeParam],
 ) -> Option<ast::GenericParamList> {
     let mut generic_params = fun
@@ -1589,7 +1708,7 @@ fn param_is_required(
 
 fn make_where_clause(
     ctx: &AssistContext<'_>,
-    fun: &Function,
+    fun: &Function<'_>,
     used_type_params: &[TypeParam],
 ) -> Option<ast::WhereClause> {
     let mut predicates = fun
@@ -1603,11 +1722,7 @@ fn make_where_clause(
         })
         .peekable();
 
-    if predicates.peek().is_some() {
-        Some(make::where_clause(predicates))
-    } else {
-        None
-    }
+    if predicates.peek().is_some() { Some(make::where_clause(predicates)) } else { None }
 }
 
 fn pred_is_required(
@@ -1633,9 +1748,9 @@ fn resolved_type_param(ctx: &AssistContext<'_>, pred: &ast::WherePred) -> Option
     }
 }
 
-impl Function {
+impl<'db> Function<'db> {
     /// Collect all the `TypeParam`s used in the `body` and `params`.
-    fn type_params(&self, ctx: &AssistContext<'_>) -> Vec<TypeParam> {
+    fn type_params(&self, ctx: &AssistContext<'db>) -> Vec<TypeParam> {
         let type_params_in_descendant_paths =
             self.body.descendant_paths().filter_map(|it| match ctx.sema.resolve_path(&it) {
                 Some(PathResolution::TypeParam(type_param)) => Some(type_param),
@@ -1645,9 +1760,14 @@ impl Function {
         type_params_in_descendant_paths.chain(type_params_in_params).collect()
     }
 
-    fn make_param_list(&self, ctx: &AssistContext<'_>, module: hir::Module) -> ast::ParamList {
+    fn make_param_list(
+        &self,
+        ctx: &AssistContext<'_>,
+        module: hir::Module,
+        edition: Edition,
+    ) -> ast::ParamList {
         let self_param = self.self_param.clone();
-        let params = self.params.iter().map(|param| param.to_param(ctx, module));
+        let params = self.params.iter().map(|param| param.to_param(ctx, module, edition));
         make::param_list(self_param, params)
     }
 
@@ -1693,8 +1813,8 @@ impl Function {
     }
 }
 
-impl FunType {
-    fn make_ty(&self, ctx: &AssistContext<'_>, module: hir::Module) -> ast::Type {
+impl<'db> FunType<'db> {
+    fn make_ty(&self, ctx: &AssistContext<'db>, module: hir::Module) -> ast::Type {
         match self {
             FunType::Unit => make::ty_unit(),
             FunType::Single(ty) => make_ty(ty, ctx, module),
@@ -1719,8 +1839,7 @@ impl FunType {
 fn make_body(
     ctx: &AssistContext<'_>,
     old_indent: IndentLevel,
-    new_indent: IndentLevel,
-    fun: &Function,
+    fun: &Function<'_>,
 ) -> ast::BlockExpr {
     let ret_ty = fun.return_type(ctx);
     let handler = FlowHandler::from_ret_ty(fun, &ret_ty);
@@ -1732,7 +1851,7 @@ fn make_body(
             match expr {
                 ast::Expr::BlockExpr(block) => {
                     // If the extracted expression is itself a block, there is no need to wrap it inside another block.
-                    let block = block.dedent(old_indent);
+                    block.dedent(old_indent);
                     let elements = block.stmt_list().map_or_else(
                         || Either::Left(iter::empty()),
                         |stmt_list| {
@@ -1752,13 +1871,13 @@ fn make_body(
                     make::hacky_block_expr(elements, block.tail_expr())
                 }
                 _ => {
-                    let expr = expr.dedent(old_indent).indent(IndentLevel(1));
+                    expr.reindent_to(1.into());
 
                     make::block_expr(Vec::new(), Some(expr))
                 }
             }
         }
-        FunctionBody::Span { parent, text_range } => {
+        FunctionBody::Span { parent, text_range, .. } => {
             let mut elements: Vec<_> = parent
                 .syntax()
                 .children_with_tokens()
@@ -1785,12 +1904,14 @@ fn make_body(
                 None => match fun.outliving_locals.as_slice() {
                     [] => {}
                     [var] => {
-                        tail_expr = Some(path_expr_from_local(ctx, var.local));
+                        tail_expr = Some(path_expr_from_local(ctx, var.local, fun.mods.edition));
                     }
                     vars => {
-                        let exprs = vars.iter().map(|var| path_expr_from_local(ctx, var.local));
+                        let exprs = vars
+                            .iter()
+                            .map(|var| path_expr_from_local(ctx, var.local, fun.mods.edition));
                         let expr = make::expr_tuple(exprs);
-                        tail_expr = Some(expr);
+                        tail_expr = Some(expr.into());
                     }
                 },
             };
@@ -1801,8 +1922,8 @@ fn make_body(
                 .map(|node_or_token| match &node_or_token {
                     syntax::NodeOrToken::Node(node) => match ast::Stmt::cast(node.clone()) {
                         Some(stmt) => {
-                            let indented = stmt.dedent(old_indent).indent(body_indent);
-                            let ast_node = indented.syntax().clone_subtree();
+                            stmt.reindent_to(body_indent);
+                            let ast_node = stmt.syntax().clone_subtree();
                             syntax::NodeOrToken::Node(ast_node)
                         }
                         _ => node_or_token,
@@ -1810,16 +1931,18 @@ fn make_body(
                     _ => node_or_token,
                 })
                 .collect::<Vec<SyntaxElement>>();
-            let tail_expr = tail_expr.map(|expr| expr.dedent(old_indent).indent(body_indent));
+            if let Some(tail_expr) = &mut tail_expr {
+                tail_expr.reindent_to(body_indent);
+            }
 
             make::hacky_block_expr(elements, tail_expr)
         }
     };
 
-    let block = match &handler {
+    match &handler {
         FlowHandler::None => block,
         FlowHandler::Try { kind } => {
-            let block = with_default_tail_expr(block, make::expr_unit());
+            let block = with_default_tail_expr(block, make::ext::expr_unit());
             map_tail_expr(block, |tail_expr| {
                 let constructor = match kind {
                     TryKind::Option => "Some",
@@ -1827,14 +1950,15 @@ fn make_body(
                 };
                 let func = make::expr_path(make::ext::ident_path(constructor));
                 let args = make::arg_list(iter::once(tail_expr));
-                make::expr_call(func, args)
+                make::expr_call(func, args).into()
             })
         }
         FlowHandler::If { .. } => {
             let controlflow_continue = make::expr_call(
                 make::expr_path(make::path_from_text("ControlFlow::Continue")),
-                make::arg_list(iter::once(make::expr_unit())),
-            );
+                make::arg_list([make::ext::expr_unit()]),
+            )
+            .into();
             with_tail_expr(block, controlflow_continue)
         }
         FlowHandler::IfOption { .. } => {
@@ -1844,16 +1968,14 @@ fn make_body(
         FlowHandler::MatchOption { .. } => map_tail_expr(block, |tail_expr| {
             let some = make::expr_path(make::ext::ident_path("Some"));
             let args = make::arg_list(iter::once(tail_expr));
-            make::expr_call(some, args)
+            make::expr_call(some, args).into()
         }),
         FlowHandler::MatchResult { .. } => map_tail_expr(block, |tail_expr| {
             let ok = make::expr_path(make::ext::ident_path("Ok"));
             let args = make::arg_list(iter::once(tail_expr));
-            make::expr_call(ok, args)
+            make::expr_call(ok, args).into()
         }),
-    };
-
-    block.indent(new_indent)
+    }
 }
 
 fn map_tail_expr(block: ast::BlockExpr, f: impl FnOnce(ast::Expr) -> ast::Expr) -> ast::BlockExpr {
@@ -1896,19 +2018,19 @@ fn with_tail_expr(block: ast::BlockExpr, tail_expr: ast::Expr) -> ast::BlockExpr
     make::hacky_block_expr(elements, Some(tail_expr))
 }
 
-fn format_type(ty: &hir::Type, ctx: &AssistContext<'_>, module: hir::Module) -> String {
-    ty.display_source_code(ctx.db(), module.into(), true).ok().unwrap_or_else(|| "_".to_string())
+fn format_type(ty: &hir::Type<'_>, ctx: &AssistContext<'_>, module: hir::Module) -> String {
+    ty.display_source_code(ctx.db(), module.into(), true).ok().unwrap_or_else(|| "_".to_owned())
 }
 
-fn make_ty(ty: &hir::Type, ctx: &AssistContext<'_>, module: hir::Module) -> ast::Type {
+fn make_ty(ty: &hir::Type<'_>, ctx: &AssistContext<'_>, module: hir::Module) -> ast::Type {
     let ty_str = format_type(ty, ctx, module);
     make::ty(&ty_str)
 }
 
 fn rewrite_body_segment(
     ctx: &AssistContext<'_>,
-    params: &[Param],
-    handler: &FlowHandler,
+    params: &[Param<'_>],
+    handler: &FlowHandler<'_>,
     syntax: &SyntaxNode,
 ) -> SyntaxNode {
     let syntax = fix_param_usages(ctx, params, syntax);
@@ -1917,8 +2039,12 @@ fn rewrite_body_segment(
 }
 
 /// change all usages to account for added `&`/`&mut` for some params
-fn fix_param_usages(ctx: &AssistContext<'_>, params: &[Param], syntax: &SyntaxNode) -> SyntaxNode {
-    let mut usages_for_param: Vec<(&Param, Vec<ast::Expr>)> = Vec::new();
+fn fix_param_usages(
+    ctx: &AssistContext<'_>,
+    params: &[Param<'_>],
+    syntax: &SyntaxNode,
+) -> SyntaxNode {
+    let mut usages_for_param: Vec<(&Param<'_>, Vec<ast::Expr>)> = Vec::new();
 
     let tm = TreeMutator::new(syntax);
 
@@ -1972,7 +2098,7 @@ fn fix_param_usages(ctx: &AssistContext<'_>, params: &[Param], syntax: &SyntaxNo
     res
 }
 
-fn update_external_control_flow(handler: &FlowHandler, syntax: &SyntaxNode) {
+fn update_external_control_flow(handler: &FlowHandler<'_>, syntax: &SyntaxNode) {
     let mut nested_loop = None;
     let mut nested_scope = None;
     for event in syntax.preorder() {
@@ -1995,29 +2121,29 @@ fn update_external_control_flow(handler: &FlowHandler, syntax: &SyntaxNode) {
                 _ => {}
             },
             WalkEvent::Leave(e) => {
-                if nested_scope.is_none() {
-                    if let Some(expr) = ast::Expr::cast(e.clone()) {
-                        match expr {
-                            ast::Expr::ReturnExpr(return_expr) => {
-                                let expr = return_expr.expr();
-                                if let Some(replacement) = make_rewritten_flow(handler, expr) {
-                                    ted::replace(return_expr.syntax(), replacement.syntax())
-                                }
+                if nested_scope.is_none()
+                    && let Some(expr) = ast::Expr::cast(e.clone())
+                {
+                    match expr {
+                        ast::Expr::ReturnExpr(return_expr) => {
+                            let expr = return_expr.expr();
+                            if let Some(replacement) = make_rewritten_flow(handler, expr) {
+                                ted::replace(return_expr.syntax(), replacement.syntax())
                             }
-                            ast::Expr::BreakExpr(break_expr) if nested_loop.is_none() => {
-                                let expr = break_expr.expr();
-                                if let Some(replacement) = make_rewritten_flow(handler, expr) {
-                                    ted::replace(break_expr.syntax(), replacement.syntax())
-                                }
+                        }
+                        ast::Expr::BreakExpr(break_expr) if nested_loop.is_none() => {
+                            let expr = break_expr.expr();
+                            if let Some(replacement) = make_rewritten_flow(handler, expr) {
+                                ted::replace(break_expr.syntax(), replacement.syntax())
                             }
-                            ast::Expr::ContinueExpr(continue_expr) if nested_loop.is_none() => {
-                                if let Some(replacement) = make_rewritten_flow(handler, None) {
-                                    ted::replace(continue_expr.syntax(), replacement.syntax())
-                                }
+                        }
+                        ast::Expr::ContinueExpr(continue_expr) if nested_loop.is_none() => {
+                            if let Some(replacement) = make_rewritten_flow(handler, None) {
+                                ted::replace(continue_expr.syntax(), replacement.syntax())
                             }
-                            _ => {
-                                // do nothing
-                            }
+                        }
+                        _ => {
+                            // do nothing
                         }
                     }
                 }
@@ -2033,23 +2159,27 @@ fn update_external_control_flow(handler: &FlowHandler, syntax: &SyntaxNode) {
     }
 }
 
-fn make_rewritten_flow(handler: &FlowHandler, arg_expr: Option<ast::Expr>) -> Option<ast::Expr> {
+fn make_rewritten_flow(
+    handler: &FlowHandler<'_>,
+    arg_expr: Option<ast::Expr>,
+) -> Option<ast::Expr> {
     let value = match handler {
         FlowHandler::None | FlowHandler::Try { .. } => return None,
         FlowHandler::If { .. } => make::expr_call(
             make::expr_path(make::path_from_text("ControlFlow::Break")),
-            make::arg_list(iter::once(make::expr_unit())),
-        ),
+            make::arg_list([make::ext::expr_unit()]),
+        )
+        .into(),
         FlowHandler::IfOption { .. } => {
-            let expr = arg_expr.unwrap_or_else(|| make::expr_tuple(Vec::new()));
-            let args = make::arg_list(iter::once(expr));
-            make::expr_call(make::expr_path(make::ext::ident_path("Some")), args)
+            let expr = arg_expr.unwrap_or_else(make::ext::expr_unit);
+            let args = make::arg_list([expr]);
+            make::expr_call(make::expr_path(make::ext::ident_path("Some")), args).into()
         }
         FlowHandler::MatchOption { .. } => make::expr_path(make::ext::ident_path("None")),
         FlowHandler::MatchResult { .. } => {
-            let expr = arg_expr.unwrap_or_else(|| make::expr_tuple(Vec::new()));
-            let args = make::arg_list(iter::once(expr));
-            make::expr_call(make::expr_path(make::ext::ident_path("Err")), args)
+            let expr = arg_expr.unwrap_or_else(make::ext::expr_unit);
+            let args = make::arg_list([expr]);
+            make::expr_call(make::expr_path(make::ext::ident_path("Err")), args).into()
         }
     };
     Some(make::expr_return(Some(value)).clone_for_update())
@@ -2549,6 +2679,20 @@ fn $0fun_name(n: u32) -> u32 {
     fn in_comment_is_not_applicable() {
         cov_mark::check!(extract_function_in_comment_is_not_applicable);
         check_assist_not_applicable(extract_function, r"fn main() { 1 + /* $0comment$0 */ 1; }");
+    }
+
+    #[test]
+    fn empty_selection_is_not_applicable() {
+        cov_mark::check!(extract_function_empty_selection_is_not_applicable);
+        check_assist_not_applicable(
+            extract_function,
+            r#"
+fn main() {
+    $0
+
+    $0
+}"#,
+        );
     }
 
     #[test]
@@ -3068,11 +3212,11 @@ fn foo() {
     let mut c = C { p: P { n: 0 } };
     let mut v = C { p: P { n: 0 } };
     let u = C { p: P { n: 0 } };
-    fun_name(&mut c, &u, &mut v);
+    fun_name(&mut c, &mut v, &u);
     let m = c.p.n + v.p.n + u.p.n;
 }
 
-fn $0fun_name(c: &mut C, u: &C, v: &mut C) {
+fn $0fun_name(c: &mut C, v: &mut C, u: &C) {
     c.p.n += u.p.n;
     let r = &mut v.p.n;
 }
@@ -4908,7 +5052,7 @@ fn $0fun_name(bar: &str) {
     }
 
     #[test]
-    fn unresolveable_types_default_to_placeholder() {
+    fn unresolvable_types_default_to_placeholder() {
         check_assist(
             extract_function,
             r#"
@@ -5503,10 +5647,10 @@ fn parent(factor: i32) {
 fn parent(factor: i32) {
     let v = &[1, 2, 3];
 
-    fun_name(v, factor);
+    fun_name(factor, v);
 }
 
-fn $0fun_name(v: &[i32; 3], factor: i32) {
+fn $0fun_name(factor: i32, v: &[i32; 3]) {
     v.iter().map(|it| it * factor);
 }
 "#,
@@ -5687,11 +5831,11 @@ struct Struct<T: Into<i32>>(T);
 impl <T: Into<i32> + Copy> Struct<T> {
     fn func<V: Into<i32>>(&self, v: V) -> i32 {
         let t = self.0;
-        fun_name(t, v)
+        fun_name(v, t)
     }
 }
 
-fn $0fun_name<T: Into<i32> + Copy, V: Into<i32>>(t: T, v: V) -> i32 {
+fn $0fun_name<T: Into<i32> + Copy, V: Into<i32>>(v: V, t: T) -> i32 {
     t.into() + v.into()
 }
 "#,
@@ -5716,11 +5860,11 @@ struct Struct<T: Into<i32>, U: Debug>(T, U);
 impl <T: Into<i32> + Copy, U: Debug> Struct<T, U> {
     fn func<V: Into<i32>>(&self, v: V) -> i32 {
         let t = self.0;
-        fun_name(t, v)
+        fun_name(v, t)
     }
 }
 
-fn $0fun_name<T: Into<i32> + Copy, V: Into<i32>>(t: T, v: V) -> i32 {
+fn $0fun_name<T: Into<i32> + Copy, V: Into<i32>>(v: V, t: T) -> i32 {
     t.into() + v.into()
 }
 "#,
@@ -5745,11 +5889,11 @@ struct Struct<T>(T) where T: Into<i32>;
 impl <T> Struct<T> where T: Into<i32> + Copy {
     fn func<V>(&self, v: V) -> i32 where V: Into<i32> {
         let t = self.0;
-        fun_name(t, v)
+        fun_name(v, t)
     }
 }
 
-fn $0fun_name<T, V>(t: T, v: V) -> i32 where T: Into<i32> + Copy, V: Into<i32> {
+fn $0fun_name<T, V>(v: V, t: T) -> i32 where T: Into<i32> + Copy, V: Into<i32> {
     t.into() + v.into()
 }
 "#,
@@ -5774,11 +5918,11 @@ struct Struct<T, U>(T, U) where T: Into<i32>, U: Debug;
 impl <T, U> Struct<T, U> where T: Into<i32> + Copy, U: Debug {
     fn func<V>(&self, v: V) -> i32 where V: Into<i32> {
         let t = self.0;
-        fun_name(t, v)
+        fun_name(v, t)
     }
 }
 
-fn $0fun_name<T, V>(t: T, v: V) -> i32 where T: Into<i32> + Copy, V: Into<i32> {
+fn $0fun_name<T, V>(v: V, t: T) -> i32 where T: Into<i32> + Copy, V: Into<i32> {
     t.into() + v.into()
 }
 "#,
@@ -6002,6 +6146,53 @@ fn $0fun_name() -> i32 {
     // comment 2
     let b = 5;
     a + b
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn sort_params_in_order() {
+        check_assist(
+            extract_function,
+            r#"
+fn existing(a: i32, b: i32, c: i32) {
+    let x = 32;
+
+    let p = $0x + b + c + a$0;
+}
+"#,
+            r#"
+fn existing(a: i32, b: i32, c: i32) {
+    let x = 32;
+
+    let p = fun_name(a, b, c, x);
+}
+
+fn $0fun_name(a: i32, b: i32, c: i32, x: i32) -> i32 {
+    x + b + c + a
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn fmt_macro_argument() {
+        check_assist(
+            extract_function,
+            r#"
+//- minicore: fmt
+fn existing(a: i32, b: i32, c: i32) {
+    $0print!("{a}{}{}", b, "{c}");$0
+}
+"#,
+            r#"
+fn existing(a: i32, b: i32, c: i32) {
+    fun_name(a, b);
+}
+
+fn $0fun_name(a: i32, b: i32) {
+    print!("{a}{}{}", b, "{c}");
 }
 "#,
         );

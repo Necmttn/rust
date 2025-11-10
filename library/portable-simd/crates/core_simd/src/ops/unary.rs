@@ -1,4 +1,3 @@
-use crate::simd::intrinsics;
 use crate::simd::{LaneCount, Simd, SimdElement, SupportedLaneCount};
 use core::ops::{Neg, Not}; // unary ops
 
@@ -12,10 +11,9 @@ macro_rules! neg {
             type Output = Self;
 
             #[inline]
-            #[must_use = "operator returns a new vector without mutating the input"]
             fn neg(self) -> Self::Output {
                 // Safety: `self` is a signed vector
-                unsafe { intrinsics::simd_neg(self) }
+                unsafe { core::intrinsics::simd::simd_neg(self) }
             }
         })*
     }
@@ -47,7 +45,6 @@ macro_rules! not {
             type Output = Self;
 
             #[inline]
-            #[must_use = "operator returns a new vector without mutating the input"]
             fn not(self) -> Self::Output {
                 self ^ (Simd::splat(!(0 as $scalar)))
             }

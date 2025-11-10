@@ -1,21 +1,22 @@
-use crate::assert_dep_graph::assert_dep_graph;
-use crate::errors;
+use std::fs;
+use std::sync::Arc;
+
 use rustc_data_structures::fx::FxIndexMap;
 use rustc_data_structures::sync::join;
 use rustc_middle::dep_graph::{
     DepGraph, SerializedDepGraph, WorkProduct, WorkProductId, WorkProductMap,
 };
 use rustc_middle::ty::TyCtxt;
-use rustc_serialize::opaque::{FileEncodeResult, FileEncoder};
 use rustc_serialize::Encodable as RustcEncodable;
+use rustc_serialize::opaque::{FileEncodeResult, FileEncoder};
 use rustc_session::Session;
-use std::fs;
+use tracing::debug;
 
 use super::data::*;
-use super::dirty_clean;
-use super::file_format;
 use super::fs::*;
-use super::work_product;
+use super::{dirty_clean, file_format, work_product};
+use crate::assert_dep_graph::assert_dep_graph;
+use crate::errors;
 
 /// Saves and writes the [`DepGraph`] to the file system.
 ///
@@ -24,7 +25,7 @@ use super::work_product;
 ///
 /// This function should only run after all queries have completed.
 /// Trying to execute a query afterwards would attempt to read the result cache we just dropped.
-pub fn save_dep_graph(tcx: TyCtxt<'_>) {
+pub(crate) fn save_dep_graph(tcx: TyCtxt<'_>) {
     debug!("save_dep_graph()");
     tcx.dep_graph.with_ignore(|| {
         let sess = tcx.sess;
@@ -32,7 +33,7 @@ pub fn save_dep_graph(tcx: TyCtxt<'_>) {
             return;
         }
         // This is going to be deleted in finalize_session_directory, so let's not create it.
-        if sess.dcx().has_errors_or_lint_errors_or_delayed_bugs().is_some() {
+        if sess.dcx().has_errors_or_delayed_bugs().is_some() {
             return;
         }
 
@@ -42,10 +43,6 @@ pub fn save_dep_graph(tcx: TyCtxt<'_>) {
 
         sess.time("assert_dep_graph", || assert_dep_graph(tcx));
         sess.time("check_dirty_clean", || dirty_clean::check_dirty_clean_annotations(tcx));
-
-        if sess.opts.unstable_opts.incremental_info {
-            tcx.dep_graph.print_incremental_info()
-        }
 
         join(
             move || {
@@ -87,7 +84,7 @@ pub fn save_work_product_index(
         return;
     }
     // This is going to be deleted in finalize_session_directory, so let's not create it
-    if sess.dcx().has_errors_or_lint_errors().is_some() {
+    if sess.dcx().has_errors().is_some() {
         return;
     }
 
@@ -147,7 +144,7 @@ fn encode_query_cache(tcx: TyCtxt<'_>, encoder: FileEncoder) -> FileEncodeResult
 /// and moves it to the permanent dep-graph path
 pub(crate) fn build_dep_graph(
     sess: &Session,
-    prev_graph: SerializedDepGraph,
+    prev_graph: Arc<SerializedDepGraph>,
     prev_work_products: WorkProductMap,
 ) -> Option<DepGraph> {
     if sess.opts.incremental.is_none() {
@@ -171,12 +168,5 @@ pub(crate) fn build_dep_graph(
     // First encode the commandline arguments hash
     sess.opts.dep_tracking_hash(false).encode(&mut encoder);
 
-    Some(DepGraph::new(
-        &sess.prof,
-        prev_graph,
-        prev_work_products,
-        encoder,
-        sess.opts.unstable_opts.query_dep_graph,
-        sess.opts.unstable_opts.incremental_info,
-    ))
+    Some(DepGraph::new(sess, prev_graph, prev_work_products, encoder))
 }

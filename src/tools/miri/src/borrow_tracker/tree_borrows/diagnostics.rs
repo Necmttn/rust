@@ -4,11 +4,9 @@ use std::ops::Range;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_span::{Span, SpanData};
 
-use crate::borrow_tracker::tree_borrows::{
-    perms::{PermTransition, Permission},
-    tree::LocationState,
-    unimap::UniIndex,
-};
+use crate::borrow_tracker::tree_borrows::perms::{PermTransition, Permission};
+use crate::borrow_tracker::tree_borrows::tree::LocationState;
+use crate::borrow_tracker::tree_borrows::unimap::UniIndex;
 use crate::borrow_tracker::{AccessKind, ProtectorKind};
 use crate::*;
 
@@ -19,7 +17,7 @@ pub enum AccessCause {
     Explicit(AccessKind),
     Reborrow,
     Dealloc,
-    FnExit,
+    FnExit(AccessKind),
 }
 
 impl fmt::Display for AccessCause {
@@ -28,7 +26,11 @@ impl fmt::Display for AccessCause {
             Self::Explicit(kind) => write!(f, "{kind}"),
             Self::Reborrow => write!(f, "reborrow"),
             Self::Dealloc => write!(f, "deallocation"),
-            Self::FnExit => write!(f, "protector release"),
+            // This is dead code, since the protector release access itself can never
+            // cause UB (while the protector is active, if some other access invalidates
+            // further use of the protected tag, that is immediate UB).
+            // Describing the cause of UB is the only time this function is called.
+            Self::FnExit(_) => unreachable!("protector accesses can never be the source of UB"),
         }
     }
 }
@@ -40,7 +42,7 @@ impl AccessCause {
             Self::Explicit(kind) => format!("{rel} {kind}"),
             Self::Reborrow => format!("reborrow (acting as a {rel} read access)"),
             Self::Dealloc => format!("deallocation (acting as a {rel} write access)"),
-            Self::FnExit => format!("protector release (acting as a {rel} read access)"),
+            Self::FnExit(kind) => format!("protector release (acting as a {rel} {kind})"),
         }
     }
 }
@@ -48,7 +50,7 @@ impl AccessCause {
 /// Complete data for an event:
 #[derive(Clone, Debug)]
 pub struct Event {
-    /// Transformation of permissions that occured because of this event.
+    /// Transformation of permissions that occurred because of this event.
     pub transition: PermTransition,
     /// Kind of the access that triggered this event.
     pub access_cause: AccessCause,
@@ -58,7 +60,7 @@ pub struct Event {
     /// `None` means that this is an implicit access to the entire allocation
     /// (used for the implicit read on protector release).
     pub access_range: Option<AllocRange>,
-    /// The transition recorded by this event only occured on a subrange of
+    /// The transition recorded by this event only occurred on a subrange of
     /// `access_range`: a single access on `access_range` triggers several events,
     /// each with their own mutually disjoint `transition_range`. No-op transitions
     /// should not be recorded as events, so the union of all `transition_range` is not
@@ -177,7 +179,7 @@ impl NodeDebugInfo {
     /// Add a name to the tag. If a same tag is associated to several pointers,
     /// it can have several names which will be separated by commas.
     pub fn add_name(&mut self, name: &str) {
-        if let Some(ref mut prev_name) = &mut self.name {
+        if let Some(prev_name) = &mut self.name {
             prev_name.push_str(", ");
             prev_name.push_str(name);
         } else {
@@ -224,7 +226,7 @@ impl<'tcx> Tree {
         } else {
             eprintln!("Tag {tag:?} (to be named '{name}') not found!");
         }
-        Ok(())
+        interp_ok(())
     }
 
     /// Debug helper: determines if the tree contains a tag.
@@ -242,8 +244,8 @@ pub(super) enum TransitionError {
     ChildAccessForbidden(Permission),
     /// A protector was triggered due to an invalid transition that loses
     /// too much permissions.
-    /// For example, if a protected tag goes from `Active` to `Disabled` due
-    /// to a foreign write this will produce a `ProtectedDisabled(Active)`.
+    /// For example, if a protected tag goes from `Unique` to `Disabled` due
+    /// to a foreign write this will produce a `ProtectedDisabled(Unique)`.
     /// This kind of error can only occur on foreign accesses.
     ProtectedDisabled(Permission),
     /// Cannot deallocate because some tag in the allocation is strongly protected.
@@ -278,6 +280,8 @@ impl History {
 pub(super) struct TbError<'node> {
     /// What failure occurred.
     pub error_kind: TransitionError,
+    /// The allocation in which the error is happening.
+    pub alloc_id: AllocId,
     /// The offset (into the allocation) at which the conflict occurred.
     pub error_offset: u64,
     /// The tag on which the error was triggered.
@@ -294,13 +298,17 @@ pub(super) struct TbError<'node> {
 
 impl TbError<'_> {
     /// Produce a UB error.
-    pub fn build<'tcx>(self) -> InterpError<'tcx> {
+    pub fn build<'tcx>(self) -> InterpErrorKind<'tcx> {
         use TransitionError::*;
         let cause = self.access_cause;
         let accessed = self.accessed_info;
         let conflicting = self.conflicting_info;
         let accessed_is_conflicting = accessed.tag == conflicting.tag;
-        let title = format!("{cause} through {accessed} is forbidden");
+        let title = format!(
+            "{cause} through {accessed} at {alloc_id:?}[{offset:#x}] is forbidden",
+            alloc_id = self.alloc_id,
+            offset = self.error_offset
+        );
         let (title, details, conflicting_tag_name) = match self.error_kind {
             ChildAccessForbidden(perm) => {
                 let conflicting_tag_name =
@@ -359,7 +367,7 @@ type S = &'static str;
 /// Pretty-printing details
 ///
 /// Example:
-/// ```
+/// ```rust,ignore (private type)
 /// DisplayFmtWrapper {
 ///     top: '>',
 ///     bot: '<',
@@ -384,10 +392,10 @@ struct DisplayFmtWrapper {
     warning_text: S,
 }
 
-/// Formating of the permissions on each range.
+/// Formatting of the permissions on each range.
 ///
 /// Example:
-/// ```
+/// ```rust,ignore (private type)
 /// DisplayFmtPermission {
 ///     open: "[",
 ///     sep: "|",
@@ -416,10 +424,10 @@ struct DisplayFmtPermission {
     range_sep: S,
 }
 
-/// Formating of the tree structure.
+/// Formatting of the tree structure.
 ///
 /// Example:
-/// ```
+/// ```rust,ignore (private type)
 /// DisplayFmtPadding {
 ///     join_middle: "|-",
 ///     join_last: "'-",
@@ -457,7 +465,7 @@ struct DisplayFmtPadding {
 /// How to show whether a location has been accessed
 ///
 /// Example:
-/// ```
+/// ```rust,ignore (private type)
 /// DisplayFmtAccess {
 ///     yes: " ",
 ///     no: "?",
@@ -481,7 +489,7 @@ struct DisplayFmtAccess {
     meh: S,
 }
 
-/// All parameters to determine how the tree is formated.
+/// All parameters to determine how the tree is formatted.
 struct DisplayFmt {
     wrapper: DisplayFmtWrapper,
     perm: DisplayFmtPermission,
@@ -496,7 +504,7 @@ impl DisplayFmt {
         if let Some(perm) = perm {
             format!(
                 "{ac}{st}",
-                ac = if perm.is_initialized() { self.accessed.yes } else { self.accessed.no },
+                ac = if perm.accessed() { self.accessed.yes } else { self.accessed.no },
                 st = perm.permission().short_name(),
             )
         } else {
@@ -790,6 +798,6 @@ impl<'tcx> Tree {
                 /* print warning message about tags not shown */ !show_unnamed,
             );
         }
-        Ok(())
+        interp_ok(())
     }
 }

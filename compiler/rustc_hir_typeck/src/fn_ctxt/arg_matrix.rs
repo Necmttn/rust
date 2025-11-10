@@ -1,7 +1,8 @@
 use core::cmp::Ordering;
+use std::cmp;
+
 use rustc_index::IndexVec;
 use rustc_middle::ty::error::TypeError;
-use std::cmp;
 
 rustc_index::newtype_index! {
     #[orderable]
@@ -16,8 +17,14 @@ rustc_index::newtype_index! {
 }
 
 impl ExpectedIdx {
-    pub fn to_provided_idx(self) -> ProvidedIdx {
+    pub(crate) fn to_provided_idx(self) -> ProvidedIdx {
         ProvidedIdx::from_usize(self.as_usize())
+    }
+}
+
+impl ProvidedIdx {
+    pub(crate) fn to_expected_idx(self) -> ExpectedIdx {
+        ExpectedIdx::from_u32(self.as_u32())
     }
 }
 
@@ -167,7 +174,7 @@ impl<'tcx> ArgMatrix<'tcx> {
                 return Some(Issue::Missing(next_unmatched_idx));
             }
             // If we eliminate the last column, any left-over inputs are extra
-            if mat[i].len() == 0 {
+            if mat[i].is_empty() {
                 return Some(Issue::Extra(next_unmatched_idx));
             }
 
@@ -180,28 +187,18 @@ impl<'tcx> ArgMatrix<'tcx> {
                 continue;
             }
 
-            let mut useless = true;
-            let mut unsatisfiable = true;
-            if is_arg {
-                for j in 0..ii.len() {
-                    // If we find at least one input this argument could satisfy
-                    // this argument isn't unsatisfiable
-                    if matches!(mat[j][i], Compatibility::Compatible) {
-                        unsatisfiable = false;
-                        break;
-                    }
-                }
-            }
-            if is_input {
-                for j in 0..ai.len() {
-                    // If we find at least one argument that could satisfy this input
-                    // this input isn't useless
-                    if matches!(mat[i][j], Compatibility::Compatible) {
-                        useless = false;
-                        break;
-                    }
-                }
-            }
+            // If this argument can satisfy some input, then this argument is satisfiable
+            let unsatisfiable = if is_arg {
+                !mat.iter().take(ii.len()).any(|c| matches!(c[i], Compatibility::Compatible))
+            } else {
+                true
+            };
+            // If this input can be satisfied by some argument, then this input is useful
+            let useless = if is_input {
+                !mat[i].iter().take(ai.len()).any(|c| matches!(c, Compatibility::Compatible))
+            } else {
+                true
+            };
 
             match (is_input, is_arg, useless, unsatisfiable) {
                 // If an argument is unsatisfied, and the input in its position is useless
@@ -306,7 +303,7 @@ impl<'tcx> ArgMatrix<'tcx> {
                 permutation.into_iter().map(|x| x.unwrap()).collect();
             return Some(Issue::Permutation(final_permutation));
         }
-        return None;
+        None
     }
 
     // Obviously, detecting exact user intention is impossible, so the goal here is to
@@ -409,6 +406,6 @@ impl<'tcx> ArgMatrix<'tcx> {
         // sort errors with same type by the order they appear in the source
         // so that suggestion will be handled properly, see #112507
         errors.sort();
-        return (errors, matched_inputs);
+        (errors, matched_inputs)
     }
 }

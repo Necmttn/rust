@@ -1,51 +1,69 @@
+use hir::db::ExpandDatabase;
 use ide_db::source_change::SourceChange;
-use syntax::{AstNode, SyntaxKind, SyntaxNode, SyntaxToken, T};
-use text_edit::TextEdit;
+use ide_db::text_edit::TextEdit;
+use syntax::{AstNode, SyntaxKind, SyntaxNode, SyntaxNodePtr, SyntaxToken, T, ast};
 
-use crate::{fix, Diagnostic, DiagnosticCode, DiagnosticsContext};
+use crate::{Diagnostic, DiagnosticCode, DiagnosticsContext, fix};
 
 // Diagnostic: need-mut
 //
 // This diagnostic is triggered on mutating an immutable variable.
-pub(crate) fn need_mut(ctx: &DiagnosticsContext<'_>, d: &hir::NeedMut) -> Diagnostic {
+pub(crate) fn need_mut(ctx: &DiagnosticsContext<'_>, d: &hir::NeedMut) -> Option<Diagnostic> {
+    let root = ctx.sema.db.parse_or_expand(d.span.file_id);
+    let node = d.span.value.to_node(&root);
+    let mut span = d.span;
+    if let Some(parent) = node.parent()
+        && ast::BinExpr::can_cast(parent.kind())
+    {
+        // In case of an assignment, the diagnostic is provided on the variable name.
+        // We want to expand it to include the whole assignment, but only when this
+        // is an ordinary assignment, not a destructuring assignment. So, the direct
+        // parent is an assignment expression.
+        span = d.span.with_value(SyntaxNodePtr::new(&parent));
+    };
+
     let fixes = (|| {
         if d.local.is_ref(ctx.sema.db) {
             // There is no simple way to add `mut` to `ref x` and `ref mut x`
             return None;
         }
-        let file_id = d.span.file_id.file_id()?;
+        let file_id = span.file_id.file_id()?;
         let mut edit_builder = TextEdit::builder();
-        let use_range = d.span.value.text_range();
+        let use_range = span.value.text_range();
         for source in d.local.sources(ctx.sema.db) {
             let Some(ast) = source.name() else { continue };
             // FIXME: macros
-            edit_builder.insert(ast.value.syntax().text_range().start(), "mut ".to_string());
+            edit_builder.insert(ast.value.syntax().text_range().start(), "mut ".to_owned());
         }
         let edit = edit_builder.finish();
         Some(vec![fix(
             "add_mut",
             "Change it to be mutable",
-            SourceChange::from_text_edit(file_id, edit),
+            SourceChange::from_text_edit(file_id.file_id(ctx.sema.db), edit),
             use_range,
         )])
     })();
-    Diagnostic::new_with_syntax_node_ptr(
-        ctx,
-        // FIXME: `E0384` is not the only error that this diagnostic handles
-        DiagnosticCode::RustcHardError("E0384"),
-        format!(
-            "cannot mutate immutable variable `{}`",
-            d.local.name(ctx.sema.db).display(ctx.sema.db)
-        ),
-        d.span,
+
+    Some(
+        Diagnostic::new_with_syntax_node_ptr(
+            ctx,
+            // FIXME: `E0384` is not the only error that this diagnostic handles
+            DiagnosticCode::RustcHardError("E0384"),
+            format!(
+                "cannot mutate immutable variable `{}`",
+                d.local.name(ctx.sema.db).display(ctx.sema.db, ctx.edition)
+            ),
+            span,
+        )
+        .stable()
+        .with_fixes(fixes),
     )
-    .with_fixes(fixes)
 }
 
 // Diagnostic: unused-mut
 //
 // This diagnostic is triggered when a mutable variable isn't actually mutated.
-pub(crate) fn unused_mut(ctx: &DiagnosticsContext<'_>, d: &hir::UnusedMut) -> Diagnostic {
+pub(crate) fn unused_mut(ctx: &DiagnosticsContext<'_>, d: &hir::UnusedMut) -> Option<Diagnostic> {
     let ast = d.local.primary_source(ctx.sema.db).syntax_ptr();
     let fixes = (|| {
         let file_id = ast.file_id.file_id()?;
@@ -55,29 +73,31 @@ pub(crate) fn unused_mut(ctx: &DiagnosticsContext<'_>, d: &hir::UnusedMut) -> Di
             let ast = source.syntax();
             let Some(mut_token) = token(ast, T![mut]) else { continue };
             edit_builder.delete(mut_token.text_range());
-            if let Some(token) = mut_token.next_token() {
-                if token.kind() == SyntaxKind::WHITESPACE {
-                    edit_builder.delete(token.text_range());
-                }
+            if let Some(token) = mut_token.next_token()
+                && token.kind() == SyntaxKind::WHITESPACE
+            {
+                edit_builder.delete(token.text_range());
             }
         }
         let edit = edit_builder.finish();
         Some(vec![fix(
             "remove_mut",
             "Remove unnecessary `mut`",
-            SourceChange::from_text_edit(file_id, edit),
+            SourceChange::from_text_edit(file_id.file_id(ctx.sema.db), edit),
             use_range,
         )])
     })();
     let ast = d.local.primary_source(ctx.sema.db).syntax_ptr();
-    Diagnostic::new_with_syntax_node_ptr(
-        ctx,
-        DiagnosticCode::RustcLint("unused_mut"),
-        "variable does not need to be mutable",
-        ast,
+    Some(
+        Diagnostic::new_with_syntax_node_ptr(
+            ctx,
+            DiagnosticCode::RustcLint("unused_mut"),
+            "variable does not need to be mutable",
+            ast,
+        )
+        // Not supporting `#[allow(unused_mut)]` in proc macros leads to false positive, hence not stable.
+        .with_fixes(fixes),
     )
-    .experimental() // Not supporting `#[allow(unused_mut)]` in proc macros leads to false positive.
-    .with_fixes(fixes)
 }
 
 pub(super) fn token(parent: &SyntaxNode, kind: SyntaxKind) -> Option<SyntaxToken> {
@@ -86,7 +106,7 @@ pub(super) fn token(parent: &SyntaxNode, kind: SyntaxKind) -> Option<SyntaxToken
 
 #[cfg(test)]
 mod tests {
-    use crate::tests::{check_diagnostics, check_fix};
+    use crate::tests::{check_diagnostics, check_diagnostics_with_disabled, check_fix};
 
     #[test]
     fn unused_mut_simple() {
@@ -413,7 +433,7 @@ fn main() {
 fn main() {
     return;
     let mut x = 2;
-      //^^^^^ warn: unused variable
+      //^^^^^ 💡 warn: unused variable
     &mut x;
 }
 "#,
@@ -423,12 +443,12 @@ fn main() {
 fn main() {
     loop {}
     let mut x = 2;
-      //^^^^^ warn: unused variable
+      //^^^^^ 💡 warn: unused variable
     &mut x;
 }
 "#,
         );
-        check_diagnostics(
+        check_diagnostics_with_disabled(
             r#"
 enum X {}
 fn g() -> X {
@@ -444,12 +464,13 @@ fn main(b: bool) {
         g();
     }
     let mut x = 2;
-      //^^^^^ warn: unused variable
+      //^^^^^ 💡 warn: unused variable
     &mut x;
 }
 "#,
+            &["remove-unnecessary-else"],
         );
-        check_diagnostics(
+        check_diagnostics_with_disabled(
             r#"
 fn main(b: bool) {
     if b {
@@ -458,10 +479,11 @@ fn main(b: bool) {
         return;
     }
     let mut x = 2;
-      //^^^^^ warn: unused variable
+      //^^^^^ 💡 warn: unused variable
     &mut x;
 }
 "#,
+            &["remove-unnecessary-else"],
         );
     }
 
@@ -787,7 +809,7 @@ fn f() {
                //^^ 💡 error: cannot mutate immutable variable `x`
     _ = (x, y);
     let x = Foo;
-      //^ warn: unused variable
+      //^ 💡 warn: unused variable
     let x = Foo;
     let y: &mut (i32, u8) = &mut x;
                           //^^^^^^ 💡 error: cannot mutate immutable variable `x`
@@ -815,8 +837,9 @@ fn f() {
 //- minicore: option
 fn f(_: i32) {}
 fn main() {
-    let ((Some(mut x), None) | (_, Some(mut x))) = (None, Some(7));
+    let ((Some(mut x), None) | (_, Some(mut x))) = (None, Some(7)) else { return };
              //^^^^^ 💡 warn: variable does not need to be mutable
+
     f(x);
 }
 "#,
@@ -923,7 +946,6 @@ fn fn_once(mut x: impl FnOnce(u8) -> u8) -> u8 {
 
     #[test]
     fn closure() {
-        // FIXME: Diagnostic spans are inconsistent inside and outside closure
         check_diagnostics(
             r#"
         //- minicore: copy, fn
@@ -936,11 +958,11 @@ fn fn_once(mut x: impl FnOnce(u8) -> u8) -> u8 {
         fn f() {
             let x = 5;
             let closure1 = || { x = 2; };
-                              //^ 💡 error: cannot mutate immutable variable `x`
+                              //^^^^^ 💡 error: cannot mutate immutable variable `x`
             let _ = closure1();
                   //^^^^^^^^ 💡 error: cannot mutate immutable variable `closure1`
             let closure2 = || { x = x; };
-                              //^ 💡 error: cannot mutate immutable variable `x`
+                              //^^^^^ 💡 error: cannot mutate immutable variable `x`
             let closure3 = || {
                 let x = 2;
                 x = 5;
@@ -982,7 +1004,7 @@ fn f() {
             || {
                 let x = 2;
                 || { || { x = 5; } }
-                        //^ 💡 error: cannot mutate immutable variable `x`
+                        //^^^^^ 💡 error: cannot mutate immutable variable `x`
             }
         }
     };
@@ -1237,11 +1259,67 @@ fn foo(mut foo: Foo) {
 
 pub struct A {}
 pub unsafe fn foo(a: *mut A) {
-    let mut b = || -> *mut A { &mut *a };
+    let mut b = || -> *mut A { unsafe { &mut *a } };
       //^^^^^ 💡 warn: variable does not need to be mutable
     let _ = b();
 }
 "#,
+        );
+    }
+
+    #[test]
+    fn regression_15799() {
+        check_diagnostics(
+            r#"
+//- minicore: deref_mut
+struct WrapPtr(*mut u32);
+
+impl core::ops::Deref for WrapPtr {
+    type Target = *mut u32;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+fn main() {
+    let mut x = 0u32;
+    let wrap = WrapPtr(&mut x);
+    unsafe {
+        **wrap = 6;
+    }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn destructuring_assignment_needs_mut() {
+        check_diagnostics(
+            r#"
+//- minicore: fn
+
+fn main() {
+	let mut var = 1;
+	let mut func = || (var,) = (2,);
+	func();
+}
+        "#,
+        );
+    }
+
+    #[test]
+    fn regression_20662() {
+        check_diagnostics(
+            r#"
+//- minicore: index
+pub trait A: core::ops::IndexMut<usize> {
+    type T: A;
+}
+
+fn func(a: &mut impl A, b: &mut [i32]) {
+    b[0] += 1;
+}
+        "#,
         );
     }
 }

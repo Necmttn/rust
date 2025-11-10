@@ -1,8 +1,7 @@
-use crate::iter::adapters::{
-    zip::try_get_unchecked, SourceIter, TrustedRandomAccess, TrustedRandomAccessNoCoerce,
-};
+use crate::iter::adapters::zip::try_get_unchecked;
+use crate::iter::adapters::{SourceIter, TrustedRandomAccess, TrustedRandomAccessNoCoerce};
 use crate::iter::{FusedIterator, InPlaceIterable, TrustedFused, TrustedLen};
-use crate::num::NonZeroUsize;
+use crate::num::NonZero;
 use crate::ops::Try;
 
 /// An iterator that yields the current count and the element during iteration.
@@ -15,6 +14,7 @@ use crate::ops::Try;
 #[derive(Clone, Debug)]
 #[must_use = "iterators are lazy and do nothing unless consumed"]
 #[stable(feature = "rust1", since = "1.0.0")]
+#[rustc_diagnostic_item = "Enumerate"]
 pub struct Enumerate<I> {
     iter: I,
     count: usize,
@@ -22,6 +22,39 @@ pub struct Enumerate<I> {
 impl<I> Enumerate<I> {
     pub(in crate::iter) fn new(iter: I) -> Enumerate<I> {
         Enumerate { iter, count: 0 }
+    }
+
+    /// Retrieve the current position of the iterator.
+    ///
+    /// If the iterator has not advanced, the position returned will be 0.
+    ///
+    /// The position may also exceed the bounds of the iterator to allow for calculating
+    /// the displacement of the iterator from following calls to [`Iterator::next`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(next_index)]
+    ///
+    /// let arr = ['a', 'b'];
+    ///
+    /// let mut iter = arr.iter().enumerate();
+    ///
+    /// assert_eq!(iter.next_index(), 0);
+    /// assert_eq!(iter.next(), Some((0, &'a')));
+    ///
+    /// assert_eq!(iter.next_index(), 1);
+    /// assert_eq!(iter.next_index(), 1);
+    /// assert_eq!(iter.next(), Some((1, &'b')));
+    ///
+    /// assert_eq!(iter.next_index(), 2);
+    /// assert_eq!(iter.next(), None);
+    /// assert_eq!(iter.next_index(), 2);
+    /// ```
+    #[inline]
+    #[unstable(feature = "next_index", issue = "130711")]
+    pub fn next_index(&self) -> usize {
+        self.count
     }
 }
 
@@ -36,7 +69,7 @@ where
     ///
     /// The method does no guarding against overflows, so enumerating more than
     /// `usize::MAX` elements either produces the wrong result or panics. If
-    /// debug assertions are enabled, a panic is guaranteed.
+    /// overflow checks are enabled, a panic is guaranteed.
     ///
     /// # Panics
     ///
@@ -115,7 +148,7 @@ where
 
     #[inline]
     #[rustc_inherit_overflow_checks]
-    fn advance_by(&mut self, n: usize) -> Result<(), NonZeroUsize> {
+    fn advance_by(&mut self, n: usize) -> Result<(), NonZero<usize>> {
         let remaining = self.iter.advance_by(n);
         let advanced = match remaining {
             Ok(()) => n,
@@ -206,7 +239,7 @@ where
     }
 
     #[inline]
-    fn advance_back_by(&mut self, n: usize) -> Result<(), NonZeroUsize> {
+    fn advance_back_by(&mut self, n: usize) -> Result<(), NonZero<usize>> {
         // we do not need to update the count since that only tallies the number of items
         // consumed from the front. consuming items from the back can never reduce that.
         self.iter.advance_back_by(n)
@@ -265,8 +298,8 @@ where
 
 #[unstable(issue = "none", feature = "inplace_iteration")]
 unsafe impl<I: InPlaceIterable> InPlaceIterable for Enumerate<I> {
-    const EXPAND_BY: Option<NonZeroUsize> = I::EXPAND_BY;
-    const MERGE_BY: Option<NonZeroUsize> = I::MERGE_BY;
+    const EXPAND_BY: Option<NonZero<usize>> = I::EXPAND_BY;
+    const MERGE_BY: Option<NonZero<usize>> = I::MERGE_BY;
 }
 
 #[stable(feature = "default_iters", since = "1.70.0")]

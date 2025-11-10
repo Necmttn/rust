@@ -1,9 +1,7 @@
-// edition: 2024
-// compile-flags: -Zunstable-options
-// run-pass
+//@ edition: 2024
+//@ run-pass
 
 #![feature(gen_blocks, async_iterator)]
-#![feature(noop_waker)]
 
 // make sure that a ridiculously simple async gen fn works as an iterator.
 
@@ -46,7 +44,6 @@ async fn async_main() {
 use std::pin::{Pin, pin};
 use std::task::*;
 use std::async_iter::AsyncIterator;
-use std::future::Future;
 
 trait AsyncIterExt {
     fn next(&mut self) -> Next<'_, Self>;

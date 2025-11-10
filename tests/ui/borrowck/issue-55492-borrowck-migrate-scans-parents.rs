@@ -10,7 +10,6 @@ mod borrowck_closures_unique {
         //~^ ERROR is not declared as mutable
         unsafe {
             c1(&mut Y);
-            //~^ WARN mutable reference of mutable static is discouraged [static_mut_ref]
         }
     }
 }
@@ -25,7 +24,6 @@ mod borrowck_closures_unique_grandparent {
         };
         unsafe {
             c1(&mut Z);
-            //~^ WARN mutable reference of mutable static is discouraged [static_mut_ref]
         }
     }
 }
@@ -62,7 +60,6 @@ fn main() {
     static mut X: isize = 2;
     unsafe {
         borrowck_closures_unique::e(&mut X);
-        //~^ WARN mutable reference of mutable static is discouraged [static_mut_ref]
     }
 
     mutability_errors::capture_assign_whole((1000,));

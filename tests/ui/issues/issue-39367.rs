@@ -1,4 +1,4 @@
-// run-pass
+//@ run-pass
 
 use std::ops::Deref;
 
@@ -20,6 +20,7 @@ fn arena() -> &'static ArenaSet<Vec<u8>> {
 
             static mut ONCE: Once = Once::new();
             ONCE.call_once(|| {
+            //~^ WARN creating a shared reference to mutable static [static_mut_refs]
                 DATA = transmute
                     ::<Box<ArenaSet<Vec<u8>>>, *const ArenaSet<Vec<u8>>>
                     (Box::new(__static_ref_initialize()));

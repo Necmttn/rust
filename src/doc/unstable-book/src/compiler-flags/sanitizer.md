@@ -1,5 +1,14 @@
 # `sanitizer`
 
+Sanitizers are tools that help detect and prevent various types of bugs and
+vulnerabilities in software. They are available in compilers and work by
+instrumenting the code to add additional runtime checks. While they provide
+powerful tools for identifying bugs or security issues, it's important to note
+that using sanitizers can introduce runtime overhead and might not catch all
+possible issues. Therefore, they are typically used alongside other best
+practices in software development, such as testing and fuzzing, to ensure the
+highest level of software quality and security.
+
 The tracking issues for this feature are:
 
 * [#39699](https://github.com/rust-lang/rust/issues/39699).
@@ -9,29 +18,48 @@ The tracking issues for this feature are:
 
 This feature allows for use of one of following sanitizers:
 
-* [AddressSanitizer](#addresssanitizer) a fast memory error detector.
-* [ControlFlowIntegrity](#controlflowintegrity) LLVM Control Flow Integrity (CFI) provides
-  forward-edge control flow protection.
-* [HWAddressSanitizer](#hwaddresssanitizer) a memory error detector similar to
-  AddressSanitizer, but based on partial hardware assistance.
-* [KernelControlFlowIntegrity](#kernelcontrolflowintegrity) LLVM Kernel Control
-  Flow Integrity (KCFI) provides forward-edge control flow protection for
-  operating systems kernels.
-* [LeakSanitizer](#leaksanitizer) a run-time memory leak detector.
-* [MemorySanitizer](#memorysanitizer) a detector of uninitialized reads.
-* [MemTagSanitizer](#memtagsanitizer) fast memory error detector based on
-  Armv8.5-A Memory Tagging Extension.
-* [SafeStack](#safestack) provides backward-edge control flow protection by separating the stack into safe and unsafe regions.
-* [ShadowCallStack](#shadowcallstack) provides backward-edge control flow protection (aarch64 only).
-* [ThreadSanitizer](#threadsanitizer) a fast data race detector.
+* Those intended for testing or fuzzing (but not production use):
+  * [AddressSanitizer](#addresssanitizer) a fast memory error detector.
+  * [HWAddressSanitizer](#hwaddresssanitizer) a memory error detector similar to
+    AddressSanitizer, but based on partial hardware assistance.
+  * [LeakSanitizer](#leaksanitizer) a run-time memory leak detector.
+  * [MemorySanitizer](#memorysanitizer) a detector of uninitialized reads.
+  * [RealtimeSanitizer](#realtimesanitizer) a detector of calls to function with
+    non-deterministic execution time in realtime contexts.
+  * [ThreadSanitizer](#threadsanitizer) a fast data race detector.
 
-To enable a sanitizer compile with `-Zsanitizer=address`,`-Zsanitizer=cfi`,
-`-Zsanitizer=hwaddress`, `-Zsanitizer=leak`, `-Zsanitizer=memory`,
-`-Zsanitizer=memtag`, `-Zsanitizer=shadow-call-stack`, or `-Zsanitizer=thread`.
-You might also need the `--target` and `build-std` flags. Example:
+* Those that apart from testing, may be used in production:
+  * [ControlFlowIntegrity](#controlflowintegrity) LLVM Control Flow Integrity
+    (CFI) provides forward-edge control flow protection.
+  * [DataFlowSanitizer](#dataflowsanitizer) a generic dynamic data flow analysis
+    framework.
+  * [KernelControlFlowIntegrity](#kernelcontrolflowintegrity) LLVM Kernel
+    Control Flow Integrity (KCFI) provides forward-edge control flow protection
+    for operating systems kernels.
+  * [MemTagSanitizer](#memtagsanitizer) fast memory error detector based on
+    Armv8.5-A Memory Tagging Extension.
+  * [SafeStack](#safestack) provides backward-edge control flow protection by
+    separating the stack into safe and unsafe regions.
+  * [ShadowCallStack](#shadowcallstack) provides backward-edge control flow
+    protection (aarch64 only).
+
+To enable a sanitizer compile with `-Zsanitizer=address`, `-Zsanitizer=cfi`,
+`-Zsanitizer=dataflow`,`-Zsanitizer=hwaddress`, `-Zsanitizer=leak`,
+`-Zsanitizer=memory`, `-Zsanitizer=memtag`, `-Zsanitizer=realtime`,
+`-Zsanitizer=shadow-call-stack` or `-Zsanitizer=thread`. You might also need the
+`--target` and `build-std` flags. If you're working with other languages that are also
+instrumented with sanitizers, you might need the `external-clangrt` flag. See
+the section on [working with other languages](#working-with-other-languages).
+
+Example:
 ```shell
 $ RUSTFLAGS=-Zsanitizer=address cargo build -Zbuild-std --target x86_64-unknown-linux-gnu
 ```
+
+Additional options for sanitizers can be passed to LLVM command line argument
+processor via LLVM arguments using `llvm-args` codegen option (e.g.,
+`-Cllvm-args=-dfsan-combine-pointer-labels-on-load=false`). See the sanitizer
+documentation for more information about additional options.
 
 # AddressSanitizer
 
@@ -218,37 +246,30 @@ See the [Clang ControlFlowIntegrity documentation][clang-cfi] for more details.
 
 ## Example 1: Redirecting control flow using an indirect branch/call to an invalid destination
 
-```rust,ignore (making doc tests pass cross-platform is hard)
-#![feature(naked_functions)]
-
-use std::arch::asm;
-use std::mem;
-
+```rust
 fn add_one(x: i32) -> i32 {
     x + 1
 }
 
-#[naked]
-pub extern "C" fn add_two(x: i32) {
+#[unsafe(naked)]
+# #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub extern "sysv64" fn add_two(x: i32) {
     // x + 2 preceded by a landing pad/nop block
-    unsafe {
-        asm!(
-            "
-             nop
-             nop
-             nop
-             nop
-             nop
-             nop
-             nop
-             nop
-             nop
-             lea eax, [rdi+2]
-             ret
-        ",
-            options(noreturn)
-        );
-    }
+    std::arch::naked_asm!(
+        "
+         nop
+         nop
+         nop
+         nop
+         nop
+         nop
+         nop
+         nop
+         nop
+         lea eax, [rdi+2]
+         ret
+        "
+    );
 }
 
 fn do_twice(f: fn(i32) -> i32, arg: i32) -> i32 {
@@ -260,16 +281,18 @@ fn main() {
 
     println!("The answer is: {}", answer);
 
-    println!("With CFI enabled, you should not see the next answer");
-    let f: fn(i32) -> i32 = unsafe {
-        // Offset 0 is a valid branch/call destination (i.e., the function entry
-        // point), but offsets 1-8 within the landing pad/nop block are invalid
-        // branch/call destinations (i.e., within the body of the function).
-        mem::transmute::<*const u8, fn(i32) -> i32>((add_two as *const u8).offset(5))
-    };
-    let next_answer = do_twice(f, 5);
+#   #[cfg(all(target_os = "linux", target_arch = "x86_64"))] {
+        println!("With CFI enabled, you should not see the next answer");
+        let f: fn(i32) -> i32 = unsafe {
+            // Offset 0 is a valid branch/call destination (i.e., the function entry
+            // point), but offsets 1-8 within the landing pad/nop block are invalid
+            // branch/call destinations (i.e., within the body of the function).
+            std::mem::transmute::<*const u8, fn(i32) -> i32>((add_two as *const u8).offset(5))
+        };
+        let next_answer = do_twice(f, 5);
 
-    println!("The next answer is: {}", next_answer);
+        println!("The next answer is: {}", next_answer);
+#   }
 }
 ```
 Fig. 1. Redirecting control flow using an indirect branch/call to an invalid
@@ -625,6 +648,21 @@ LLVM KCFI is supported on the following targets:
 See the [Clang KernelControlFlowIntegrity documentation][clang-kcfi] for more
 details.
 
+# DataFlowSanitizer
+
+DataFlowSanitizer is a generalised dynamic data flow analysis.
+
+Unlike other Sanitizer tools, this tool is not designed to detect a specific
+class of bugs on its own. Instead, it provides a generic dynamic data flow
+analysis framework to be used by clients to help detect application-specific
+issues within their own code.
+
+DataFlowSanitizer is supported on the following targets:
+
+* `x86_64-unknown-linux-gnu`
+
+See the [Clang DataFlowSanitizer documentation][clang-dataflow] for more details.
+
 # KernelAddressSanitizer
 
 KernelAddressSanitizer (KASAN) is a freestanding version of AddressSanitizer
@@ -649,7 +687,6 @@ LeakSanitizer is run-time memory leak detector.
 
 LeakSanitizer is supported on the following targets:
 
-* `aarch64-apple-darwin`
 * `aarch64-unknown-linux-gnu`
 * `x86_64-apple-darwin`
 * `x86_64-unknown-linux-gnu`
@@ -734,17 +771,46 @@ See the [Clang SafeStack documentation][clang-safestack] for more details.
 
 # ShadowCallStack
 
-ShadowCallStack provides backward edge control flow protection by storing a function's return address in a separately allocated 'shadow call stack' and loading the return address from that shadow call stack.
-
-ShadowCallStack requires a platform ABI which reserves `x18` as the instrumentation makes use of this register.
+ShadowCallStack provides backward edge control flow protection by storing a function's return address in a separately allocated 'shadow call stack'
+and loading the return address from that shadow call stack.
+AArch64 and RISC-V both have a platform register defined in their ABIs, which is `x18` and `x3`/`gp` respectively, that can optionally be reserved for this purpose.
+Software support from the operating system and runtime may be required depending on the target platform which is detailed in the remaining section.
+See the [Clang ShadowCallStack documentation][clang-scs] for more details.
 
 ShadowCallStack can be enabled with `-Zsanitizer=shadow-call-stack` option and is supported on the following targets:
 
-* `aarch64-linux-android`
+## AArch64 family
 
+ShadowCallStack requires the use of the ABI defined platform register, `x18`, which is required for code generation purposes.
+When `x18` is not reserved, and is instead used as a scratch register subsequently, enabling ShadowCallStack would lead to undefined behaviour
+due to corruption of return address or invalid memory access when the instrumentation restores return register to the link register `lr` from the
+already clobbered `x18` register.
+In other words, code that is calling into or called by functions instrumented with ShadowCallStack must reserve the `x18` register or preserve its value.
+
+### `aarch64-linux-android` and `aarch64-unknown-fuchsia`/`aarch64-fuchsia`
+
+This target already reserves the `x18` register.
 A runtime must be provided by the application or operating system.
+If `bionic` is used on this target, the software support is provided.
+Otherwise, a runtime needs to prepare a memory region and points `x18` to the region which serves as the shadow call stack.
 
-See the [Clang ShadowCallStack documentation][clang-scs] for more details.
+### `aarch64-unknown-none`
+
+In addition to support from a runtime by the application or operating system, the `-Zfixed-x18` flag is also mandatory.
+
+## RISC-V 64 family
+
+ShadowCallStack uses either the `gp` register for software shadow stack, also known as `x3`, or the `ssp` register if [`Zicfiss`][riscv-zicfiss] extension is available.
+`gp`/`x3` is currently always reserved and available for ShadowCallStack instrumentation, and `ssp` in case of `Zicfiss` is only accessible through its dedicated shadow stack instructions.
+
+Support from the runtime and operating system is required when `gp`/`x3` is used for software shadow stack.
+A runtime must prepare a memory region and point `gp`/`x3` to the region before executing the code.
+
+The following targets support ShadowCallStack.
+
+* `riscv64imac-unknown-none-elf`
+* `riscv64gc-unknown-none-elf`
+* `riscv64gc-unknown-fuchsia`
 
 # ThreadSanitizer
 
@@ -801,6 +867,70 @@ WARNING: ThreadSanitizer: data race (pid=10574)
   Location is global 'example::A::h43ac149ddf992709' of size 8 at 0x5632dfe3d030 (example+0x000000bd9030)
 ```
 
+# RealtimeSanitizer
+RealtimeSanitizer detects non-deterministic execution time calls in real-time contexts.
+Functions marked with the `#[sanitize(realtime = "nonblocking")]` attribute are considered real-time functions.
+When RTSan detects a call to a function with a non-deterministic execution time, like `malloc` or `free`
+while in a real-time context, it reports an error.
+
+Besides "nonblocking" the attribute can also be used with "blocking" and "caller".
+- "blocking" allows the programmer to mark their own functions as having a non-deterministic execution time.
+When reaching such a function while in a real-time context a violation will be reported. A typical use
+case is a userland spinlock.
+- functions marked with "caller" will be sanitized if they were called from a real-time context.
+If no attribute is set, this is the default. Between entering a "nonblocking" function and exiting that
+function again the program will get sanitized.
+
+The santizer checks can be disabled using the external functions `__rtsan_disable()` and `__rtsan_enable()`.
+Each call to `__rtsan_disable()` must be paired with one following call to `__rtsan_enable()`, otherwise the behaviour is undefined.
+
+```rust
+unsafe extern "C" {
+  fn __rtsan_disable();
+  fn __rtsan_enable();
+}
+```
+
+```rust,ignore (log is just a example and doesn't exist)
+// in a real-time context
+#[cfg(debug_assertions)]
+{
+    unsafe { __rtsan_disable() };
+    log!("logging xyz");
+    unsafe { __rtsan_enable() };
+}
+```
+
+See the [Clang RealtimeSanitizer documentation][clang-rtsan] for more details.
+
+## Example
+
+```rust,no_run
+#![feature(sanitize)]
+#[sanitize(realtime = "nonblocking")]
+fn real_time() {
+  let vec = vec![0, 1, 2]; // call to malloc is detected and reported as an error
+}
+```
+
+```shell
+==8670==ERROR: RealtimeSanitizer: unsafe-library-call
+Intercepted call to real-time unsafe function `malloc` in real-time context!
+    #0 0x00010107b0d8 in malloc rtsan_interceptors_posix.cpp:792
+    #1 0x000100d94e70 in alloc::alloc::Global::alloc_impl::h9e1fc3206c868eea+0xa0 (realtime_vec:arm64+0x100000e70)
+    #2 0x000100d94d90 in alloc::alloc::exchange_malloc::hd45b5788339eb5c8+0x48 (realtime_vec:arm64+0x100000d90)
+    #3 0x000100d95020 in realtime_vec::main::hea6bd69b03eb9ca1+0x24 (realtime_vec:arm64+0x100001020)
+    #4 0x000100d94a28 in core::ops::function::FnOnce::call_once::h493b6cb9dd87d87c+0xc (realtime_vec:arm64+0x100000a28)
+    #5 0x000100d949b8 in std::sys::backtrace::__rust_begin_short_backtrace::hfcddb06c73c19eea+0x8 (realtime_vec:arm64+0x1000009b8)
+    #6 0x000100d9499c in std::rt::lang_start::_$u7b$$u7b$closure$u7d$$u7d$::h202288c05a2064f0+0xc (realtime_vec:arm64+0x10000099c)
+    #7 0x000100d9fa34 in std::rt::lang_start_internal::h6c763158a05ac05f+0x6c (realtime_vec:arm64+0x10000ba34)
+    #8 0x000100d94980 in std::rt::lang_start::h1c29cc56df0598b4+0x38 (realtime_vec:arm64+0x100000980)
+    #9 0x000100d95118 in main+0x20 (realtime_vec:arm64+0x100001118)
+    #10 0x000183a46b94 in start+0x17b8 (dyld:arm64+0xfffffffffff3ab94)
+
+SUMMARY: RealtimeSanitizer: unsafe-library-call rtsan_interceptors_posix.cpp:792 in malloc
+```
+
 # Instrumentation of external dependencies and std
 
 The sanitizers to varying degrees work correctly with partially instrumented
@@ -814,6 +944,18 @@ instrumented standard library, for example using [cargo `-Zbuild-std`
 functionality][build-std].
 
 [build-std]: ../../cargo/reference/unstable.html#build-std
+
+# Working with other languages
+
+Sanitizers rely on compiler runtime libraries to function properly. Rust links
+in its own compiler runtime which might conflict with runtimes required by
+languages such as C++. Since Rust's runtime doesn't always contain the symbols
+required by C++ instrumented code, you might need to skip linking it so another
+runtime can be linked instead.
+
+A separate unstable option `-Zexternal-clangrt` can be used to make rustc skip
+linking the compiler runtime for the sanitizer. This will require you to link
+in an external runtime, such as from clang instead.
 
 # Build scripts and procedural macros
 
@@ -835,21 +977,26 @@ Sanitizers produce symbolized stacktraces when llvm-symbolizer binary is in `PAT
 * [Sanitizers project page](https://github.com/google/sanitizers/wiki/)
 * [AddressSanitizer in Clang][clang-asan]
 * [ControlFlowIntegrity in Clang][clang-cfi]
+* [DataFlowSanitizer in Clang][clang-dataflow]
 * [HWAddressSanitizer in Clang][clang-hwasan]
 * [Linux Kernel's KernelAddressSanitizer documentation][linux-kasan]
 * [LeakSanitizer in Clang][clang-lsan]
 * [MemorySanitizer in Clang][clang-msan]
 * [MemTagSanitizer in LLVM][llvm-memtag]
 * [ThreadSanitizer in Clang][clang-tsan]
+* [RealtimeSanitizer in Clang][clang-rtsan]
 
 [clang-asan]: https://clang.llvm.org/docs/AddressSanitizer.html
 [clang-cfi]: https://clang.llvm.org/docs/ControlFlowIntegrity.html
+[clang-dataflow]: https://clang.llvm.org/docs/DataFlowSanitizer.html
 [clang-hwasan]: https://clang.llvm.org/docs/HardwareAssistedAddressSanitizerDesign.html
 [clang-kcfi]: https://clang.llvm.org/docs/ControlFlowIntegrity.html#fsanitize-kcfi
 [clang-lsan]: https://clang.llvm.org/docs/LeakSanitizer.html
 [clang-msan]: https://clang.llvm.org/docs/MemorySanitizer.html
+[clang-rtsan]: https://clang.llvm.org/docs/RealtimeSanitizer.html
 [clang-safestack]: https://clang.llvm.org/docs/SafeStack.html
 [clang-scs]: https://clang.llvm.org/docs/ShadowCallStack.html
 [clang-tsan]: https://clang.llvm.org/docs/ThreadSanitizer.html
 [linux-kasan]: https://www.kernel.org/doc/html/latest/dev-tools/kasan.html
 [llvm-memtag]: https://llvm.org/docs/MemTagSanitizer.html
+[riscv-zicfiss]: https://github.com/riscv/riscv-cfi/blob/3f8e450c481ac303bd5643444f7a89672f24476e/src/cfi_backward.adoc

@@ -1,4 +1,4 @@
-// edition:2021
+//@ edition:2021
 
 #![feature(rustc_attrs)]
 #![allow(unused)]
@@ -22,8 +22,8 @@ fn main() {
     //~^ ERROR: First Pass analysis includes:
     //~| ERROR: Min Capture analysis includes:
         println!("{}", w.p.x);
-        //~^ NOTE: Capturing w[(0, 0),(0, 0)] -> ImmBorrow
-        //~| NOTE: Min Capture w[(0, 0),(0, 0)] -> ImmBorrow
+        //~^ NOTE: Capturing w[(0, 0),(0, 0)] -> Immutable
+        //~| NOTE: Min Capture w[(0, 0),(0, 0)] -> Immutable
     };
 
     // `c` only captures `w.p.x`, therefore it's safe to mutate `w.p.y`.

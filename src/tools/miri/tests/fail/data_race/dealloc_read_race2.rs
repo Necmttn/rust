@@ -1,5 +1,7 @@
 // We want to control preemption here. Stacked borrows interferes by having its own accesses.
-//@compile-flags: -Zmiri-preemption-rate=0 -Zmiri-disable-stacked-borrows
+//@compile-flags: -Zmiri-deterministic-concurrency -Zmiri-disable-stacked-borrows
+
+#![feature(rustc_attrs)]
 
 use std::thread::spawn;
 
@@ -10,10 +12,11 @@ unsafe impl<T> Send for EvilSend<T> {}
 unsafe impl<T> Sync for EvilSend<T> {}
 
 extern "Rust" {
+    #[rustc_std_internal_symbol]
     fn __rust_dealloc(ptr: *mut u8, size: usize, align: usize);
 }
 
-pub fn main() {
+fn main() {
     // Shared atomic pointer
     let pointer: *mut usize = Box::into_raw(Box::new(0usize));
     let ptr = EvilSend(pointer);
@@ -30,7 +33,7 @@ pub fn main() {
 
         let j2 = spawn(move || {
             let ptr = ptr; // avoid field capturing
-            // Also an error of the form: Data race detected between (1) deallocation on thread `<unnamed>` and (2) non-atomic read on thread `<unnamed>`
+            // Also an error of the form: Data race detected between (1) deallocation on thread `unnamed-ID` and (2) non-atomic read on thread `unnamed-ID`
             // but the invalid allocation is detected first.
             *ptr.0 //~ ERROR: has been freed
         });

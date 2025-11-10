@@ -1,8 +1,7 @@
-// revisions: pass fail
-//[pass] check-pass
-//[fail] check-fail
+//@ revisions: pass fail
+//@[pass] check-pass
+//@[fail] check-fail
 #![feature(never_patterns)]
-#![feature(exhaustive_patterns)]
 #![allow(incomplete_features)]
 
 #[derive(Copy, Clone)]
@@ -107,7 +106,7 @@ fn never_pattern_typeck_pass(void: Void) {
     }
     match (&[] as &[Void]) {
         [] => {}
-        [!],
+        [!, ..],
     }
     // Accept on a composite empty type.
     match None::<&(u32, Void)> {
@@ -121,5 +120,17 @@ fn never_pattern_typeck_pass(void: Void) {
     match None::<&Result<Void, Void>> {
         None => {}
         Some(!),
+    }
+}
+
+struct Unsized {
+    void: Void,
+    slice: [u8],
+}
+
+#[cfg(pass)]
+fn not_sized(x: &Unsized) {
+    match *x {
+        !,
     }
 }

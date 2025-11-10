@@ -1,6 +1,6 @@
 use clippy_utils::diagnostics::span_lint_and_sugg;
+use clippy_utils::res::MaybeDef;
 use clippy_utils::source::snippet_with_applicability;
-use clippy_utils::ty::get_type_diagnostic_name;
 use rustc_errors::Applicability;
 use rustc_hir as hir;
 use rustc_lint::{LateContext, LateLintPass};
@@ -38,13 +38,11 @@ impl<'tcx> LateLintPass<'tcx> for UnnecessaryMapOnConstructor {
         if expr.span.from_expansion() {
             return;
         }
-        if let hir::ExprKind::MethodCall(path, recv, args, ..) = expr.kind
-            && let Some(sym::Option | sym::Result) = get_type_diagnostic_name(cx, cx.typeck_results().expr_ty(recv))
+        if let hir::ExprKind::MethodCall(path, recv, [map_arg], ..) = expr.kind
+            && let Some(sym::Option | sym::Result) = cx.typeck_results().expr_ty(recv).opt_diag_name(cx)
         {
-            let (constructor_path, constructor_item) = if let hir::ExprKind::Call(constructor, constructor_args) =
-                recv.kind
+            let (constructor_path, constructor_item) = if let hir::ExprKind::Call(constructor, [arg, ..]) = recv.kind
                 && let hir::ExprKind::Path(constructor_path) = constructor.kind
-                && let Some(arg) = constructor_args.first()
             {
                 if constructor.span.from_expansion() || arg.span.from_expansion() {
                     return;
@@ -62,17 +60,14 @@ impl<'tcx> LateLintPass<'tcx> for UnnecessaryMapOnConstructor {
                     }
                 },
                 hir::QPath::TypeRelative(_, path) => path.ident.name,
-                hir::QPath::LangItem(..) => return,
             };
             match constructor_symbol {
-                sym::Some | sym::Ok if path.ident.name == rustc_span::sym::map => (),
+                sym::Some | sym::Ok if path.ident.name == sym::map => (),
                 sym::Err if path.ident.name == sym::map_err => (),
                 _ => return,
             }
 
-            if let Some(map_arg) = args.first()
-                && let hir::ExprKind::Path(fun) = map_arg.kind
-            {
+            if let hir::ExprKind::Path(fun) = map_arg.kind {
                 if map_arg.span.from_expansion() {
                     return;
                 }
@@ -86,7 +81,7 @@ impl<'tcx> LateLintPass<'tcx> for UnnecessaryMapOnConstructor {
                     cx,
                     UNNECESSARY_MAP_ON_CONSTRUCTOR,
                     expr.span,
-                    &format!(
+                    format!(
                         "unnecessary {} on constructor {constructor_snippet}(_)",
                         path.ident.name
                     ),

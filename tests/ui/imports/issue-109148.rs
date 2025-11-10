@@ -1,4 +1,4 @@
-// edition: 2021
+//@ edition: 2021
 
 // https://github.com/rust-lang/rust/pull/111761#issuecomment-1557777314
 macro_rules! m {
@@ -10,6 +10,7 @@ macro_rules! m {
 
 m!();
 
-use std::mem;
+use std::mem; //~ ERROR `std` is ambiguous
+use ::std::mem as _; //~ ERROR `std` is ambiguous
 
 fn main() {}

@@ -1,14 +1,14 @@
 use either::Either;
 use itertools::Itertools;
 use syntax::{
-    ast::{self, edit::IndentLevel, CommentPlacement, Whitespace},
     AstToken, TextRange,
+    ast::{self, CommentPlacement, Whitespace, edit::IndentLevel},
 };
 
 use crate::{
+    AssistContext, AssistId, Assists,
     handlers::convert_comment_block::{line_comment_text, relevant_line_comments},
     utils::required_hashes,
-    AssistContext, AssistId, AssistKind, Assists,
 };
 
 // Assist: desugar_doc_comment
@@ -27,9 +27,7 @@ use crate::{
 pub(crate) fn desugar_doc_comment(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
     let comment = ctx.find_token_at_offset::<ast::Comment>()?;
     // Only allow doc comments
-    let Some(placement) = comment.kind().doc else {
-        return None;
-    };
+    let placement = comment.kind().doc?;
 
     // Only allow comments which are alone on their line
     if let Some(prev) = comment.syntax().prev_token() {
@@ -56,7 +54,7 @@ pub(crate) fn desugar_doc_comment(acc: &mut Assists, ctx: &AssistContext<'_>) ->
     };
 
     acc.add(
-        AssistId("desugar_doc_comment", AssistKind::RefactorRewrite),
+        AssistId::refactor_rewrite("desugar_doc_comment"),
         "Desugar doc-comment to attribute macro",
         target,
         |edit| {

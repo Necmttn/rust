@@ -1,9 +1,10 @@
 // Test where we change the body of a private method in an impl.
 // We then test what sort of functions must be rebuilt as a result.
 
-// revisions:cfail1 cfail2
-// compile-flags: -Z query-dep-graph
-// build-pass (FIXME(62277): could be check-pass?)
+//@ revisions:cfail1 cfail2
+//@ compile-flags: -Z query-dep-graph
+//@ build-pass (FIXME(62277): could be check-pass?)
+//@ ignore-backends: gcc
 
 #![feature(rustc_attrs)]
 #![feature(stmt_expr_attributes)]

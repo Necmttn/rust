@@ -1,9 +1,10 @@
 // Regression test for #112691
 //
-// revisions: current next
-// [next] compile-flags: -Znext-solver
-// [next] check-pass
-// [current]: known-bug: #112691
+//@ revisions: current next
+//@ ignore-compare-mode-next-solver (explicit revisions)
+//@ [next] compile-flags: -Znext-solver
+//@ [next] check-pass
+//@ [current] known-bug: #112691
 
 #![feature(type_alias_impl_trait)]
 
@@ -22,8 +23,8 @@ fn dyn_hoops<T: Trait>(_: T) -> *const dyn FnOnce(T::Gat<'_>) {
 mod typeof_1 {
     use super::*;
     type Opaque = impl Sized;
+    #[define_opaque(Opaque)]
     fn define() -> Opaque {
-        //[current]~^ ERROR concrete type differs
         dyn_hoops::<_>(0)
     }
 }
@@ -31,18 +32,19 @@ mod typeof_1 {
 mod typeof_2 {
     use super::*;
     type Opaque = impl Sized;
+    #[define_opaque(Opaque)]
     fn define_1() -> Opaque { dyn_hoops::<_>(0) }
-    //[current]~^ ERROR concrete type differs
+    #[define_opaque(Opaque)]
     fn define_2() -> Opaque { dyn_hoops::<u8>(0) }
 }
 
 mod typeck {
     use super::*;
     type Opaque = impl Sized;
+    #[define_opaque(Opaque)]
     fn define() -> Option<Opaque> {
         let _: Opaque = dyn_hoops::<_>(0);
         let _: Opaque = dyn_hoops::<u8>(0);
-        //[current]~^ ERROR mismatched types
         None
     }
 }
@@ -50,9 +52,9 @@ mod typeck {
 mod borrowck {
     use super::*;
     type Opaque = impl Sized;
+    #[define_opaque(Opaque)]
     fn define() -> Option<Opaque> {
         let _: Opaque = dyn_hoops::<_>(0);
-        //[current]~^ ERROR concrete type differs
         None
     }
 }

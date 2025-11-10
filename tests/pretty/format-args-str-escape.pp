@@ -1,12 +1,12 @@
 #![feature(prelude_import)]
 #![no_std]
-#[prelude_import]
-use ::std::prelude::rust_2015::*;
 #[macro_use]
 extern crate std;
-// pretty-compare-only
-// pretty-mode:expanded
-// pp-exact:format-args-str-escape.pp
+#[prelude_import]
+use ::std::prelude::rust_2015::*;
+//@ pretty-compare-only
+//@ pretty-mode:expanded
+//@ pp-exact:format-args-str-escape.pp
 
 fn main() {
     { ::std::io::_print(format_args!("\u{1b}[1mHello, world!\u{1b}[0m\n")); };

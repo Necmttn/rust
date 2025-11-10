@@ -31,7 +31,7 @@
 //! // instead of a max-heap.
 //! impl Ord for State {
 //!     fn cmp(&self, other: &Self) -> Ordering {
-//!         // Notice that the we flip the ordering on costs.
+//!         // Notice that we flip the ordering on costs.
 //!         // In case of a tie we compare positions - this step is necessary
 //!         // to make implementations of `PartialEq` and `Ord` consistent.
 //!         other.cost.cmp(&self.cost)
@@ -144,20 +144,18 @@
 #![stable(feature = "rust1", since = "1.0.0")]
 
 use core::alloc::Allocator;
-use core::fmt;
 use core::iter::{FusedIterator, InPlaceIterable, SourceIter, TrustedFused, TrustedLen};
-use core::mem::{self, swap, ManuallyDrop};
-use core::num::NonZeroUsize;
+use core::mem::{self, ManuallyDrop, swap};
+use core::num::NonZero;
 use core::ops::{Deref, DerefMut};
-use core::ptr;
+use core::{fmt, ptr};
 
 use crate::alloc::Global;
 use crate::collections::TryReserveError;
 use crate::slice;
-use crate::vec::{self, AsVecIntoIter, Vec};
-
-#[cfg(test)]
-mod tests;
+#[cfg(not(test))]
+use crate::vec::AsVecIntoIter;
+use crate::vec::{self, Vec};
 
 /// A priority queue implemented with a binary heap.
 ///
@@ -296,7 +294,7 @@ pub struct PeekMut<
     heap: &'a mut BinaryHeap<T, A>,
     // If a set_len + sift_down are required, this is Some. If a &mut T has not
     // yet been exposed to peek_mut()'s caller, it's None.
-    original_len: Option<NonZeroUsize>,
+    original_len: Option<NonZero<usize>>,
 }
 
 #[stable(feature = "collection_debug", since = "1.17.0")]
@@ -350,7 +348,7 @@ impl<T: Ord, A: Allocator> DerefMut for PeekMut<'_, T, A> {
             // the standard library as "leak amplification".
             unsafe {
                 // SAFETY: len > 1 so len != 0.
-                self.original_len = Some(NonZeroUsize::new_unchecked(len));
+                self.original_len = Some(NonZero::new_unchecked(len));
                 // SAFETY: len > 1 so all this does for now is leak elements,
                 // which is safe.
                 self.heap.data.set_len(1);
@@ -363,6 +361,74 @@ impl<T: Ord, A: Allocator> DerefMut for PeekMut<'_, T, A> {
 }
 
 impl<'a, T: Ord, A: Allocator> PeekMut<'a, T, A> {
+    /// Sifts the current element to its new position.
+    ///
+    /// Afterwards refers to the new element. Returns if the element changed.
+    ///
+    /// ## Examples
+    ///
+    /// The condition can be used to upper bound all elements in the heap. When only few elements
+    /// are affected, the heap's sort ensures this is faster than a reconstruction from the raw
+    /// element list and requires no additional allocation.
+    ///
+    /// ```
+    /// #![feature(binary_heap_peek_mut_refresh)]
+    /// use std::collections::BinaryHeap;
+    ///
+    /// let mut heap: BinaryHeap<u32> = (0..128).collect();
+    /// let mut peek = heap.peek_mut().unwrap();
+    ///
+    /// loop {
+    ///     *peek = 99;
+    ///
+    ///     if !peek.refresh() {
+    ///         break;
+    ///     }
+    /// }
+    ///
+    /// // Post condition, this is now an upper bound.
+    /// assert!(*peek < 100);
+    /// ```
+    ///
+    /// When the element remains the maximum after modification, the peek remains unchanged:
+    ///
+    /// ```
+    /// #![feature(binary_heap_peek_mut_refresh)]
+    /// use std::collections::BinaryHeap;
+    ///
+    /// let mut heap: BinaryHeap<u32> = [1, 2, 3].into();
+    /// let mut peek = heap.peek_mut().unwrap();
+    ///
+    /// assert_eq!(*peek, 3);
+    /// *peek = 42;
+    ///
+    /// // When we refresh, the peek is updated to the new maximum.
+    /// assert!(!peek.refresh(), "42 is even larger than 3");
+    /// assert_eq!(*peek, 42);
+    /// ```
+    #[unstable(feature = "binary_heap_peek_mut_refresh", issue = "138355")]
+    #[must_use = "is equivalent to dropping and getting a new PeekMut except for return information"]
+    pub fn refresh(&mut self) -> bool {
+        // The length of the underlying heap is unchanged by sifting down. The value stored for leak
+        // amplification thus remains accurate. We erase the leak amplification firstly because the
+        // operation is then equivalent to constructing a new PeekMut and secondly this avoids any
+        // future complication where original_len being non-empty would be interpreted as the heap
+        // having been leak amplified instead of checking the heap itself.
+        if let Some(original_len) = self.original_len.take() {
+            // SAFETY: This is how many elements were in the Vec at the time of
+            // the BinaryHeap::peek_mut call.
+            unsafe { self.heap.data.set_len(original_len.get()) };
+
+            // The length of the heap did not change by sifting, upholding our own invariants.
+
+            // SAFETY: PeekMut is only instantiated for non-empty heaps.
+            (unsafe { self.heap.sift_down(0) }) != 0
+        } else {
+            // The element was not modified.
+            false
+        }
+    }
+
     /// Removes the peeked value from the heap and returns it.
     #[stable(feature = "binary_heap_peek_mut_pop", since = "1.18.0")]
     pub fn pop(mut this: PeekMut<'a, T, A>) -> T {
@@ -375,7 +441,10 @@ impl<'a, T: Ord, A: Allocator> PeekMut<'a, T, A> {
             // the caller could've mutated the element. It is removed from the
             // heap on the next line and pop() is not sensitive to its value.
         }
-        this.heap.pop().unwrap()
+
+        // SAFETY: Have a `PeekMut` element proves that the associated binary heap being non-empty,
+        // so the `pop` operation will not fail.
+        unsafe { this.heap.pop().unwrap_unchecked() }
     }
 }
 
@@ -385,6 +454,12 @@ impl<T: Clone, A: Allocator + Clone> Clone for BinaryHeap<T, A> {
         BinaryHeap { data: self.data.clone() }
     }
 
+    /// Overwrites the contents of `self` with a clone of the contents of `source`.
+    ///
+    /// This method is preferred over simply assigning `source.clone()` to `self`,
+    /// as it avoids reallocation if possible.
+    ///
+    /// See [`Vec::clone_from()`] for more details.
     fn clone_from(&mut self, source: &Self) {
         self.data.clone_from(&source.data);
     }
@@ -434,7 +509,7 @@ impl<T: Ord> BinaryHeap<T> {
     /// heap.push(4);
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
-    #[rustc_const_unstable(feature = "const_binary_heap_constructor", issue = "112353")]
+    #[rustc_const_stable(feature = "const_binary_heap_constructor", since = "1.80.0")]
     #[must_use]
     pub const fn new() -> BinaryHeap<T> {
         BinaryHeap { data: vec![] }
@@ -444,7 +519,7 @@ impl<T: Ord> BinaryHeap<T> {
     ///
     /// The binary heap will be able to hold at least `capacity` elements without
     /// reallocating. This method is allowed to allocate for more elements than
-    /// `capacity`. If `capacity` is 0, the binary heap will not allocate.
+    /// `capacity`. If `capacity` is zero, the binary heap will not allocate.
     ///
     /// # Examples
     ///
@@ -478,7 +553,6 @@ impl<T: Ord, A: Allocator> BinaryHeap<T, A> {
     /// heap.push(4);
     /// ```
     #[unstable(feature = "allocator_api", issue = "32838")]
-    #[rustc_const_unstable(feature = "const_binary_heap_constructor", issue = "112353")]
     #[must_use]
     pub const fn new_in(alloc: A) -> BinaryHeap<T, A> {
         BinaryHeap { data: Vec::new_in(alloc) }
@@ -488,7 +562,7 @@ impl<T: Ord, A: Allocator> BinaryHeap<T, A> {
     ///
     /// The binary heap will be able to hold at least `capacity` elements without
     /// reallocating. This method is allowed to allocate for more elements than
-    /// `capacity`. If `capacity` is 0, the binary heap will not allocate.
+    /// `capacity`. If `capacity` is zero, the binary heap will not allocate.
     ///
     /// # Examples
     ///
@@ -527,8 +601,7 @@ impl<T: Ord, A: Allocator> BinaryHeap<T, A> {
     /// heap.push(1);
     /// heap.push(5);
     /// heap.push(2);
-    /// {
-    ///     let mut val = heap.peek_mut().unwrap();
+    /// if let Some(mut val) = heap.peek_mut() {
     ///     *val = 0;
     /// }
     /// assert_eq!(heap.peek(), Some(&2));
@@ -607,6 +680,7 @@ impl<T: Ord, A: Allocator> BinaryHeap<T, A> {
     /// occurs when capacity is exhausted and needs a resize. The resize cost
     /// has been amortized in the previous figures.
     #[stable(feature = "rust1", since = "1.0.0")]
+    #[rustc_confusables("append", "put")]
     pub fn push(&mut self, item: T) {
         let old_len = self.len();
         self.data.push(item);
@@ -666,6 +740,8 @@ impl<T: Ord, A: Allocator> BinaryHeap<T, A> {
     /// # Safety
     ///
     /// The caller must guarantee that `pos < self.len()`.
+    ///
+    /// Returns the new position of the element.
     unsafe fn sift_up(&mut self, start: usize, pos: usize) -> usize {
         // Take out the value at `pos` and create a hole.
         // SAFETY: The caller guarantees that pos < self.len()
@@ -692,10 +768,12 @@ impl<T: Ord, A: Allocator> BinaryHeap<T, A> {
     /// Take an element at `pos` and move it down the heap,
     /// while its children are larger.
     ///
+    /// Returns the new position of the element.
+    ///
     /// # Safety
     ///
     /// The caller must guarantee that `pos < end <= self.len()`.
-    unsafe fn sift_down_range(&mut self, pos: usize, end: usize) {
+    unsafe fn sift_down_range(&mut self, pos: usize, end: usize) -> usize {
         // SAFETY: The caller guarantees that pos < end <= self.len().
         let mut hole = unsafe { Hole::new(&mut self.data, pos) };
         let mut child = 2 * hole.pos() + 1;
@@ -715,7 +793,7 @@ impl<T: Ord, A: Allocator> BinaryHeap<T, A> {
             // SAFETY: child is now either the old child or the old child+1
             //  We already proven that both are < self.len() and != hole.pos()
             if hole.element() >= unsafe { hole.get(child) } {
-                return;
+                return hole.pos();
             }
 
             // SAFETY: same as above.
@@ -730,16 +808,18 @@ impl<T: Ord, A: Allocator> BinaryHeap<T, A> {
             //  child == 2 * hole.pos() + 1 != hole.pos().
             unsafe { hole.move_to(child) };
         }
+
+        hole.pos()
     }
 
     /// # Safety
     ///
     /// The caller must guarantee that `pos < self.len()`.
-    unsafe fn sift_down(&mut self, pos: usize) {
+    unsafe fn sift_down(&mut self, pos: usize) -> usize {
         let len = self.len();
         // SAFETY: pos < len is guaranteed by the caller and
         //  obviously len = self.len() <= self.len().
-        unsafe { self.sift_down_range(pos, len) };
+        unsafe { self.sift_down_range(pos, len) }
     }
 
     /// Take an element at `pos` and move it all the way down the heap,
@@ -953,11 +1033,13 @@ impl<T, A: Allocator> BinaryHeap<T, A> {
     /// }
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
+    #[cfg_attr(not(test), rustc_diagnostic_item = "binaryheap_iter")]
     pub fn iter(&self) -> Iter<'_, T> {
         Iter { iter: self.data.iter() }
     }
 
     /// Returns an iterator which retrieves elements in heap order.
+    ///
     /// This method consumes the original heap.
     ///
     /// # Examples
@@ -1206,7 +1288,6 @@ impl<T, A: Allocator> BinaryHeap<T, A> {
     /// Basic usage:
     ///
     /// ```
-    /// #![feature(binary_heap_as_slice)]
     /// use std::collections::BinaryHeap;
     /// use std::io::{self, Write};
     ///
@@ -1215,7 +1296,7 @@ impl<T, A: Allocator> BinaryHeap<T, A> {
     /// io::sink().write(heap.as_slice()).unwrap();
     /// ```
     #[must_use]
-    #[unstable(feature = "binary_heap_as_slice", issue = "83659")]
+    #[stable(feature = "binary_heap_as_slice", since = "1.80.0")]
     pub fn as_slice(&self) -> &[T] {
         self.data.as_slice()
     }
@@ -1264,6 +1345,7 @@ impl<T, A: Allocator> BinaryHeap<T, A> {
     /// ```
     #[must_use]
     #[stable(feature = "rust1", since = "1.0.0")]
+    #[rustc_confusables("length", "size")]
     pub fn len(&self) -> usize {
         self.data.len()
     }
@@ -1354,7 +1436,7 @@ struct Hole<'a, T: 'a> {
 }
 
 impl<'a, T> Hole<'a, T> {
-    /// Create a new `Hole` at index `pos`.
+    /// Creates a new `Hole` at index `pos`.
     ///
     /// Unsafe because pos must be within the data slice.
     #[inline]
@@ -1424,6 +1506,20 @@ impl<T> Drop for Hole<'_, T> {
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct Iter<'a, T: 'a> {
     iter: slice::Iter<'a, T>,
+}
+
+#[stable(feature = "default_iters_sequel", since = "1.82.0")]
+impl<T> Default for Iter<'_, T> {
+    /// Creates an empty `binary_heap::Iter`.
+    ///
+    /// ```
+    /// # use std::collections::binary_heap;
+    /// let iter: binary_heap::Iter<'_, u8> = Default::default();
+    /// assert_eq!(iter.len(), 0);
+    /// ```
+    fn default() -> Self {
+        Iter { iter: Default::default() }
+    }
 }
 
 #[stable(feature = "collection_debug", since = "1.17.0")]
@@ -1576,10 +1672,11 @@ unsafe impl<T, A: Allocator> SourceIter for IntoIter<T, A> {
 #[unstable(issue = "none", feature = "inplace_iteration")]
 #[doc(hidden)]
 unsafe impl<I, A: Allocator> InPlaceIterable for IntoIter<I, A> {
-    const EXPAND_BY: Option<NonZeroUsize> = NonZeroUsize::new(1);
-    const MERGE_BY: Option<NonZeroUsize> = NonZeroUsize::new(1);
+    const EXPAND_BY: Option<NonZero<usize>> = NonZero::new(1);
+    const MERGE_BY: Option<NonZero<usize>> = NonZero::new(1);
 }
 
+#[cfg(not(test))]
 unsafe impl<I> AsVecIntoIter for IntoIter<I> {
     type Item = I;
 

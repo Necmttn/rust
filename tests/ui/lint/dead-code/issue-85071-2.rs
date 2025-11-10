@@ -2,7 +2,7 @@
 // of a function, and the warning is about an unreachable definition
 // instead of an unreachable expression.
 
-// check-pass
+//@ check-pass
 
 #![warn(unused_variables,unreachable_code)]
 
@@ -17,6 +17,6 @@ fn main() {
     let s = S;
     let x = s.f();
     //~^ WARNING: unused variable: `x`
+    //~| WARNING: unreachable definition
     let _y = x;
-    //~^ WARNING: unreachable definition
 }

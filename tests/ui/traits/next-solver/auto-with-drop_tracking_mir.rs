@@ -1,7 +1,7 @@
-// compile-flags: -Znext-solver
-// edition: 2021
-// revisions: pass fail
-//[pass] check-pass
+//@ compile-flags: -Znext-solver
+//@ edition: 2021
+//@ revisions: pass fail
+//@[pass] check-pass
 
 #![feature(negative_impls)]
 
@@ -23,5 +23,5 @@ async fn bar() {}
 fn main() {
     fn is_send(_: impl Send) {}
     is_send(foo());
-    //[fail]~^ ERROR `impl Future<Output = ()>` cannot be sent between threads safely
+    //[fail]~^ ERROR future cannot be sent between threads safely
 }

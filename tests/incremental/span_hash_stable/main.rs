@@ -3,8 +3,9 @@
 // the spans and this test makes sure that we handle them correctly by hashing
 // file:line:column instead of raw byte offset.
 
-// revisions:rpass1 rpass2
-// compile-flags: -g -Z query-dep-graph
+//@ revisions:rpass1 rpass2
+//@ compile-flags: -g -Z query-dep-graph
+//@ ignore-backends: gcc
 
 #![feature(rustc_attrs)]
 

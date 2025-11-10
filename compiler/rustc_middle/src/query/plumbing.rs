@@ -1,44 +1,33 @@
+use std::ops::Deref;
+
+use rustc_data_structures::sync::{AtomicU64, WorkerLocal};
+use rustc_hir::def_id::{DefId, LocalDefId};
+use rustc_hir::hir_id::OwnerId;
+use rustc_macros::HashStable;
+use rustc_query_system::HandleCycleError;
+use rustc_query_system::dep_graph::{DepNodeIndex, SerializedDepNodeIndex};
+pub(crate) use rustc_query_system::query::QueryJobId;
+use rustc_query_system::query::*;
+use rustc_span::{ErrorGuaranteed, Span};
+pub use sealed::IntoQueryParam;
+
 use crate::dep_graph;
 use crate::dep_graph::DepKind;
-use crate::query::on_disk_cache::CacheEncoder;
-use crate::query::on_disk_cache::EncodedDepNodeIndex;
-use crate::query::on_disk_cache::OnDiskCache;
+use crate::query::on_disk_cache::{CacheEncoder, EncodedDepNodeIndex, OnDiskCache};
 use crate::query::{
     DynamicQueries, ExternProviders, Providers, QueryArenas, QueryCaches, QueryEngine, QueryStates,
 };
 use crate::ty::TyCtxt;
-use field_offset::FieldOffset;
-use measureme::StringId;
-use rustc_data_structures::fx::FxHashMap;
-use rustc_data_structures::sync::AtomicU64;
-use rustc_data_structures::sync::WorkerLocal;
-use rustc_hir::def_id::{DefId, LocalDefId};
-use rustc_hir::hir_id::OwnerId;
-use rustc_query_system::dep_graph::DepNodeIndex;
-use rustc_query_system::dep_graph::SerializedDepNodeIndex;
-pub(crate) use rustc_query_system::query::QueryJobId;
-use rustc_query_system::query::*;
-use rustc_query_system::HandleCycleError;
-use rustc_span::{ErrorGuaranteed, Span, DUMMY_SP};
-use std::ops::Deref;
-
-pub struct QueryKeyStringCache {
-    pub def_id_cache: FxHashMap<DefId, StringId>,
-}
-
-impl QueryKeyStringCache {
-    pub fn new() -> QueryKeyStringCache {
-        QueryKeyStringCache { def_id_cache: Default::default() }
-    }
-}
 
 pub struct DynamicQuery<'tcx, C: QueryCache> {
     pub name: &'static str,
     pub eval_always: bool,
     pub dep_kind: DepKind,
     pub handle_cycle_error: HandleCycleError,
-    pub query_state: FieldOffset<QueryStates<'tcx>, QueryState<C::Key>>,
-    pub query_cache: FieldOffset<QueryCaches<'tcx>, C>,
+    // Offset of this query's state field in the QueryStates struct
+    pub query_state: usize,
+    // Offset of this query's cache field in the QueryCaches struct
+    pub query_cache: usize,
     pub cache_on_disk: fn(tcx: TyCtxt<'tcx>, key: &C::Key) -> bool,
     pub execute_query: fn(tcx: TyCtxt<'tcx>, k: C::Key) -> C::Value,
     pub compute: fn(tcx: TyCtxt<'tcx>, key: C::Key) -> C::Value,
@@ -57,16 +46,16 @@ pub struct DynamicQuery<'tcx, C: QueryCache> {
     pub format_value: fn(&C::Value) -> String,
 }
 
-pub struct QuerySystemFns<'tcx> {
+pub struct QuerySystemFns {
     pub engine: QueryEngine,
     pub local_providers: Providers,
     pub extern_providers: ExternProviders,
-    pub encode_query_results: fn(
+    pub encode_query_results: for<'tcx> fn(
         tcx: TyCtxt<'tcx>,
         encoder: &mut CacheEncoder<'_, 'tcx>,
         query_result_index: &mut EncodedDepNodeIndex,
     ),
-    pub try_mark_green: fn(tcx: TyCtxt<'tcx>, dep_node: &dep_graph::DepNode) -> bool,
+    pub try_mark_green: for<'tcx> fn(tcx: TyCtxt<'tcx>, dep_node: &dep_graph::DepNode) -> bool,
 }
 
 pub struct QuerySystem<'tcx> {
@@ -79,9 +68,9 @@ pub struct QuerySystem<'tcx> {
     /// Do not access this directly. It is only meant to be used by
     /// `DepGraph::try_mark_green()` and the query infrastructure.
     /// This is `None` if we are not incremental compilation mode
-    pub on_disk_cache: Option<OnDiskCache<'tcx>>,
+    pub on_disk_cache: Option<OnDiskCache>,
 
-    pub fns: QuerySystemFns<'tcx>,
+    pub fns: QuerySystemFns,
 
     pub jobs: AtomicU64,
 }
@@ -101,30 +90,68 @@ impl<'tcx> Deref for TyCtxtAt<'tcx> {
 }
 
 #[derive(Copy, Clone)]
-pub struct TyCtxtEnsure<'tcx> {
+#[must_use]
+pub struct TyCtxtEnsureOk<'tcx> {
     pub tcx: TyCtxt<'tcx>,
 }
 
 #[derive(Copy, Clone)]
-pub struct TyCtxtEnsureWithValue<'tcx> {
+#[must_use]
+pub struct TyCtxtEnsureDone<'tcx> {
     pub tcx: TyCtxt<'tcx>,
 }
 
 impl<'tcx> TyCtxt<'tcx> {
-    /// Returns a transparent wrapper for `TyCtxt`, which ensures queries
-    /// are executed instead of just returning their results.
+    /// Wrapper that calls queries in a special "ensure OK" mode, for callers
+    /// that don't need the return value and just want to invoke a query for
+    /// its potential side-effect of emitting fatal errors.
+    ///
+    /// This can be more efficient than a normal query call, because if the
+    /// query's inputs are all green, the call can return immediately without
+    /// needing to obtain a value (by decoding one from disk or by executing
+    /// the query).
+    ///
+    /// (As with all query calls, execution is also skipped if the query result
+    /// is already cached in memory.)
+    ///
+    /// ## WARNING
+    /// A subsequent normal call to the same query might still cause it to be
+    /// executed! This can occur when the inputs are all green, but the query's
+    /// result is not cached on disk, so the query must be executed to obtain a
+    /// return value.
+    ///
+    /// Therefore, this call mode is not appropriate for callers that want to
+    /// ensure that the query is _never_ executed in the future.
+    ///
+    /// ## `return_result_from_ensure_ok`
+    /// If a query has the `return_result_from_ensure_ok` modifier, calls via
+    /// `ensure_ok` will instead return `Result<(), ErrorGuaranteed>`. If the
+    /// query needs to be executed, and execution returns an error, that error
+    /// is returned to the caller.
     #[inline(always)]
-    pub fn ensure(self) -> TyCtxtEnsure<'tcx> {
-        TyCtxtEnsure { tcx: self }
+    pub fn ensure_ok(self) -> TyCtxtEnsureOk<'tcx> {
+        TyCtxtEnsureOk { tcx: self }
     }
 
-    /// Returns a transparent wrapper for `TyCtxt`, which ensures queries
-    /// are executed instead of just returning their results.
+    /// Wrapper that calls queries in a special "ensure done" mode, for callers
+    /// that don't need the return value and just want to guarantee that the
+    /// query won't be executed in the future, by executing it now if necessary.
     ///
-    /// This version verifies that the computed result exists in the cache before returning.
+    /// This is useful for queries that read from a [`Steal`] value, to ensure
+    /// that they are executed before the query that will steal the value.
+    ///
+    /// Unlike [`Self::ensure_ok`], a query with all-green inputs will only be
+    /// skipped if its return value is stored in the disk-cache. This is still
+    /// more efficient than a regular query, because in that situation the
+    /// return value doesn't necessarily need to be decoded.
+    ///
+    /// (As with all query calls, execution is also skipped if the query result
+    /// is already cached in memory.)
+    ///
+    /// [`Steal`]: rustc_data_structures::steal::Steal
     #[inline(always)]
-    pub fn ensure_with_value(self) -> TyCtxtEnsureWithValue<'tcx> {
-        TyCtxtEnsureWithValue { tcx: self }
+    pub fn ensure_done(self) -> TyCtxtEnsureDone<'tcx> {
+        TyCtxtEnsureDone { tcx: self }
     }
 
     /// Returns a transparent wrapper for `TyCtxt` which uses
@@ -139,78 +166,17 @@ impl<'tcx> TyCtxt<'tcx> {
     }
 }
 
-#[inline]
-pub fn query_get_at<'tcx, Cache>(
-    tcx: TyCtxt<'tcx>,
-    execute_query: fn(TyCtxt<'tcx>, Span, Cache::Key, QueryMode) -> Option<Cache::Value>,
-    query_cache: &Cache,
-    span: Span,
-    key: Cache::Key,
-) -> Cache::Value
-where
-    Cache: QueryCache,
-{
-    let key = key.into_query_param();
-    match try_get_cached(tcx, query_cache, &key) {
-        Some(value) => value,
-        None => execute_query(tcx, span, key, QueryMode::Get).unwrap(),
-    }
-}
-
-#[inline]
-pub fn query_ensure<'tcx, Cache>(
-    tcx: TyCtxt<'tcx>,
-    execute_query: fn(TyCtxt<'tcx>, Span, Cache::Key, QueryMode) -> Option<Cache::Value>,
-    query_cache: &Cache,
-    key: Cache::Key,
-    check_cache: bool,
-) where
-    Cache: QueryCache,
-{
-    let key = key.into_query_param();
-    if try_get_cached(tcx, query_cache, &key).is_none() {
-        execute_query(tcx, DUMMY_SP, key, QueryMode::Ensure { check_cache });
-    }
-}
-
-#[inline]
-pub fn query_ensure_error_guaranteed<'tcx, Cache, T>(
-    tcx: TyCtxt<'tcx>,
-    execute_query: fn(TyCtxt<'tcx>, Span, Cache::Key, QueryMode) -> Option<Cache::Value>,
-    query_cache: &Cache,
-    key: Cache::Key,
-    check_cache: bool,
-) -> Result<(), ErrorGuaranteed>
-where
-    Cache: QueryCache<Value = super::erase::Erase<Result<T, ErrorGuaranteed>>>,
-    Result<T, ErrorGuaranteed>: EraseType,
-{
-    let key = key.into_query_param();
-    if let Some(res) = try_get_cached(tcx, query_cache, &key) {
-        super::erase::restore(res).map(drop)
-    } else {
-        execute_query(tcx, DUMMY_SP, key, QueryMode::Ensure { check_cache })
-            .map(super::erase::restore)
-            .map(|res| res.map(drop))
-            // Either we actually executed the query, which means we got a full `Result`,
-            // or we can just assume the query succeeded, because it was green in the
-            // incremental cache. If it is green, that means that the previous compilation
-            // that wrote to the incremental cache compiles successfully. That is only
-            // possible if the cache entry was `Ok(())`, so we emit that here, without
-            // actually encoding the `Result` in the cache or loading it from there.
-            .unwrap_or(Ok(()))
-    }
-}
-
-macro_rules! query_ensure {
+/// Calls either `query_ensure` or `query_ensure_error_guaranteed`, depending
+/// on whether the list of modifiers contains `return_result_from_ensure_ok`.
+macro_rules! query_ensure_select {
     ([]$($args:tt)*) => {
-        query_ensure($($args)*)
+        crate::query::inner::query_ensure($($args)*)
     };
-    ([(ensure_forwards_result_if_red) $($rest:tt)*]$($args:tt)*) => {
-        query_ensure_error_guaranteed($($args)*).map(|_| ())
+    ([(return_result_from_ensure_ok) $($rest:tt)*]$($args:tt)*) => {
+        crate::query::inner::query_ensure_error_guaranteed($($args)*)
     };
     ([$other:tt $($modifiers:tt)*]$($args:tt)*) => {
-        query_ensure!([$($modifiers)*]$($args)*)
+        query_ensure_select!([$($modifiers)*]$($args)*)
     };
 }
 
@@ -232,7 +198,7 @@ macro_rules! query_if_arena {
     };
 }
 
-/// If `separate_provide_if_extern`, then the key can be projected to its
+/// If `separate_provide_extern`, then the key can be projected to its
 /// local key via `<$K as AsLocalKey>::LocalKey`.
 macro_rules! local_key_if_separate_extern {
     ([] $($K:tt)*) => {
@@ -261,15 +227,15 @@ macro_rules! separate_provide_extern_decl {
     };
 }
 
-macro_rules! ensure_result {
-    ([][$ty:ty]) => {
+macro_rules! ensure_ok_result {
+    ( [] ) => {
         ()
     };
-    ([(ensure_forwards_result_if_red) $($rest:tt)*][$ty:ty]) => {
+    ( [(return_result_from_ensure_ok) $($rest:tt)*] ) => {
         Result<(), ErrorGuaranteed>
     };
-    ([$other:tt $($modifiers:tt)*][$($args:tt)*]) => {
-        ensure_result!([$($modifiers)*][$($args)*])
+    ( [$other:tt $($modifiers:tt)*] ) => {
+        ensure_ok_result!( [$($modifiers)*] )
     };
 }
 
@@ -278,13 +244,7 @@ macro_rules! separate_provide_extern_default {
         ()
     };
     ([(separate_provide_extern) $($rest:tt)*][$name:ident]) => {
-        |_, key| bug!(
-            "`tcx.{}({:?})` unsupported by its crate; \
-             perhaps the `{}` query was never assigned a provider function",
-            stringify!($name),
-            key,
-            stringify!($name),
-        )
+        |_, key| $crate::query::plumbing::default_extern_query(stringify!($name), &key)
     };
     ([$other:tt $($modifiers:tt)*][$($args:tt)*]) => {
         separate_provide_extern_default!([$($modifiers)*][$($args)*])
@@ -293,8 +253,11 @@ macro_rules! separate_provide_extern_default {
 
 macro_rules! define_callbacks {
     (
-     $($(#[$attr:meta])*
-        [$($modifiers:tt)*] fn $name:ident($($K:tt)*) -> $V:ty,)*) => {
+        $(
+            $(#[$attr:meta])*
+            [$($modifiers:tt)*] fn $name:ident($($K:tt)*) -> $V:ty,
+        )*
+    ) => {
 
         #[allow(unused_lifetimes)]
         pub mod queries {
@@ -308,10 +271,10 @@ macro_rules! define_callbacks {
 
                 /// This type alias specifies the type returned from query providers and the type
                 /// used for decoding. For regular queries this is the declared returned type `V`,
-                /// but `arena_cache` will use `<V as Deref>::Target` instead.
+                /// but `arena_cache` will use `<V as ArenaCached>::Provided` instead.
                 pub type ProvidedValue<'tcx> = query_if_arena!(
                     [$($modifiers)*]
-                    (<$V as Deref>::Target)
+                    (<$V as $crate::query::arena_cached::ArenaCached<'tcx>>::Provided)
                     ($V)
                 );
 
@@ -326,24 +289,31 @@ macro_rules! define_callbacks {
                 ) -> Erase<Value<'tcx>> {
                     erase(query_if_arena!([$($modifiers)*]
                         {
-                            if mem::needs_drop::<ProvidedValue<'tcx>>() {
-                                &*_tcx.query_system.arenas.$name.alloc(value)
+                            use $crate::query::arena_cached::ArenaCached;
+
+                            if mem::needs_drop::<<$V as ArenaCached<'tcx>>::Allocated>() {
+                                <$V as ArenaCached>::alloc_in_arena(
+                                    |v| _tcx.query_system.arenas.$name.alloc(v),
+                                    value,
+                                )
                             } else {
-                                &*_tcx.arena.dropless.alloc(value)
+                                <$V as ArenaCached>::alloc_in_arena(
+                                    |v| _tcx.arena.dropless.alloc(v),
+                                    value,
+                                )
                             }
                         }
                         (value)
                     ))
                 }
 
-                pub type Storage<'tcx> = <
-                    <$($K)* as keys::Key>::CacheSelector as CacheSelector<'tcx, Erase<$V>>
-                >::Cache;
+                pub type Storage<'tcx> = <$($K)* as keys::Key>::Cache<Erase<$V>>;
 
-                // Ensure that keys grow no larger than 64 bytes
-                #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+                // Ensure that keys grow no larger than 88 bytes by accident.
+                // Increase this limit if necessary, but do try to keep the size low if possible
+                #[cfg(target_pointer_width = "64")]
                 const _: () = {
-                    if mem::size_of::<Key<'static>>() > 64 {
+                    if size_of::<Key<'static>>() > 88 {
                         panic!("{}", concat!(
                             "the query `",
                             stringify!($name),
@@ -354,10 +324,12 @@ macro_rules! define_callbacks {
                     }
                 };
 
-                // Ensure that values grow no larger than 64 bytes
-                #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+                // Ensure that values grow no larger than 64 bytes by accident.
+                // Increase this limit if necessary, but do try to keep the size low if possible
+                #[cfg(target_pointer_width = "64")]
+                #[cfg(not(feature = "rustc_randomized_layouts"))]
                 const _: () = {
-                    if mem::size_of::<Value<'static>>() > 64 {
+                    if size_of::<Value<'static>>() > 64 {
                         panic!("{}", concat!(
                             "the query `",
                             stringify!($name),
@@ -372,7 +344,7 @@ macro_rules! define_callbacks {
 
         pub struct QueryArenas<'tcx> {
             $($(#[$attr])* pub $name: query_if_arena!([$($modifiers)*]
-                (TypedArena<<$V as Deref>::Target>)
+                (TypedArena<<$V as $crate::query::arena_cached::ArenaCached<'tcx>>::Allocated>)
                 ()
             ),)*
         }
@@ -393,11 +365,14 @@ macro_rules! define_callbacks {
             $($(#[$attr])* pub $name: queries::$name::Storage<'tcx>,)*
         }
 
-        impl<'tcx> TyCtxtEnsure<'tcx> {
+        impl<'tcx> TyCtxtEnsureOk<'tcx> {
             $($(#[$attr])*
             #[inline(always)]
-            pub fn $name(self, key: query_helper_param_ty!($($K)*)) -> ensure_result!([$($modifiers)*][$V]) {
-                query_ensure!(
+            pub fn $name(
+                self,
+                key: query_helper_param_ty!($($K)*),
+            ) -> ensure_ok_result!([$($modifiers)*]) {
+                query_ensure_select!(
                     [$($modifiers)*]
                     self.tcx,
                     self.tcx.query_system.fns.engine.$name,
@@ -408,11 +383,11 @@ macro_rules! define_callbacks {
             })*
         }
 
-        impl<'tcx> TyCtxtEnsureWithValue<'tcx> {
+        impl<'tcx> TyCtxtEnsureDone<'tcx> {
             $($(#[$attr])*
             #[inline(always)]
             pub fn $name(self, key: query_helper_param_ty!($($K)*)) {
-                query_ensure(
+                crate::query::inner::query_ensure(
                     self.tcx,
                     self.tcx.query_system.fns.engine.$name,
                     &self.tcx.query_system.caches.$name,
@@ -437,7 +412,7 @@ macro_rules! define_callbacks {
             #[inline(always)]
             pub fn $name(self, key: query_helper_param_ty!($($K)*)) -> $V
             {
-                restore::<$V>(query_get_at(
+                restore::<$V>(crate::query::inner::query_get_at(
                     self.tcx,
                     self.tcx.query_system.fns.engine.$name,
                     &self.tcx.query_system.caches.$name,
@@ -456,7 +431,7 @@ macro_rules! define_callbacks {
         #[derive(Default)]
         pub struct QueryStates<'tcx> {
             $(
-                pub $name: QueryState<$($K)*>,
+                pub $name: QueryState<$($K)*, QueryStackDeferred<'tcx>>,
             )*
         }
 
@@ -474,15 +449,7 @@ macro_rules! define_callbacks {
         impl Default for Providers {
             fn default() -> Self {
                 Providers {
-                    $($name: |_, key| bug!(
-                        "`tcx.{}({:?})` is not supported for this key;\n\
-                        hint: Queries can be either made to the local crate, or the external crate. \
-                        This error means you tried to use it for one that's not supported.\n\
-                        If that's not the case, {} was likely never assigned to a provider function.\n",
-                        stringify!($name),
-                        key,
-                        stringify!($name),
-                    ),)*
+                    $($name: |_, key| $crate::query::plumbing::default_query(stringify!($name), &key)),*
                 }
             }
         }
@@ -538,49 +505,19 @@ macro_rules! define_feedable {
 
                 let tcx = self.tcx;
                 let erased = queries::$name::provided_to_erased(tcx, value);
-                let value = restore::<$V>(erased);
                 let cache = &tcx.query_system.caches.$name;
 
+                let dep_kind: dep_graph::DepKind = dep_graph::dep_kinds::$name;
                 let hasher: Option<fn(&mut StableHashingContext<'_>, &_) -> _> = hash_result!([$($modifiers)*]);
-                match try_get_cached(tcx, cache, &key) {
-                    Some(old) => {
-                        let old = restore::<$V>(old);
-                        if let Some(hasher) = hasher {
-                            let (value_hash, old_hash): (Fingerprint, Fingerprint) = tcx.with_stable_hashing_context(|mut hcx|
-                                (hasher(&mut hcx, &value), hasher(&mut hcx, &old))
-                            );
-                            if old_hash != value_hash {
-                                // We have an inconsistency. This can happen if one of the two
-                                // results is tainted by errors. In this case, delay a bug to
-                                // ensure compilation is doomed, and keep the `old` value.
-                                tcx.dcx().delayed_bug(format!(
-                                    "Trying to feed an already recorded value for query {} key={key:?}:\n\
-                                    old value: {old:?}\nnew value: {value:?}",
-                                    stringify!($name),
-                                ));
-                            }
-                        } else {
-                            // The query is `no_hash`, so we have no way to perform a sanity check.
-                            // If feeding the same value multiple times needs to be supported,
-                            // the query should not be marked `no_hash`.
-                            bug!(
-                                "Trying to feed an already recorded value for query {} key={key:?}:\nold value: {old:?}\nnew value: {value:?}",
-                                stringify!($name),
-                            )
-                        }
-                    }
-                    None => {
-                        let dep_node = dep_graph::DepNode::construct(tcx, dep_graph::dep_kinds::$name, &key);
-                        let dep_node_index = tcx.dep_graph.with_feed_task(
-                            dep_node,
-                            tcx,
-                            key,
-                            &value,
-                            hash_result!([$($modifiers)*]),
-                        );
-                        cache.complete(key, erased, dep_node_index);
-                    }
-                }
+
+                $crate::query::inner::query_feed(
+                    tcx,
+                    dep_kind,
+                    hasher,
+                    cache,
+                    key,
+                    erased,
+                );
             }
         })*
     }
@@ -599,8 +536,9 @@ macro_rules! define_feedable {
 // as they will raise an fatal error on query cycles instead.
 
 mod sealed {
-    use super::{DefId, LocalDefId, OwnerId};
     use rustc_hir::def_id::{LocalModDefId, ModDefId};
+
+    use super::{DefId, LocalDefId, OwnerId};
 
     /// An analogue of the `Into` trait that's intended only for query parameters.
     ///
@@ -667,9 +605,23 @@ mod sealed {
     }
 }
 
-pub use sealed::IntoQueryParam;
-
-use super::erase::EraseType;
-
 #[derive(Copy, Clone, Debug, HashStable)]
 pub struct CyclePlaceholder(pub ErrorGuaranteed);
+
+#[cold]
+pub(crate) fn default_query(name: &str, key: &dyn std::fmt::Debug) -> ! {
+    bug!(
+        "`tcx.{name}({key:?})` is not supported for this key;\n\
+        hint: Queries can be either made to the local crate, or the external crate. \
+        This error means you tried to use it for one that's not supported.\n\
+        If that's not the case, {name} was likely never assigned to a provider function.\n",
+    )
+}
+
+#[cold]
+pub(crate) fn default_extern_query(name: &str, key: &dyn std::fmt::Debug) -> ! {
+    bug!(
+        "`tcx.{name}({key:?})` unsupported by its crate; \
+         perhaps the `{name}` query was never assigned a provider function",
+    )
+}

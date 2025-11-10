@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-// ignore-emscripten weird assertion?
+//@ ignore-emscripten weird assertion?
 
 #[repr(packed)]
 struct Foo1 {
@@ -21,10 +21,10 @@ struct Foo4C {
 
 pub fn main() {
     let foo = Foo1 { bar: 1, baz: 2 };
-    let brw = &foo.baz; //~ERROR reference to packed field is unaligned
+    let brw = &foo.baz; //~ERROR reference to field of packed struct is unaligned
     assert_eq!(*brw, 2);
 
     let foo = Foo2 { bar: 1, baz: 2 };
-    let brw = &foo.baz; //~ERROR reference to packed field is unaligned
+    let brw = &foo.baz; //~ERROR reference to field of packed struct is unaligned
     assert_eq!(*brw, 2);
 }

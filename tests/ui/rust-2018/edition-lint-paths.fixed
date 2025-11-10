@@ -1,5 +1,6 @@
-// aux-build:edition-lint-paths.rs
-// run-rustfix
+//@ edition: 2015
+//@ aux-build:edition-lint-paths.rs
+//@ run-rustfix
 
 #![deny(absolute_paths_not_starting_with_crate)]
 #![allow(unused)]
